@@ -1,4 +1,4 @@
-"""Warm-start iBOT pretraining from model weights using one YAML config."""
+"""Continue iBOT pretraining from a full source checkpoint using one YAML config."""
 
 import argparse
 import datetime
@@ -23,10 +23,13 @@ from losses import iBOTLoss
 from model import create_model, iBOTHead
 from utils import training as utils
 from utils.checkpoint import (
-    load_pretrained_state,
+    continuation_provenance,
+    load_continuation_state,
     load_resume_state,
+    milestone_checkpoint_name,
     read_pretrained_checkpoint,
     read_resume_checkpoint,
+    source_equivalent_epoch,
 )
 from utils.recipe import get_ibot_recipe
 
@@ -42,15 +45,44 @@ def load_config(path):
         user_config = yaml.safe_load(handle)
 
     config = {**get_ibot_recipe(user_config["arch"]), **user_config}
+    if "additional_epochs" in user_config and "epochs" in user_config:
+        raise ValueError(
+            "Configure training length with additional_epochs, not both keys"
+        )
+    if "additional_epochs" in user_config:
+        config["epochs"] = user_config["additional_epochs"]
+    elif "epochs" in user_config:
+        config["additional_epochs"] = user_config["epochs"]
+    else:
+        raise ValueError("The configuration must define additional_epochs")
+    if config.get("warmup_epochs", 0) != 0:
+        raise ValueError(
+            "Continuation training must not restart the iBOT learning-rate warm-up; "
+            "set warmup_epochs to 0"
+        )
     config.setdefault("resume_checkpoint", None)
     config.setdefault("resume_allow_precision_change", False)
     requested_precision = config.get("precision")
     if requested_precision is None:
         requested_precision = "fp16" if config.get("use_fp16", False) else "fp32"
-    if requested_precision not in {"fp32", "fp16", "bf16"}:
-        raise ValueError("precision must be one of: fp32, fp16, bf16")
     if "precision" in user_config and "use_fp16" in user_config:
         raise ValueError("Configure precision with either precision or use_fp16, not both")
+    precision_override = os.environ.get("IBOT_PRECISION_OVERRIDE")
+    if precision_override:
+        requested_precision = precision_override
+    if requested_precision not in {"fp32", "fp16", "bf16"}:
+        raise ValueError("precision must be one of: fp32, fp16, bf16")
+    integer_overrides = {
+        "IBOT_BATCH_SIZE_PER_GPU_OVERRIDE": "batch_size_per_gpu",
+        "IBOT_GPU_COUNT_OVERRIDE": "gpu_count",
+    }
+    for environment_key, config_key in integer_overrides.items():
+        value = os.environ.get(environment_key)
+        if value:
+            value = int(value)
+            if value <= 0:
+                raise ValueError(f"{environment_key} must be positive")
+            config[config_key] = value
     config["precision"] = requested_precision
     config["use_fp16"] = requested_precision == "fp16"
     for key in ("data_path", "initial_checkpoint", "output_dir"):
@@ -100,7 +132,7 @@ def init_wandb(args):
         name=args.wandb_run_name,
         dir=args.output_dir,
         config=config,
-        job_type="pretraining-warm-start",
+        job_type="pretraining-continuation",
         id=args.wandb_run_id,
         resume=args.wandb_resume,
     )
@@ -118,13 +150,17 @@ def train_ibot(args, wandb_run=None):
     else:
         checkpoint = read_resume_checkpoint(args)
         start_epoch = checkpoint["epoch"]
+    args.source_equivalent_final_epoch = source_equivalent_epoch(
+        args.source_checkpoint_epoch, args.epochs
+    )
     if wandb_run is not None:
         wandb_run.config.update(
             {
                 "effective_batch_size": args.effective_batch_size,
-                "start_epoch": start_epoch,
-                "final_epoch": args.epochs,
+                "continuation_start_epoch": start_epoch,
+                "additional_epochs": args.epochs,
                 "source_checkpoint_epoch": args.source_checkpoint_epoch,
+                "source_equivalent_final_epoch": args.source_equivalent_final_epoch,
             },
             allow_val_change=True,
         )
@@ -233,7 +269,6 @@ def train_ibot(args, wandb_run=None):
         lambda1=args.lambda1,
         lambda2=args.lambda2,
         lambda3=args.lambda3,
-        region_warmup_epochs=args.region_warmup_epochs,
         region_min_area=args.region_min_area,
         mim_start_epoch=args.pred_start_epoch,
     ).cuda()
@@ -248,6 +283,73 @@ def train_ibot(args, wandb_run=None):
     optimizer = torch.optim.AdamW(params_groups)
     fp16_scaler = torch.cuda.amp.GradScaler() if args.precision == "fp16" else None
 
+    if args.resume_checkpoint is None:
+        optimizer_restored = load_continuation_state(
+            checkpoint,
+            student,
+            teacher,
+            ibot_loss,
+            optimizer,
+            fp16_scaler,
+        )
+    else:
+        optimizer_restored = True
+        start_epoch = load_resume_state(
+            checkpoint,
+            student,
+            teacher,
+            ibot_loss,
+            optimizer,
+            fp16_scaler,
+        )
+
+    source_has_scaler = "fp16_scaler" in checkpoint
+    source_has_args = "args" in checkpoint
+    del checkpoint
+
+    source_epoch = args.source_checkpoint_epoch
+    source_description = (
+        str(source_epoch) if source_epoch is not None else "unknown"
+    )
+    print(
+        "Continuation provenance: "
+        f"source checkpoint epoch={source_description}; "
+        f"continuation epoch={start_epoch}/{args.epochs}; "
+        "source-equivalent epoch="
+        f"{source_equivalent_epoch(source_epoch, start_epoch)}/"
+        f"{args.source_equivalent_final_epoch}."
+    )
+    print(
+        "Source checkpoint state: "
+        f"optimizer={'restored' if optimizer_restored else 'absent/reconstructed'}; "
+        f"FP16 scaler={'present' if source_has_scaler else 'absent'}; "
+        f"original args={'present' if source_has_args else 'absent'}."
+    )
+    print(
+        f"Precision transition: continuation uses {args.precision.upper()} from "
+        f"the first iteration; GradScaler is "
+        f"{'enabled' if fp16_scaler is not None else 'disabled'}."
+    )
+    if args.resume_checkpoint is None:
+        if optimizer_restored:
+            print(
+                "Loaded student, teacher, projection heads, iBOT centers, and "
+                "AdamW first/second moments from the continuation source."
+            )
+        else:
+            print(
+                "WARNING: the continuation source has no optimizer state; AdamW "
+                "was reconstructed with zero first/second moments."
+            )
+    else:
+        restored_state = "student, teacher, iBOT centers, and optimizer"
+        if fp16_scaler is not None:
+            restored_state += ", including the FP16 scaler"
+        print(
+            f"Restored {restored_state} from {args.resume_checkpoint} at "
+            f"continuation epoch {start_epoch}/{args.epochs}."
+        )
+
     if args.lr_schedule != "cosine":
         raise ValueError(f"Unsupported learning-rate schedule: {args.lr_schedule}")
     lr_schedule = utils.cosine_scheduler(
@@ -257,7 +359,7 @@ def train_ibot(args, wandb_run=None):
         args.min_lr,
         args.epochs,
         len(data_loader),
-        warmup_epochs=args.warmup_epochs,
+        warmup_epochs=0,
     )
     wd_schedule = utils.cosine_scheduler(
         args.weight_decay,
@@ -268,44 +370,28 @@ def train_ibot(args, wandb_run=None):
     momentum_schedule = utils.cosine_scheduler(
         args.momentum_teacher, 1, args.epochs, len(data_loader)
     )
-    print("Loss, optimizer and schedulers ready.")
-
-    if args.resume_checkpoint is None:
-        load_pretrained_state(checkpoint, student, teacher, ibot_loss)
-    else:
-        start_epoch = load_resume_state(
-            checkpoint,
-            student,
-            teacher,
-            ibot_loss,
-            optimizer,
-            fp16_scaler,
-        )
-    del checkpoint
-    if args.resume_checkpoint is None:
-        source_epoch = args.source_checkpoint_epoch
-        source_description = (
-            f" at epoch {source_epoch}" if source_epoch is not None else ""
-        )
+    if start_epoch < args.epochs:
+        first_schedule_iteration = start_epoch * len(data_loader)
         print(
-            "Loaded pretrained student, teacher, projection heads, and iBOT "
-            f"centers{source_description}. Starting a fresh {args.epochs}-epoch "
-            "adaptation optimizer and schedules."
+            "Continuation schedulers ready: no LR warm-up; first optimizer-step "
+            f"lr={lr_schedule[first_schedule_iteration]:.12g}; "
+            f"weight_decay={wd_schedule[first_schedule_iteration]:.12g}; "
+            f"teacher_momentum={momentum_schedule[first_schedule_iteration]:.12g}."
         )
     else:
-        restored_state = "student, teacher, iBOT centers, and optimizer"
-        if fp16_scaler is not None:
-            restored_state += ", including the FP16 scaler"
-        print(
-            f"Restored {restored_state} from {args.resume_checkpoint}. "
-            "Resuming at epoch "
-            f"{start_epoch}/{args.epochs} with the original schedule position."
-        )
+        print("Continuation checkpoint is already at the configured final epoch.")
+    print(
+        "Teacher EMA schedule position is reconstructed because the source "
+        "checkpoint does not store scheduler state or original args."
+    )
 
     start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
-        data_loader.sampler.set_epoch(epoch)
-        data_loader.dataset.set_epoch(epoch)
+        data_epoch = source_equivalent_epoch(args.source_checkpoint_epoch, epoch)
+        if data_epoch is None:
+            data_epoch = epoch
+        data_loader.sampler.set_epoch(data_epoch)
+        data_loader.dataset.set_epoch(data_epoch)
 
         train_stats = train_one_epoch(
             student,
@@ -322,11 +408,20 @@ def train_ibot(args, wandb_run=None):
             args,
         )
 
+        completed_continuation_epoch = epoch + 1
+        completed_source_epoch = source_equivalent_epoch(
+            args.source_checkpoint_epoch, completed_continuation_epoch
+        )
         save_dict = {
             "student": student.state_dict(),
             "teacher": teacher.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "epoch": epoch + 1,
+            **continuation_provenance(
+                args.source_checkpoint_epoch,
+                completed_continuation_epoch,
+                args.epochs,
+                args.precision,
+            ),
             "args": args,
             "ibot_loss": ibot_loss.state_dict(),
         }
@@ -335,14 +430,27 @@ def train_ibot(args, wandb_run=None):
         utils.save_on_master(
             save_dict, os.path.join(args.output_dir, "checkpoint.pth")
         )
-        if args.saveckp_freq and (epoch % args.saveckp_freq == 0) and epoch:
+        if (
+            args.saveckp_freq
+            and completed_continuation_epoch % args.saveckp_freq == 0
+        ):
             utils.save_on_master(
                 save_dict,
-                os.path.join(args.output_dir, f"checkpoint{epoch:04}.pth"),
+                os.path.join(
+                    args.output_dir,
+                    milestone_checkpoint_name(
+                        args.source_checkpoint_epoch,
+                        completed_continuation_epoch,
+                    ),
+                ),
             )
         log_stats = {
             **{f"train_{key}": value for key, value in train_stats.items()},
             "epoch": epoch,
+            "continuation_epoch": completed_continuation_epoch,
+            "additional_epochs": args.epochs,
+            "source_checkpoint_epoch": args.source_checkpoint_epoch,
+            "source_equivalent_epoch": completed_source_epoch,
         }
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as handle:
@@ -352,8 +460,12 @@ def train_ibot(args, wandb_run=None):
             if wandb_run is not None:
                 wandb_run.log(
                     {
-                        "epoch": epoch + 1,
-                        "state/global_step": (epoch + 1) * len(data_loader),
+                        "epoch": completed_continuation_epoch,
+                        "state/continuation_epoch": completed_continuation_epoch,
+                        "state/source_checkpoint_epoch": args.source_checkpoint_epoch,
+                        "state/source_equivalent_epoch": completed_source_epoch,
+                        "state/global_step": completed_continuation_epoch
+                        * len(data_loader),
                         **{
                             f"train/{key}": value
                             for key, value in train_stats.items()
@@ -367,7 +479,10 @@ def train_ibot(args, wandb_run=None):
     total_time = time.time() - start_time
     total_time_string = str(datetime.timedelta(seconds=int(total_time)))
     if wandb_run is not None:
-        wandb_run.summary["state/final_epoch"] = args.epochs
+        wandb_run.summary["state/final_continuation_epoch"] = args.epochs
+        wandb_run.summary["state/final_source_equivalent_epoch"] = (
+            args.source_equivalent_final_epoch
+        )
         wandb_run.summary["state/training_time_seconds"] = total_time
         wandb_run.summary["state/checkpoint"] = str(
             Path(args.output_dir) / "checkpoint.pth"
@@ -390,7 +505,14 @@ def train_one_epoch(
     args,
 ):
     metric_logger = utils.MetricLogger(delimiter="  ")
-    header = f"Epoch: [{epoch}/{args.epochs}]"
+    source_epoch = source_equivalent_epoch(args.source_checkpoint_epoch, epoch)
+    source_final = source_equivalent_epoch(
+        args.source_checkpoint_epoch, args.epochs
+    )
+    header = (
+        f"Continuation epoch: [{epoch}/{args.epochs}]  "
+        f"Source-equivalent epoch: [{source_epoch}/{source_final}]"
+    )
 
     names_q, params_q, names_k, params_k = [], [], [], []
     for name_q, param_q in student.module.named_parameters():
@@ -422,7 +544,9 @@ def train_one_epoch(
 
         images = [image.cuda(non_blocking=True) for image in images]
         masks = [mask.cuda(non_blocking=True) for mask in masks]
-        crop_boxes = crop_boxes.cuda(non_blocking=True)
+        crop_boxes = (
+            crop_boxes.cuda(non_blocking=True) if ibot_loss.lambda3 != 0 else None
+        )
 
         autocast_enabled = args.precision in {"fp16", "bf16"}
         autocast_dtype = (
@@ -488,7 +612,9 @@ def train_one_epoch(
             if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
             utils.cancel_gradients_last_layer(
-                epoch, student, args.freeze_last_layer
+                source_epoch if source_epoch is not None else epoch,
+                student,
+                args.freeze_last_layer,
             )
             optimizer.step()
         else:
@@ -497,7 +623,9 @@ def train_one_epoch(
                 fp16_scaler.unscale_(optimizer)
                 utils.clip_gradients(student, args.clip_grad)
             utils.cancel_gradients_last_layer(
-                epoch, student, args.freeze_last_layer
+                source_epoch if source_epoch is not None else epoch,
+                student,
+                args.freeze_last_layer,
             )
             fp16_scaler.step(optimizer)
             fp16_scaler.update()

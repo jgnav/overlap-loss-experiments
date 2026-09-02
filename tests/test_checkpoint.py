@@ -8,10 +8,14 @@ import torch.nn as nn
 
 from losses import iBOTLoss
 from utils.checkpoint import (
+    continuation_provenance,
+    load_continuation_state,
     load_pretrained_state,
     load_resume_state,
+    milestone_checkpoint_name,
     read_pretrained_checkpoint,
     read_resume_checkpoint,
+    source_equivalent_epoch,
 )
 
 
@@ -70,6 +74,112 @@ class PretrainedCheckpointTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "official full checkpoint"):
                 read_pretrained_checkpoint(args)
+
+    def test_completed_continuation_can_become_a_new_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory) / "checkpoint.pth"
+            loss = make_loss()
+            torch.save(
+                {
+                    "student": {},
+                    "teacher": {},
+                    "ibot_loss": loss.state_dict(),
+                    "epoch": 200,
+                    "source_checkpoint_epoch": 800,
+                    "source_equivalent_epoch": 1000,
+                },
+                checkpoint_path,
+            )
+            args = SimpleNamespace(initial_checkpoint=checkpoint_path)
+
+            read_pretrained_checkpoint(args)
+
+            self.assertEqual(args.source_checkpoint_epoch, 1000)
+
+    def test_continuation_restores_optimizer_state_when_available(self):
+        source_student = nn.Linear(2, 2)
+        source_teacher = nn.Linear(2, 2)
+        source_loss = make_loss()
+        source_optimizer = torch.optim.AdamW(source_student.parameters(), lr=0.0123)
+        source_student(torch.ones(1, 2)).sum().backward()
+        source_optimizer.step()
+        checkpoint = {
+            "student": source_student.state_dict(),
+            "teacher": source_teacher.state_dict(),
+            "optimizer": source_optimizer.state_dict(),
+            "epoch": 800,
+            "ibot_loss": source_loss.state_dict(),
+            "fp16_scaler": {"scale": 16384.0},
+        }
+        student = nn.Linear(2, 2)
+        teacher = nn.Linear(2, 2)
+        loss = make_loss()
+        optimizer = torch.optim.AdamW(student.parameters(), lr=1.0)
+
+        restored = load_continuation_state(
+            checkpoint, student, teacher, loss, optimizer
+        )
+
+        self.assertTrue(restored)
+        self.assertTrue(optimizer.state)
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.0123)
+        # BF16 continuation has no scaler object and does not need to consume
+        # the source checkpoint's FP16 scaler state.
+
+    def test_bf16_continuation_does_not_require_fp16_scaler(self):
+        source_student = nn.Linear(2, 2)
+        source_teacher = nn.Linear(2, 2)
+        source_loss = make_loss()
+        source_optimizer = torch.optim.AdamW(source_student.parameters())
+        checkpoint = {
+            "student": source_student.state_dict(),
+            "teacher": source_teacher.state_dict(),
+            "optimizer": source_optimizer.state_dict(),
+            "epoch": 800,
+            "ibot_loss": source_loss.state_dict(),
+        }
+        student = nn.Linear(2, 2)
+        teacher = nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(student.parameters())
+
+        restored = load_continuation_state(
+            checkpoint, student, teacher, make_loss(), optimizer
+        )
+
+        self.assertTrue(restored)
+
+
+class ContinuationProvenanceTest(unittest.TestCase):
+    def test_source_epoch_800_can_run_200_additional_epochs(self):
+        self.assertEqual(source_equivalent_epoch(800, 0), 800)
+        self.assertEqual(source_equivalent_epoch(800, 200), 1000)
+
+    def test_milestone_names_and_provenance_encode_both_epoch_systems(self):
+        expected_names = {
+            50: "checkpoint_source0850_continuation0050.pth",
+            100: "checkpoint_source0900_continuation0100.pth",
+            150: "checkpoint_source0950_continuation0150.pth",
+            200: "checkpoint_source1000_continuation0200.pth",
+        }
+        for continuation_epoch, expected_name in expected_names.items():
+            with self.subTest(continuation_epoch=continuation_epoch):
+                self.assertEqual(
+                    milestone_checkpoint_name(800, continuation_epoch),
+                    expected_name,
+                )
+
+        provenance = continuation_provenance(800, 200, 200, "bf16")
+        self.assertEqual(
+            provenance,
+            {
+                "epoch": 200,
+                "continuation_epoch": 200,
+                "additional_epochs": 200,
+                "source_checkpoint_epoch": 800,
+                "source_equivalent_epoch": 1000,
+                "precision": "bf16",
+            },
+        )
 
 
 class RecordingScaler:

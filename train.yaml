@@ -1,6 +1,7 @@
 # Paths
 data_path: dataset/imagenet/train
-# Must be an official full checkpoint with student, teacher, heads, and centers.
+# Official epoch-800 full checkpoint. The continuation restores student,
+# teacher, heads, centers, and the available AdamW state.
 initial_checkpoint: checkpoints/ibot_vit_small.pth
 # Every launch creates a run-specific subdirectory below this root.
 output_dir: output/region_loss
@@ -11,8 +12,7 @@ arch: vit_small
 # Loss and teacher
 lambda1: 1.0  # Global CLS loss
 lambda2: 1.0  # Masked patch loss
-lambda3: 0.2  # Final intersection-region loss weight
-region_warmup_epochs: 5  # Linear ramp from zero to lambda3
+lambda3: 0.4  # Constant from the first epoch; set to 0.0 for pure iBOT.
 # Minimum two-view intersection as a fraction of the original image area.
 region_min_area: 0.10
 momentum_teacher: 0.9995
@@ -20,20 +20,25 @@ teacher_temp: 0.07
 teacher_patch_temp: 0.07
 
 # Training
-# Number of epochs in the new run. Schedules start from epoch 0.
-epochs: 50
+# Additional epochs after source epoch 800 (source-equivalent end: epoch 1000).
+additional_epochs: 200
 gpu_count: 4
 batch_size_per_gpu: 64
 seed: 0
-use_fp16: true
+precision: bf16
 
 # Optimizer and schedules
 optimizer: adamw
 lr_schedule: cosine
+# Continuation LR: cosine decay begins immediately, without initialization warm-up.
 lr: 0.0001
 min_lr: 0.000001
-warmup_epochs: 5
-weight_decay: 0.04
+warmup_epochs: 0
+# The official checkpoint ends at weight decay ~=0.4; do not reset it to 0.04.
+weight_decay: 0.4
+weight_decay_end: 0.4
+# Permanently retain source-equivalent epochs 850, 900, 950, and 1000.
+saveckp_freq: 50
 
 # Data loading
 num_workers: 10

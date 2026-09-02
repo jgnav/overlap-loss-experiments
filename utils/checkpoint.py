@@ -37,7 +37,6 @@ RESUME_COMPATIBILITY_KEYS = (
     "lambda1",
     "lambda2",
     "lambda3",
-    "region_warmup_epochs",
     "region_min_area",
     "momentum_teacher",
     "epochs",
@@ -98,8 +97,26 @@ def read_pretrained_checkpoint(args):
         )
     if "epoch" in checkpoint and not isinstance(checkpoint["epoch"], int):
         raise ValueError("The checkpoint epoch must be an integer")
+    if "optimizer" in checkpoint and not isinstance(checkpoint["optimizer"], Mapping):
+        raise ValueError("The checkpoint key 'optimizer' must be a mapping")
+    if "optimizer" in checkpoint:
+        missing_optimizer_state = sorted(
+            {"state", "param_groups"} - set(checkpoint["optimizer"])
+        )
+        if missing_optimizer_state:
+            raise ValueError(
+                "The checkpoint optimizer state is incomplete: "
+                f"{missing_optimizer_state}"
+            )
 
-    args.source_checkpoint_epoch = checkpoint.get("epoch")
+    # A completed continuation checkpoint stores its resume position in
+    # `epoch` and its absolute provenance in `source_equivalent_epoch`.
+    args.source_checkpoint_epoch = checkpoint.get(
+        "source_equivalent_epoch", checkpoint.get("epoch")
+    )
+    args.source_optimizer_available = "optimizer" in checkpoint
+    args.source_fp16_scaler_available = "fp16_scaler" in checkpoint
+    args.source_args_available = "args" in checkpoint
     return checkpoint
 
 
@@ -176,8 +193,9 @@ def read_resume_checkpoint(args):
         )
     _validate_resume_compatibility(checkpoint, args)
     args.resume_epoch = checkpoint["epoch"]
-    args.source_checkpoint_epoch = _checkpoint_argument(
-        checkpoint, "source_checkpoint_epoch"
+    args.source_checkpoint_epoch = checkpoint.get(
+        "source_checkpoint_epoch",
+        _checkpoint_argument(checkpoint, "source_checkpoint_epoch"),
     )
     return checkpoint
 
@@ -231,3 +249,69 @@ def load_resume_state(
     if fp16_scaler is not None:
         fp16_scaler.load_state_dict(checkpoint["fp16_scaler"])
     return checkpoint["epoch"]
+
+
+def load_continuation_state(
+    checkpoint,
+    student,
+    teacher,
+    ibot_loss,
+    optimizer,
+    fp16_scaler=None,
+):
+    """Load an external source checkpoint for additional training.
+
+    Unlike an exact resume, continuation starts at continuation epoch zero.
+    Model, teacher, centers, and Adam moments are restored when available. A
+    source FP16 scaler is deliberately irrelevant to BF16/FP32 continuation.
+    """
+    load_pretrained_state(checkpoint, student, teacher, ibot_loss)
+    optimizer_restored = "optimizer" in checkpoint
+    if optimizer_restored:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    if fp16_scaler is not None:
+        if "fp16_scaler" not in checkpoint:
+            raise ValueError(
+                "FP16 continuation requires the source FP16 scaler state"
+            )
+        fp16_scaler.load_state_dict(checkpoint["fp16_scaler"])
+    return optimizer_restored
+
+
+def source_equivalent_epoch(source_checkpoint_epoch, continuation_epoch):
+    if source_checkpoint_epoch is None:
+        return None
+    return source_checkpoint_epoch + continuation_epoch
+
+
+def continuation_provenance(
+    source_checkpoint_epoch,
+    continuation_epoch,
+    additional_epochs,
+    precision,
+):
+    """Return the unambiguous epoch/precision fields stored in checkpoints."""
+    return {
+        # `epoch` is retained for compatibility with exact-resume code.
+        "epoch": continuation_epoch,
+        "continuation_epoch": continuation_epoch,
+        "additional_epochs": additional_epochs,
+        "source_checkpoint_epoch": source_checkpoint_epoch,
+        "source_equivalent_epoch": source_equivalent_epoch(
+            source_checkpoint_epoch, continuation_epoch
+        ),
+        "precision": precision,
+    }
+
+
+def milestone_checkpoint_name(source_checkpoint_epoch, continuation_epoch):
+    """Name a permanent checkpoint by both continuation and source epoch."""
+    if continuation_epoch <= 0:
+        raise ValueError("continuation_epoch must be positive")
+    source_epoch = source_equivalent_epoch(
+        source_checkpoint_epoch, continuation_epoch
+    )
+    continuation = f"continuation{continuation_epoch:04d}"
+    if source_epoch is None:
+        return f"checkpoint_{continuation}.pth"
+    return f"checkpoint_source{source_epoch:04d}_{continuation}.pth"

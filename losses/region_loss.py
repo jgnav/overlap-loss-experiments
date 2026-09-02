@@ -98,6 +98,7 @@ class RegionLoss(nn.Module):
             student_patch_logits[0].shape[1],
             self.min_area,
         )
+        all_patch_weights = weights
 
         valid_count = valid.sum().float()
         local_valid_samples = int(valid_count.item())
@@ -157,4 +158,9 @@ class RegionLoss(nn.Module):
             "loss": loss,
             "valid_ratio": valid.float().mean(),
             "intersection_area": intersection_area.mean(),
+            # Reuse the already-computed geometry for diagnostics in iBOTLoss.
+            # These tensors are removed before the scalar logging dictionary is
+            # returned to the training loop.
+            "patch_weights": all_patch_weights,
+            "valid": valid,
         }
