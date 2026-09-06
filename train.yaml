@@ -12,7 +12,7 @@ arch: vit_small
 # Loss and teacher
 lambda1: 1.0  # Global CLS loss
 lambda2: 1.0  # Masked patch loss
-lambda3: 0.4  # Constant from the first epoch; set to 0.0 for pure iBOT.
+lambda3: 0.2  # Constant from the first epoch; set to 0.0 for pure iBOT.
 # Minimum two-view intersection as a fraction of the original image area.
 region_min_area: 0.10
 momentum_teacher: 0.9995

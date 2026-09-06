@@ -33,15 +33,15 @@ CHECKPOINTS = {
         REPO_ROOT
         / "output"
         / "region_loss"
-        / "20260818T154524Z-slurm-1295383"
-        / "checkpoint.pth"
+        / "20260903T181757Z-slurm-1309714"
+        / "checkpoint_source0900_continuation0100.pth"
     ),
     "Overlap": (
         REPO_ROOT
         / "output"
         / "region_loss"
-        / "20260818T233720Z-slurm-1295841"
-        / "checkpoint.pth"
+        / "20260904T062926Z-slurm-1309971"
+        / "checkpoint_source0900_continuation0100.pth"
     ),
 }
 
