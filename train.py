@@ -45,6 +45,8 @@ def load_config(path):
         user_config = yaml.safe_load(handle)
 
     config = {**get_ibot_recipe(user_config["arch"]), **user_config}
+    if config["centering"] not in ("centering", "sinkhorn_knopp"):
+        raise ValueError("centering must be one of: centering, sinkhorn_knopp")
     if "additional_epochs" in user_config and "epochs" in user_config:
         raise ValueError(
             "Configure training length with additional_epochs, not both keys"
@@ -490,6 +492,26 @@ def train_ibot(args, wandb_run=None):
     print(f"Training time {total_time_string}")
 
 
+@torch.no_grad()
+def get_teacher_targets(teacher_output, ibot_loss, epoch, centering):
+    """Select DINOv2-style teacher normalization before computing any losses."""
+    teacher_temp = ibot_loss.teacher_temp_schedule[epoch]
+    teacher_patch_temp = ibot_loss.teacher_temp2_schedule[epoch]
+    if centering == "centering":
+        teacher_targets = ibot_loss.softmax_center_teacher(
+            teacher_output, teacher_temp, teacher_patch_temp
+        )
+        # Use the old centers for this batch, then update them for the next one.
+        ibot_loss.update_center(*teacher_output)
+    elif centering == "sinkhorn_knopp":
+        teacher_targets = ibot_loss.sinkhorn_knopp_teacher(
+            teacher_output, teacher_temp, teacher_patch_temp
+        )
+    else:
+        raise ValueError(f"Unsupported teacher normalization: {centering!r}")
+    return teacher_targets
+
+
 def train_one_epoch(
     student,
     teacher,
@@ -557,7 +579,11 @@ def train_one_epoch(
             dtype=autocast_dtype,
             enabled=autocast_enabled,
         ):
-            teacher_output = teacher(images[: args.global_crops_number])
+            with torch.no_grad():
+                teacher_output = teacher(images[: args.global_crops_number])
+                teacher_targets = get_teacher_targets(
+                    teacher_output, ibot_loss, epoch, args.centering
+                )
             student_output = student(
                 images[: args.global_crops_number],
                 mask=masks[: args.global_crops_number],
@@ -573,11 +599,10 @@ def train_one_epoch(
 
             all_loss = ibot_loss(
                 student_output,
-                teacher_output,
+                teacher_targets,
                 student_local_cls,
                 masks,
                 crop_boxes,
-                epoch,
             )
             loss = all_loss.pop("loss")
 

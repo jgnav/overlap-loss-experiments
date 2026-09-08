@@ -1,8 +1,14 @@
+import datetime
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn.functional as F
 
 from losses import iBOTLoss
 
@@ -25,12 +31,139 @@ def make_loss(**overrides):
     return iBOTLoss(**arguments)
 
 
+def reference_sinkhorn(logits, temperature):
+    """Independent NumPy reference for DINOv2's three assignment iterations."""
+    weights = np.exp(logits.detach().float().numpy() / temperature).T
+    prototypes, tokens = weights.shape
+    weights /= weights.sum()
+    for _ in range(3):
+        weights /= weights.sum(axis=1, keepdims=True) * prototypes
+        weights /= weights.sum(axis=0, keepdims=True) * tokens
+    return torch.from_numpy((weights * tokens).T.copy())
+
+
+def distributed_sinkhorn_worker(rank, rendezvous):
+    dist.init_process_group(
+        "gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=30),
+    )
+    try:
+        loss = make_loss(patch_out_dim=5)
+        generator = torch.Generator().manual_seed(17)
+        cls = torch.randn(8, 3, generator=generator) * 0.1
+        patch = torch.randn(8, 4, 5, generator=generator) * 0.1
+        expected_cls = reference_sinkhorn(cls, 0.07)
+        expected_patch = reference_sinkhorn(
+            patch.flatten(0, 1), 0.09
+        ).reshape_as(patch)
+        # Exercise unequal token counts and a rank with no local tokens.
+        for split in (1, 0):
+            selection = slice(0, split) if rank == 0 else slice(split, 8)
+            actual = loss.sinkhorn_knopp_teacher(
+                (cls[selection], patch[selection]), 0.07, 0.09
+            )
+            torch.testing.assert_close(actual[0], expected_cls[selection])
+            torch.testing.assert_close(actual[1], expected_patch[selection])
+    finally:
+        dist.destroy_process_group()
+
+
 class AdaptationScheduleTest(unittest.TestCase):
     def test_teacher_temperatures_remain_at_pretrained_value(self):
         loss = make_loss()
 
         np.testing.assert_allclose(loss.teacher_temp_schedule, 0.07)
         np.testing.assert_allclose(loss.teacher_temp2_schedule, 0.07)
+
+
+class TeacherNormalizationTest(unittest.TestCase):
+    def test_center_softmax_and_ema_preserve_baseline_formula(self):
+        loss = make_loss(patch_out_dim=5, center_momentum2=0.8)
+        loss.center.copy_(torch.tensor([[0.1, -0.2, 0.3]]))
+        loss.center2.copy_(torch.linspace(-0.1, 0.1, 5).reshape(1, 1, 5))
+        cls = torch.randn(4, 3, requires_grad=True)
+        patch = torch.randn(4, 4, 5, requires_grad=True)
+        old_cls_center = loss.center.clone()
+        old_patch_center = loss.center2.clone()
+
+        targets = loss.softmax_center_teacher((cls, patch), 0.07, 0.09)
+
+        torch.testing.assert_close(
+            targets[0], ((cls - old_cls_center) / 0.07).softmax(-1)
+        )
+        torch.testing.assert_close(
+            targets[1], ((patch - old_patch_center) / 0.09).softmax(-1)
+        )
+        self.assertFalse(targets[0].requires_grad)
+        self.assertFalse(targets[1].requires_grad)
+        torch.testing.assert_close(loss.center, old_cls_center)
+        torch.testing.assert_close(loss.center2, old_patch_center)
+
+        loss.update_center(cls, patch)
+
+        torch.testing.assert_close(
+            loss.center, old_cls_center * 0.9 + cls.mean(0) * 0.1
+        )
+        torch.testing.assert_close(
+            loss.center2, old_patch_center * 0.8 + patch.mean((0, 1)) * 0.2
+        )
+
+    def test_sinkhorn_matches_reference_for_cls_and_all_patches_in_fp32(self):
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                loss = make_loss(patch_out_dim=5)
+                cls = (torch.randn(4, 3) * 0.1).to(dtype).requires_grad_()
+                patch = (torch.randn(4, 4, 5) * 0.1).to(dtype).requires_grad_()
+                originals = (cls.detach().clone(), patch.detach().clone())
+                # Nonzero centers must have no influence on SK targets.
+                loss.center.fill_(100)
+                loss.center2.fill_(-100)
+
+                targets = loss.sinkhorn_knopp_teacher((cls, patch), 0.07, 0.09)
+
+                expected = (
+                    reference_sinkhorn(cls, 0.07),
+                    reference_sinkhorn(patch.flatten(0, 1), 0.09).reshape_as(patch),
+                )
+                for actual, reference in zip(targets, expected):
+                    torch.testing.assert_close(actual, reference)
+                    self.assertEqual(actual.dtype, torch.float32)
+                    self.assertFalse(actual.requires_grad)
+                    self.assertTrue(torch.isfinite(actual).all())
+                    torch.testing.assert_close(
+                        actual.sum(-1), torch.ones(actual.shape[:-1])
+                    )
+                torch.testing.assert_close(cls, originals[0])
+                torch.testing.assert_close(patch, originals[1])
+                torch.testing.assert_close(
+                    loss.center, torch.full_like(loss.center, 100)
+                )
+                torch.testing.assert_close(
+                    loss.center2, torch.full_like(loss.center2, -100)
+                )
+
+    def test_sinkhorn_balances_constant_prototype_bias(self):
+        loss = make_loss()
+        cls = torch.tensor([[0.1, 0.2, 0.3]]).expand(4, -1)
+        patch = cls[:, None, :].expand(-1, 4, -1)
+        targets = loss.sinkhorn_knopp_teacher((cls, patch), 0.07, 0.07)
+        for target in targets:
+            torch.testing.assert_close(target, torch.full_like(target, 1 / 3))
+
+    @unittest.skipUnless(
+        dist.is_available() and dist.is_gloo_available(), "Gloo required"
+    )
+    def test_distributed_sinkhorn_matches_global_batch_with_unequal_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rendezvous = (Path(directory) / "rendezvous").as_uri()
+            mp.spawn(
+                distributed_sinkhorn_worker,
+                args=(rendezvous,), nprocs=2, join=True,
+            )
+
 
 class PureIBOTAndDiagnosticsTest(unittest.TestCase):
     @staticmethod
@@ -70,10 +203,12 @@ class PureIBOTAndDiagnosticsTest(unittest.TestCase):
             side_effect=AssertionError("RegionLoss must be inactive")
         )
         student, teacher, masks, crop_boxes = self._inputs()
+        targets = loss.softmax_center_teacher(teacher, 0.07, 0.07)
 
-        result = loss(student, teacher, None, masks, None, epoch=0)
+        result = loss(student, targets, None, masks, None)
 
         loss.region_loss.forward.assert_not_called()
+        loss.update_center.assert_not_called()
         torch.testing.assert_close(result["loss"], result["cls"] + result["patch"])
         self.assertEqual(result["region_active"].item(), 0.0)
         self.assertEqual(result["region_raw"].item(), 0.0)
@@ -85,12 +220,13 @@ class PureIBOTAndDiagnosticsTest(unittest.TestCase):
         loss = make_loss(lambda3=0.2)
         loss.update_center = mock.Mock()
         student, teacher, masks, crop_boxes = self._inputs()
+        targets = loss.softmax_center_teacher(teacher, 0.07, 0.07)
         with mock.patch.object(
             loss.region_loss,
             "forward",
             wraps=loss.region_loss.forward,
         ) as region_forward:
-            result = loss(student, teacher, None, masks, crop_boxes, epoch=0)
+            result = loss(student, targets, None, masks, crop_boxes)
 
         region_forward.assert_called_once()
         self.assertAlmostEqual(result["region_weight"].item(), 0.2)
@@ -111,6 +247,55 @@ class PureIBOTAndDiagnosticsTest(unittest.TestCase):
             "teacher_patch_effective_prototypes",
         ):
             self.assertTrue(torch.isfinite(result[key]).item(), key)
+
+    def test_both_modes_use_targets_once_for_cls_patches_and_regions(self):
+        for mode in ("softmax_center_teacher", "sinkhorn_knopp_teacher"):
+            with self.subTest(mode=mode):
+                loss = make_loss(nlcrops=1)
+                student, teacher, masks, crop_boxes = self._inputs()
+                local_cls = torch.randn(2, 3, requires_grad=True)
+                # Include an unmasked patch and a fully unmasked sample.
+                masks[0][0, 0, 0] = False
+                masks[1][1] = False
+                targets = getattr(loss, mode)(teacher, 0.07, 0.07)
+                teacher_cls = targets[0].chunk(2)
+                teacher_patch = targets[1].chunk(2)
+                student_cls = torch.cat((student[0], local_cls)).chunk(3)
+                student_patch = student[1].chunk(2)
+                expected_cls = torch.stack(
+                    [
+                        -(teacher_cls[q] * F.log_softmax(
+                            student_cls[v] / 0.1, -1
+                        )).sum(-1).mean()
+                        for q in range(2)
+                        for v in range(3)
+                        if q != v
+                    ]
+                ).mean()
+                expected_patch = []
+                for q in range(2):
+                    ce = -(teacher_patch[q] * F.log_softmax(
+                        student_patch[q] / 0.1, -1
+                    )).sum(-1)
+                    mask = masks[q].flatten(1)
+                    expected_patch.append(
+                        ((ce * mask).sum(-1) / mask.sum(-1).clamp_min(1)).mean()
+                    )
+
+                with mock.patch.object(
+                    loss.region_loss, "forward", wraps=loss.region_loss.forward
+                ) as region:
+                    result = loss(student, targets, local_cls, masks, crop_boxes)
+
+                torch.testing.assert_close(result["cls"], expected_cls)
+                torch.testing.assert_close(
+                    result["patch"], torch.stack(expected_patch).mean()
+                )
+                for actual, expected in zip(region.call_args.args[1], teacher_patch):
+                    torch.testing.assert_close(actual, expected)
+                result["loss"].backward()
+                for logits in (*student, local_cls):
+                    self.assertTrue(torch.isfinite(logits.grad).all())
 
 
 if __name__ == "__main__":

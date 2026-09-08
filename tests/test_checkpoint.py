@@ -260,6 +260,26 @@ class ResumeCheckpointTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "lambda3"):
                 read_resume_checkpoint(args)
 
+    def test_resume_checks_normalization_and_treats_legacy_as_centering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory) / "checkpoint.pth"
+            for saved_mode in (None, "centering", "sinkhorn_knopp"):
+                checkpoint = self._make_checkpoint()
+                if saved_mode is not None:
+                    checkpoint["args"].centering = saved_mode
+                torch.save(checkpoint, checkpoint_path)
+                for requested_mode in ("centering", "sinkhorn_knopp"):
+                    with self.subTest(saved=saved_mode, requested=requested_mode):
+                        args = SimpleNamespace(
+                            resume_checkpoint=checkpoint_path, epochs=50,
+                            use_fp16=True, centering=requested_mode,
+                        )
+                        if requested_mode == (saved_mode or "centering"):
+                            read_resume_checkpoint(args)
+                        else:
+                            with self.assertRaisesRegex(ValueError, "centering"):
+                                read_resume_checkpoint(args)
+
 
 if __name__ == "__main__":
     unittest.main()

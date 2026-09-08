@@ -27,6 +27,7 @@ RESUME_COMPATIBILITY_KEYS = (
     "local_crop_size",
     "local_crops_scale",
     "student_temp",
+    "centering",
     "center_momentum",
     "center_momentum2",
     "warmup_teacher_temp",
@@ -143,6 +144,9 @@ def _validate_resume_compatibility(checkpoint, args):
     mismatches = []
     for key in RESUME_COMPATIBILITY_KEYS:
         saved_value = _checkpoint_argument(checkpoint, key)
+        if key == "centering" and saved_value is None:
+            # Checkpoints written before this option always used centering.
+            saved_value = "centering"
         if saved_value is None or not hasattr(args, key):
             continue
         configured_value = getattr(args, key)

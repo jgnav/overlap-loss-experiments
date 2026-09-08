@@ -83,6 +83,72 @@ class iBOTLoss(nn.Module):
             )
         )
 
+    @torch.no_grad()
+    def softmax_center_teacher(
+        self, teacher_output, teacher_temp, teacher_patch_temp
+    ):
+        """Build detached CLS and dense patch targets using the current centers."""
+        teacher_cls, teacher_patch = teacher_output
+        return (
+            F.softmax((teacher_cls - self.center) / teacher_temp, dim=-1),
+            F.softmax((teacher_patch - self.center2) / teacher_patch_temp, dim=-1),
+        )
+
+    @staticmethod
+    @torch.no_grad()
+    def _sinkhorn_knopp(teacher_logits, teacher_temp, n_iterations):
+        """DINOv2's distributed assignment normalization on [tokens, prototypes].
+
+        See facebookresearch/dinov2, dinov2/loss/dino_clstoken_loss.py and
+        dinov2/loss/ibot_patch_loss.py. The token count is summed across ranks,
+        as in the patch loss, so ranks may contribute different token counts.
+        """
+        assignments = (teacher_logits.float() / teacher_temp).exp().t()
+        distributed = dist.is_available() and dist.is_initialized()
+        token_count = torch.tensor(
+            teacher_logits.shape[0], device=teacher_logits.device, dtype=torch.long
+        )
+        if distributed:
+            dist.all_reduce(token_count)
+        if token_count.item() == 0:
+            return assignments.t()
+
+        total_mass = assignments.sum()
+        if distributed:
+            dist.all_reduce(total_mass)
+        assignments /= total_mass
+        prototype_count = assignments.shape[0]
+        for _ in range(n_iterations):
+            prototype_mass = assignments.sum(dim=1, keepdim=True)
+            if distributed:
+                dist.all_reduce(prototype_mass)
+            assignments /= prototype_mass
+            assignments /= prototype_count
+            assignments /= assignments.sum(dim=0, keepdim=True)
+            assignments /= token_count
+        assignments *= token_count
+        return assignments.t()
+
+    @torch.no_grad()
+    def sinkhorn_knopp_teacher(
+        self, teacher_output, teacher_temp, teacher_patch_temp, n_iterations=3
+    ):
+        """Balance CLS and patch prototypes separately, without using centers.
+
+        Both global crops participate in each assignment problem. Unlike
+        DINOv2's masked-only patch targets, this repo needs every patch for the
+        region loss. Use the same dense targets when lambda3 is zero so the
+        iBOT control and region experiment share their teacher normalization.
+        """
+        teacher_cls, teacher_patch = teacher_output
+        cls_targets = self._sinkhorn_knopp(
+            teacher_cls, teacher_temp, n_iterations
+        )
+        patch_targets = self._sinkhorn_knopp(
+            teacher_patch.flatten(0, 1), teacher_patch_temp, n_iterations
+        ).reshape_as(teacher_patch)
+        return cls_targets, patch_targets
+
     @staticmethod
     @torch.no_grad()
     def _distribution_diagnostics(distributions, are_probabilities):
@@ -171,14 +237,14 @@ class iBOTLoss(nn.Module):
     def forward(
         self,
         student_output,
-        teacher_output,
+        teacher_targets,
         student_local_cls,
         student_mask,
         crop_boxes,
-        epoch,
     ):
+        """Compute losses from student logits and pre-normalized teacher targets."""
         student_cls, student_patch = student_output
-        teacher_cls, teacher_patch = teacher_output
+        teacher_cls, teacher_patch = teacher_targets
 
         if student_local_cls is not None:
             student_cls = torch.cat([student_cls, student_local_cls])
@@ -188,14 +254,8 @@ class iBOTLoss(nn.Module):
         student_patch = student_patch / self.student_temp
         student_patch_c = student_patch.chunk(self.ngcrops)
 
-        temp = self.teacher_temp_schedule[epoch]
-        temp2 = self.teacher_temp2_schedule[epoch]
-        teacher_cls_c = F.softmax((teacher_cls - self.center) / temp, dim=-1)
-        teacher_cls_c = teacher_cls_c.detach().chunk(self.ngcrops)
-        teacher_patch_c = F.softmax(
-            (teacher_patch - self.center2) / temp2, dim=-1
-        )
-        teacher_patch_c = teacher_patch_c.detach().chunk(self.ngcrops)
+        teacher_cls_c = teacher_cls.detach().chunk(self.ngcrops)
+        teacher_patch_c = teacher_patch.detach().chunk(self.ngcrops)
 
         total_loss1, n_loss_terms1 = 0, 0
         total_loss2, n_loss_terms2 = 0, 0
@@ -297,23 +357,24 @@ class iBOTLoss(nn.Module):
             "region_intersection_area": region_intersection_area,
             "loss": objective,
         }
-        self.update_center(teacher_cls, teacher_patch)
         return total_loss
 
     @torch.no_grad()
     def update_center(self, teacher_cls, teacher_patch):
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
         cls_center = torch.sum(teacher_cls, dim=0, keepdim=True)
-        dist.all_reduce(cls_center)
-        cls_center = cls_center / (len(teacher_cls) * dist.get_world_size())
+        if distributed:
+            dist.all_reduce(cls_center)
+        cls_center = cls_center / (len(teacher_cls) * world_size)
         self.center = self.center * self.center_momentum + cls_center * (
             1 - self.center_momentum
         )
 
         patch_center = torch.sum(teacher_patch.mean(1), dim=0, keepdim=True)
-        dist.all_reduce(patch_center)
-        patch_center = patch_center / (
-            len(teacher_patch) * dist.get_world_size()
-        )
+        if distributed:
+            dist.all_reduce(patch_center)
+        patch_center = patch_center / (len(teacher_patch) * world_size)
         self.center2 = self.center2 * self.center_momentum2 + patch_center * (
             1 - self.center_momentum2
         )
