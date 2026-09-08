@@ -29,32 +29,36 @@ OUTPUT_DIR = REPO_ROOT / "output" / "pca_visualizations"
 
 CHECKPOINTS = {
     "Official iBOT": REPO_ROOT / "checkpoints" / "ibot_vit_small.pth",
-    "50-epoch control": (
+    "200 epoch control": (
         REPO_ROOT
         / "output"
         / "region_loss"
         / "20260903T181757Z-slurm-1309714"
-        / "checkpoint_source0900_continuation0100.pth"
+        / "checkpoint_source1000_continuation0200.pth"
     ),
     "Overlap": (
         REPO_ROOT
         / "output"
         / "region_loss"
         / "20260904T062926Z-slurm-1309971"
-        / "checkpoint_source0900_continuation0100.pth"
+        / "checkpoint_source1000_continuation0200.pth"
     ),
 }
 
 CHECKPOINT_KEY = "teacher"
 ARCH = "vit_small"
 
-N_IMAGES = 12
+N_IMAGES = 100
 SEED = 0
 
 # 560 is divisible by the ViT-S/16 patch size and gives a 35 x 35 dense grid.
 # Increase to 1120 for a CRISP-like high-resolution figure if GPU memory/time
 # are not a concern (70 x 70 patch tokens, much more expensive attention).
 VIS_RESOLUTION = 560
+
+# Average corresponding patch embeddings from the last N transformer blocks.
+# Each block output is LayerNorm-normalized. Set to 1 for the old visualization.
+N_LAST_LAYERS = 4
 
 # PCA is whitened so components have comparable scale. The sigmoid provides a
 # smooth [0, 1] color mapping without per-image min/max clipping.
@@ -135,13 +139,21 @@ def _prepare_selected_images(
 
 @torch.inference_mode()
 def _extract_dense_features(model: torch.nn.Module, image: Image.Image) -> np.ndarray:
-    """Extract final normalized patch tokens, matching the repo dense evaluator."""
+    """Average the last N normalized block outputs at each patch position."""
+    depth = model.get_num_layers()
+    if type(N_LAST_LAYERS) is not int or not 1 <= N_LAST_LAYERS <= depth:
+        raise ValueError(
+            f"N_LAST_LAYERS must be an integer between 1 and {depth}, "
+            f"got {N_LAST_LAYERS!r}"
+        )
+
     tensor = MODEL_TRANSFORM(image).unsqueeze(0).to(DEVICE, non_blocking=True)
 
-    # The dense evaluator uses exactly this representation:
-    # model.get_intermediate_layers(images, n=1)[0][:, 1:]
-    tokens = model.get_intermediate_layers(tensor, n=1)[0][:, 1:]
-    tokens = tokens.squeeze(0).float().cpu().numpy()
+    # Exclude CLS from every block and average in FP32 before fitting PCA.
+    # Unlike the dense evaluator (last block only), this mixes multiple depths.
+    layers = model.get_intermediate_layers(tensor, n=N_LAST_LAYERS)
+    tokens = torch.stack([layer[:, 1:].float() for layer in layers], dim=0).mean(dim=0)
+    tokens = tokens.squeeze(0).cpu().numpy()
 
     grid_size = math.isqrt(tokens.shape[0])
     if grid_size * grid_size != tokens.shape[0]:
@@ -260,6 +272,7 @@ def main() -> None:
 
     print(f"Selected {len(originals)} ImageNet validation images")
     print(f"Visualization resolution: {VIS_RESOLUTION} x {VIS_RESOLUTION}")
+    print(f"PCA features: mean of the last {N_LAST_LAYERS} normalized block outputs")
     print(f"Output directory: {OUTPUT_DIR}")
 
     all_maps: dict[str, list[Image.Image]] = {}
