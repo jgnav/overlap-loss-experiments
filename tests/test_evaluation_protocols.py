@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, TensorDataset
 
+from evaluation.prepare_voc_manifest import VOC_CLASSES, build_voc2012_manifest, prepare_voc2012_manifest
 from evaluation.utils import classification, dense, orchestrator
 from evaluation.utils.classification_data import read_multilabel_manifest
 from evaluation.utils.common import checkpoint_fingerprint, evaluation_identity
@@ -86,25 +87,123 @@ class VOCConstructionTest(unittest.TestCase):
         (splits / "val.txt").write_text("heldout\n")
         (self.augmented / "train.txt").write_text("a\nb\nheldout\n")
         (self.augmented / "val.txt").write_text("c\nd\n")
+        masks = self.original / "SegmentationClass"
+        masks.mkdir()
+        for item in ("a", "d", "heldout"):
+            Image.new("L", (8, 8)).save(masks / f"{item}.png")
 
-    def test_released_capi_order_mask_sources_duplicates_and_overlap(self):
+    def test_clean_sorted_ids_original_mask_precedence_and_zero_overlap(self):
         dataset = make_pascal_voc(self.root, "trainaug")
-        self.assertEqual([p.stem for p in dataset.images], ["a", "d", "a", "b", "heldout", "c", "d"])
+        self.assertEqual([p.stem for p in dataset.images], ["a", "b", "c", "d"])
         self.assertEqual(dataset.targets[0], self.original / "SegmentationClass/a.png")
-        self.assertEqual(dataset.targets[2], self.augmented / "cls/a.mat")
+        self.assertEqual(dataset.targets[1], self.augmented / "cls/b.mat")
+        self.assertEqual(dataset.targets[3], self.original / "SegmentationClass/d.png")
         meta = segmentation_manifest(dataset)
-        self.assertEqual(meta["repeated_image_entries"], 2)
-        self.assertEqual(meta["official_val_overlap_unique_ids"], 1)
-        self.assertEqual(meta["unique_image_ids"], 5)
-        self.assertIn("does not reproduce", meta["upstream_limitation"])
+        self.assertEqual(meta["construction"], "voc2012_sbd_disjoint_trainaug_v1")
+        self.assertEqual(meta["repeated_image_entries"], 0)
+        self.assertEqual(meta["official_val_overlap_unique_ids"], 0)
+        self.assertEqual(meta["unique_image_ids"], 4)
+        self.assertEqual(meta["deduplicated_source_entries"], 2)
+        self.assertEqual(meta["excluded_official_val_unique_ids"], 1)
+        self.assertEqual(meta["source_image_entries"], 7)
         before = meta["ordered_pairs_sha256"]
         dataset.targets[2] = dataset.targets[0]
         self.assertNotEqual(segmentation_manifest(dataset)["ordered_pairs_sha256"], before)
+
+    def test_prefers_original_masks_even_for_sbd_only_training_ids(self):
+        Image.new("L", (8, 8)).save(self.original / "SegmentationClass/b.png")
+        dataset = make_pascal_voc(self.root, "trainaug")
+        self.assertEqual(dataset.targets[1], self.original / "SegmentationClass/b.png")
+        self.assertEqual(dataset.images[1], self.original / "JPEGImages/b.jpg")
 
     def test_official_validation_uses_only_original_masks(self):
         dataset = make_pascal_voc(self.root, "val")
         self.assertEqual(dataset.images, [self.original / "JPEGImages/heldout.jpg"])
         self.assertEqual(dataset.targets, [self.original / "SegmentationClass/heldout.png"])
+
+    def test_rejects_duplicate_official_validation_ids(self):
+        (self.original / "ImageSets/Segmentation/val.txt").write_text("heldout\nheldout\n")
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            make_pascal_voc(self.root, "val")
+
+    def test_internal_holdout_is_image_disjoint_and_seeded(self):
+        (self.augmented / "val.txt").write_text("\n".join(["c", "d"] + [f"extra{i}" for i in range(20)]))
+        sets = dense._build_dense_datasets("pascal_voc", self.root, 0)
+        train_ids = {sets["train"].dataset.images[i].stem for i in sets["train"].indices}
+        holdout_ids = {sets["val"].dataset.images[i].stem for i in sets["val"].indices}
+        test_ids = {p.stem for p in sets["test"].images}
+        self.assertEqual(len(train_ids), 22)
+        self.assertEqual(len(holdout_ids), 2)
+        self.assertFalse(train_ids & holdout_ids or train_ids & test_ids or holdout_ids & test_ids)
+        repeated = dense._build_dense_datasets("pascal_voc", self.root, 0)
+        self.assertEqual(sets["val"].indices, repeated["val"].indices)
+
+
+class VOCClassificationPreparationTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.voc = self.root / "pascal_voc/VOCdevkit/VOC2012"
+        self.main = self.voc / "ImageSets/Main"
+        self.main.mkdir(parents=True)
+        images = self.voc / "JPEGImages"
+        images.mkdir()
+        for item in ("a", "b", "c", "d", "difficult"):
+            Image.new("RGB", (8, 8)).save(images / f"{item}.jpg")
+        for split, positive, negative in (("train", "a", "b"), ("val", "c", "d")):
+            ids = [positive, negative] + (["difficult"] if split == "val" else [])
+            (self.main / f"{split}.txt").write_text("\n".join(ids) + "\n")
+            for index, class_name in enumerate(VOC_CLASSES):
+                # Deliberately reverse annotation rows: alignment must use IDs.
+                rows = f"{negative} -1\n{positive} 1\n"
+                if split == "val":
+                    rows += f"difficult {1 if index == 0 else 0}\n"
+                (self.main / f"{class_name}_{split}.txt").write_text(rows)
+
+    def test_prepares_valid_reproducible_classification_manifest(self):
+        result = prepare_voc2012_manifest(self.root)
+        path = Path(result["manifest"])
+        payload = path.read_bytes()
+        samples, classes, metadata = read_multilabel_manifest(path, self.root, "pascal_voc", 20)
+        self.assertEqual(classes, list(VOC_CLASSES))
+        self.assertEqual(metadata["split_sizes"], {"train": 2, "val": 3})
+        self.assertEqual(samples["train"][0][1], [1] * 20)
+        self.assertEqual(samples["train"][1][1], [0] * 20)
+        self.assertEqual(samples["val"][2][1], [1] + [-1] * 19)
+        manifest = json.loads(payload)
+        self.assertEqual(manifest["splits"]["val"][2]["labels"], [1] + [None] * 19)
+        self.assertFalse(Path(manifest["splits"]["train"][0]["image"]).is_absolute())
+        self.assertEqual(len(manifest["source_files_sha256"]), 42)
+        prepare_voc2012_manifest(self.root)
+        self.assertEqual(path.read_bytes(), payload)
+
+    def test_refuses_to_replace_an_existing_different_manifest(self):
+        output = self.root / "existing.json"
+        output.write_text("existing data")
+        with self.assertRaises(FileExistsError):
+            prepare_voc2012_manifest(self.root, output=output)
+        self.assertEqual(output.read_text(), "existing data")
+
+    def test_rejects_native_label_and_annotation_id_errors(self):
+        path = self.main / "aeroplane_train.txt"
+        for text in ("a 2\nb -1\n", "a 1\na -1\n", "a 1\nunknown -1\n", "a 1\n"):
+            with self.subTest(text=text):
+                path.write_text(text)
+                with self.assertRaises(ValueError):
+                    build_voc2012_manifest(self.root)
+
+    def test_rejects_overlapping_or_duplicate_split_ids(self):
+        for text in ("c\na\n", "c\nc\n"):
+            (self.main / "val.txt").write_text(text)
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "overlap"):
+                build_voc2012_manifest(self.root)
+
+    def test_missing_images_fail_before_publishing_manifest(self):
+        (self.voc / "JPEGImages/a.jpg").unlink()
+        with self.assertRaises(FileNotFoundError):
+            prepare_voc2012_manifest(self.root)
+        self.assertFalse((self.root / "evaluation_manifests/pascal_voc.json").exists())
 
 
 class SegmentationResolutionTest(unittest.TestCase):
@@ -141,6 +240,14 @@ class SegmentationResolutionTest(unittest.TestCase):
                 extract.reset_mock()
                 dense._load_or_extract_features(None, metadata, args, "pascal_voc")
                 extract.assert_not_called()
+                # A cache at the current resolution but with the old leaky
+                # VOC construction must also be rejected, not only 224 caches.
+                cached = torch.load(path, map_location="cpu", weights_only=False)
+                self.assertEqual(cached["metadata"]["resolution"], 256)
+                cached["metadata"]["datasets"] = {"construction": "capi_released_voc2012_trainaug_v1"}
+                torch.save(cached, path)
+                dense._load_or_extract_features(None, metadata, args, "pascal_voc")
+                self.assertEqual(extract.call_count, 3)
 
 
 class ManifestTest(unittest.TestCase):

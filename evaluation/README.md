@@ -18,19 +18,26 @@ official validation set. k-NN tests k in {1, 3, 10, 30} with cosine/L2 distance;
 linear segmentation uses CAPI's cuML logistic-regression sweep. The paper-style
 mIoU percentage is `metrics.miou_percent`.
 
-VOC `trainaug` now follows the **released CAPI loader literally**:
-original VOC training list, then SBD training list, then SBD validation list.
-List order and repeated IDs are preserved. Original entries use original PNG
-masks; SBD entries use SBD MAT masks. The evaluation set is original VOC val.
+VOC `trainaug` uses a **clean, disjoint split**:
+`unique(VOC train + SBD train + SBD val) - official VOC val`. Image IDs are
+sorted, each image appears once, and original VOC PNG masks are preferred
+where available; remaining images use SBD MAT masks. For the prepared dataset
+this gives **10,582 training images and 1,449 official validation images**, with
+zero intersection. The seeded internal 10% holdout is drawn only after cleaning
+the training list. Official validation is never used to fit or select probes.
 
-**Upstream limitation:** that released loader explicitly states that it does
-not reproduce CAPI's paper results. Its concatenation can retain both duplicate
-images and official validation images appearing in SBD. Reproducing the loader
-does not establish the image split used for CG-SSL/CRISP's published numbers.
-Results record duplicate counts, official-val overlap, and ordered image/mask
-pair hashes under `dataset_manifests`. Interpret these as reproduction of the
-released loader, including its limitations, rather than a clean held-out VOC
-benchmark. Do not erase these metadata when reporting scores.
+This intentionally differs from the released CAPI loader, whose concatenation
+previously produced 12,819 entries, 1,134 repetitions, and 1,103 official
+validation images in training on our data. That loader also warns that its VOC
+results do not reproduce its paper. Our clean split does not establish exact
+CG-SSL/CRISP published-score equivalence. Results record the new construction
+ID, mask policy, removed entries, zero final overlap, and ordered image/mask
+pair hashes under `dataset_manifests`.
+
+Re-evaluate official iBOT, the continued-iBOT control, and the overlap model
+under this same clean protocol; do not compare contaminated VOC scores as
+held-out results. Use a new output directory to preserve the old results for
+provenance. Backbone retraining is not required.
 
 Changes to resolution, dataset list construction, seed, source code, or manifest
 files invalidate old caches/results. Incompatible dense caches are recomputed.
@@ -94,6 +101,25 @@ class directories. Multilabel tasks read:
 <datasets-root>/evaluation_manifests/pascal_voc.json
 <datasets-root>/evaluation_manifests/coco.json
 ```
+
+For VOC we select **VOC2012 classification train/val**, not segmentation/SBD:
+5,717 training images and 5,823 validation images, with 20 ordered object
+classes. Prepare its manifest from the already extracted official files:
+
+```bash
+python -m evaluation.prepare_voc_manifest --datasets-root dataset
+```
+
+The default source is `dataset/pascal_voc/VOCdevkit/VOC2012`; use `--voc-root`
+for another location. The tool reads `ImageSets/Main/{train,val}.txt` and all
+20 per-class annotation files, converts negative/difficult/positive labels to
+`0`/`null`/`1`, records source-file hashes, and validates the manifest with the
+evaluation loader before saving. Identical output is reusable; a different
+existing manifest is not overwritten. Generated manifests live with the
+locally prepared datasets rather than being committed to Git.
+
+COCO still needs its explicitly selected version, images, annotations, and
+`coco.json` manifest; preparing VOC does not prepare or skip COCO.
 
 Use `--classification-manifests /path/to/manifests` to locate those files
 elsewhere. Every file uses this schema (the example shows only two classes;

@@ -163,17 +163,26 @@ def make_pascal_voc(root, split, transform=None, target_transform=None):
     )
     augmented_train = _read_ids(augmented / "train.txt")
     augmented_val = _read_ids(augmented / "val.txt")
+    validation_ids = set(original_val)
+    if len(validation_ids) != len(original_val):
+        raise ValueError("VOC official validation split contains duplicate image IDs")
+    source_ids = original_train + augmented_train + augmented_val
     if split == "trainaug":
-        # Literal construction in facebookresearch/capi/data.py:VOC2012.
-        # CRISP A.2 specifies the released CAPI evaluator without modification.
-        # Preserve list order, repeated IDs, and original/SBD mask provenance.
-        # Upstream explicitly warns that this loader does not reproduce its
-        # paper's VOC scores. Record duplicates and validation overlap below;
-        # reproducing this code is not proof of reproducing the published scores.
-        images = [original / "JPEGImages" / f"{item}.jpg" for item in original_train]
-        targets = [original / "SegmentationClass" / f"{item}.png" for item in original_train]
-        images.extend(augmented / "img" / f"{item}.jpg" for item in augmented_train + augmented_val)
-        targets.extend(augmented / "cls" / f"{item}.mat" for item in augmented_train + augmented_val)
+        # One entry per image, with official validation excluded BEFORE the
+        # seeded probe holdout is drawn. Sorting makes the split reproducible.
+        # This deliberately corrects the released CAPI loader's concatenation.
+        train_ids = sorted(set(source_ids) - validation_ids)
+        original_mask_ids = {
+            path.stem for path in (original / "SegmentationClass").glob("*.png")
+        }
+        images, targets = [], []
+        for item in train_ids:
+            if item in original_mask_ids:
+                images.append(original / "JPEGImages" / f"{item}.jpg")
+                targets.append(original / "SegmentationClass" / f"{item}.png")
+            else:
+                images.append(augmented / "img" / f"{item}.jpg")
+                targets.append(augmented / "cls" / f"{item}.mat")
     elif split == "val":
         images = [original / "JPEGImages" / f"{item}.jpg" for item in original_val]
         targets = [
@@ -186,20 +195,27 @@ def make_pascal_voc(root, split, transform=None, target_transform=None):
     ids = [path.stem for path in images]
     counts = Counter(ids)
     dataset.protocol_metadata = {
-        "construction": "capi_released_voc2012_trainaug_v1",
-        "source": "https://github.com/facebookresearch/capi/blob/main/data.py",
+        "construction": "voc2012_sbd_disjoint_trainaug_v1",
+        "source": "VOC2012 ImageSets/Segmentation and SBD train/val lists",
+        "mask_policy": "original VOC PNG when available; otherwise SBD MAT",
+        "training_order": "sorted unique image IDs",
         "split": split,
         "unique_image_ids": len(counts),
         "repeated_image_entries": len(ids) - len(counts),
         "official_val_overlap_unique_ids": (
-            len(set(ids).intersection(original_val)) if split == "trainaug" else None
+            len(set(ids).intersection(validation_ids)) if split == "trainaug" else None
         ),
-        "upstream_limitation": (
-            "CAPI's released VOC loader states it does not reproduce its paper's "
-            "results. Its trainaug concatenation retains repeated image IDs and "
-            "any official validation images present in SBD."
+        "published_score_equivalence": (
+            "Not established. This clean split differs from the released CAPI "
+            "concatenation: duplicates and official validation images are removed."
         ),
     }
+    if split == "trainaug":
+        dataset.protocol_metadata.update({
+            "source_image_entries": len(source_ids),
+            "deduplicated_source_entries": len(source_ids) - len(set(source_ids)),
+            "excluded_official_val_unique_ids": len(set(source_ids) & validation_ids),
+        })
     return dataset
 
 

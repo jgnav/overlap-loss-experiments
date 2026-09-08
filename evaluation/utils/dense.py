@@ -497,7 +497,11 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
         "dataset_sizes": {key: len(value) for key, value in datasets.items()},
         "dataset_manifests": _dataset_metadata(datasets),
         "protocol": {
-            "source": "CRISP Appendix A.2 / official CAPI segmentation evaluation",
+            "source": (
+                "CRISP-inspired / CAPI probes with a clean, disjoint VOC2012+SBD split"
+                if dataset_name == "pascal_voc"
+                else "CRISP Appendix A.2 / official CAPI segmentation evaluation"
+            ),
             "input_resolution": DENSE_RESOLUTION,
             "patch_tokens": (DENSE_RESOLUTION // metadata["patch_size"]) ** 2,
             "backbone_frozen": True,
