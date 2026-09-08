@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import math
 import sys
 from pathlib import Path
@@ -23,6 +24,7 @@ REPO_ROOT = SCRIPT_PATH.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from evaluation.utils.common import load_backbone  # noqa: E402
+from utils.pca_alignment import align_pca_components  # noqa: E402
 
 IMAGENET_VAL = REPO_ROOT / "dataset" / "imagenet" / "val"
 OUTPUT_DIR = REPO_ROOT / "output" / "pca_visualizations"
@@ -47,6 +49,10 @@ CHECKPOINTS = {
 
 CHECKPOINT_KEY = "teacher"
 ARCH = "vit_small"
+
+# Fit each model's PCA separately, then align its colors to this checkpoint.
+# Alignment is per image, over corresponding patch positions in that image.
+PCA_REFERENCE_MODEL = "Official iBOT"
 
 N_IMAGES = 100
 SEED = 0
@@ -89,6 +95,9 @@ MODEL_TRANSFORM = T.Compose(
 
 
 def _check_inputs() -> None:
+    if PCA_REFERENCE_MODEL not in CHECKPOINTS:
+        raise ValueError("PCA_REFERENCE_MODEL must name an entry in CHECKPOINTS")
+
     if not torch.cuda.is_available():
         raise RuntimeError("A CUDA GPU is required for this visualization script.")
 
@@ -176,12 +185,14 @@ def _orient_component_signs(projected: np.ndarray) -> np.ndarray:
     return projected
 
 
-def _pca_to_rgb(features: np.ndarray) -> Image.Image:
-    """Fit PCA for one image and convert the first 3 components into an RGB map."""
+def _project_pca(features: np.ndarray) -> np.ndarray:
+    """Fit one model/image's whitened PCA before any color alignment or sigmoid."""
     pca = PCA(n_components=3, whiten=True, svd_solver="full")
-    projected = pca.fit_transform(features).astype(np.float32, copy=False)
-    projected = _orient_component_signs(projected)
+    return pca.fit_transform(features).astype(np.float32, copy=False)
 
+
+def _projected_to_rgb(projected: np.ndarray) -> Image.Image:
+    """Map reference-oriented or aligned PCA scores to RGB with shared contrast."""
     # Smooth contrast mapping. Whitened PCs are approximately unit scale, so
     # sigmoid(gain * x) gives a stable mapping without hard min/max saturation.
     rgb = 1.0 / (1.0 + np.exp(-SIGMOID_GAIN * projected))
@@ -273,12 +284,20 @@ def main() -> None:
     print(f"Selected {len(originals)} ImageNet validation images")
     print(f"Visualization resolution: {VIS_RESOLUTION} x {VIS_RESOLUTION}")
     print(f"PCA features: mean of the last {N_LAST_LAYERS} normalized block outputs")
+    print(f"PCA color reference: {PCA_REFERENCE_MODEL} (aligned per image)")
     print(f"Output directory: {OUTPUT_DIR}")
 
     all_maps: dict[str, list[Image.Image]] = {}
+    reference_projections: list[np.ndarray] = []
+    alignment_records: list[dict] = []
 
-    # Load one checkpoint at a time so GPU memory use stays small.
-    for model_name, checkpoint_path in CHECKPOINTS.items():
+    # Extract the reference first even if it is not the first displayed column.
+    # Only keep its three scores per patch; load one model at a time as before.
+    model_order = [PCA_REFERENCE_MODEL] + [
+        name for name in CHECKPOINTS if name != PCA_REFERENCE_MODEL
+    ]
+    for model_name in model_order:
+        checkpoint_path = CHECKPOINTS[model_name]
         print(f"\nLoading {model_name}: {checkpoint_path}", flush=True)
         model, metadata = load_backbone(checkpoint_path, CHECKPOINT_KEY, ARCH)
         model = model.to(DEVICE).eval()
@@ -288,7 +307,34 @@ def main() -> None:
 
         for image_number, image in enumerate(originals):
             features = _extract_dense_features(model, image)
-            pca_image = _pca_to_rgb(features)
+            projected = _project_pca(features)
+            alignment_description = "reference"
+            if model_name == PCA_REFERENCE_MODEL:
+                # Retain the old sign convention only to anchor the reference.
+                projected = _orient_component_signs(projected)
+                reference_projections.append(projected)
+            else:
+                alignment = align_pca_components(
+                    reference_projections[image_number], projected
+                )
+                projected = alignment.projected
+                matched = alignment.correlations[np.arange(3), alignment.permutation]
+                alignment_records.append(
+                    {
+                        "image_number": image_number,
+                        "dataset_index": selected_indices[image_number],
+                        "model": model_name,
+                        "correlation_matrix": alignment.correlations.tolist(),
+                        # Entry r selects the original target PC for RGB channel r.
+                        "target_components_zero_based": alignment.permutation.tolist(),
+                        "signs": alignment.signs.tolist(),
+                        "matched_correlations_before_sign_flip": matched.tolist(),
+                    }
+                )
+                alignment_description = "matched |corr|=" + ",".join(
+                    f"{value:.3f}" for value in np.abs(matched)
+                )
+            pca_image = _projected_to_rgb(projected)
             model_maps.append(pca_image)
 
             safe_name = (
@@ -302,7 +348,8 @@ def main() -> None:
             )
             print(
                 f"[{model_name}] {image_number + 1:02d}/{len(originals):02d} "
-                f"{descriptions[image_number]} | patches={features.shape[0]}",
+                f"{descriptions[image_number]} | patches={features.shape[0]} | "
+                f"{alignment_description}",
                 flush=True,
             )
 
@@ -312,6 +359,22 @@ def main() -> None:
         del model
         gc.collect()
         torch.cuda.empty_cache()
+
+    # Keep the requested display order independent of the reference model.
+    all_maps = {name: all_maps[name] for name in CHECKPOINTS}
+    (OUTPUT_DIR / "pca_alignment.json").write_text(
+        json.dumps(
+            {
+                "reference_model": PCA_REFERENCE_MODEL,
+                "checkpoints": {name: str(path) for name, path in CHECKPOINTS.items()},
+                "checkpoint_key": CHECKPOINT_KEY,
+                "scope": "per image, over corresponding patch positions",
+                "assignment_cost": "-abs(Pearson correlation)",
+                "alignments": alignment_records,
+            },
+            indent=2,
+        ) + "\n"
+    )
 
     # Save originals and per-image side-by-side comparisons.
     for image_number, original in enumerate(originals):
@@ -324,6 +387,7 @@ def main() -> None:
     print("\nDone.")
     print(f"Main comparison: {OUTPUT_DIR / 'comparison_grid.png'}")
     print(f"Selected-image manifest: {OUTPUT_DIR / 'selected_images.tsv'}")
+    print(f"PCA color alignment: {OUTPUT_DIR / 'pca_alignment.json'}")
 
 
 if __name__ == "__main__":
