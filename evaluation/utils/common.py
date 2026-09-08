@@ -59,6 +59,10 @@ def base_parser(description):
     parser.add_argument("--result-json", type=Path, default=None)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--classification-manifests", type=Path, default=None,
+        help="Multilabel split/label JSON directory; defaults to <datasets-root>/evaluation_manifests",
+    )
     return parser
 
 
@@ -108,6 +112,34 @@ def checkpoint_fingerprint(path):
     stat = path.stat()
     material = f"{path}:{stat.st_size}:{stat.st_mtime_ns}".encode()
     return hashlib.sha256(material).hexdigest()[:16]
+
+
+def classification_manifest_root(args):
+    path = getattr(args, "classification_manifests", None)
+    return (Path(path) if path is not None else Path(args.datasets_root) / "evaluation_manifests").expanduser().resolve()
+
+
+def evaluation_identity(args):
+    """Invalidate results when the evaluator, selected inputs, or seed changes."""
+    digest = hashlib.sha256()
+    for directory in (REPO_ROOT / "evaluation", REPO_ROOT / "model"):
+        for path in sorted(directory.rglob("*.py")):
+            digest.update(str(path.relative_to(REPO_ROOT)).encode())
+            digest.update(path.read_bytes())
+    manifests = classification_manifest_root(args)
+    manifest_hashes = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(manifests.glob("*.json"))
+    }
+    return {
+        "version": 2,
+        "source_sha256": digest.hexdigest(),
+        "seed": args.seed,
+        "architecture_argument": args.arch,
+        "datasets_root": str(Path(args.datasets_root).expanduser().resolve()),
+        "classification_manifests": str(manifests),
+        "classification_manifest_hashes": manifest_hashes,
+    }
 
 
 def _torch_load(path):

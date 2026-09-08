@@ -7,10 +7,10 @@ output_dir: output/train
 arch: vit_small
 
 # Loss and teacher
-centering: sinkhorn_knopp  # centering or sinkhorn_knopp.
+centering: centering  # centering or sinkhorn_knopp.
 lambda1: 1.0  # Global CLS loss
 lambda2: 1.0  # Masked patch loss
-lambda3: 1.0  # Constant from the first epoch; set to 0.0 for pure iBOT.
+lambda3: 0.0  # Constant from the first epoch; set to 0.0 for pure iBOT.
 
 # Minimum two-view intersection as a fraction of the original image area.
 region_min_area: 0.10

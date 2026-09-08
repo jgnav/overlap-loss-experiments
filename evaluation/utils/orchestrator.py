@@ -13,6 +13,8 @@ from evaluation.utils.common import (
     ARCHITECTURES,
     REPO_ROOT,
     checkpoint_fingerprint,
+    classification_manifest_root,
+    evaluation_identity,
     utc_now,
     write_json,
 )
@@ -26,12 +28,15 @@ EVALUATIONS = (
     ("ade20k_linear", "evaluation.utils.ade20k_linear", "ade20k"),
     ("cityscapes_knn", "evaluation.utils.cityscapes_knn", "cityscapes"),
     ("cityscapes_linear", "evaluation.utils.cityscapes_linear", "cityscapes"),
+    ("imagenet_linear", "evaluation.utils.imagenet_linear", None),
+    ("pascal_voc_multilabel", "evaluation.utils.pascal_voc_multilabel", None),
+    ("coco_multilabel", "evaluation.utils.coco_multilabel", None),
 )
 
 
 def _parser():
     parser = argparse.ArgumentParser(
-        description="Run the complete CRISP evaluation suite for one checkpoint"
+        description="Run segmentation and classification evaluations for one checkpoint"
     )
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument(
@@ -57,6 +62,14 @@ def _parser():
     )
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--classification-manifests", type=Path, default=None,
+        help="Multilabel split/label JSON directory; defaults to <datasets-root>/evaluation_manifests",
+    )
+    parser.add_argument(
+        "--evaluations", nargs="+", choices=[name for name, _, _ in EVALUATIONS],
+        default=None, help="Run selected evaluations (default: all ten)",
+    )
     return parser
 
 
@@ -73,12 +86,26 @@ def _result_table(results):
         ("Cityscapes", "cityscapes_knn", "cityscapes_linear"),
     )
     for dataset, knn_name, linear_name in pairs:
-        row = {"dataset": dataset}
+        if knn_name not in results and (linear_name is None or linear_name not in results):
+            continue
+        row = {"dataset": dataset, "task": "multiclass_classification" if dataset.startswith("ImageNet") else "semantic_segmentation"}
         if knn_name in results:
             row["knn"] = results[knn_name].get("metrics", {})
         if linear_name is not None and linear_name in results:
             row["linear"] = results[linear_name].get("metrics", {})
         table.append(row)
+    if "imagenet_linear" in results:
+        table.append({
+            "dataset": "ImageNet-1K 100%", "task": "multiclass_classification",
+            "linear": results["imagenet_linear"]["metrics"],
+        })
+    for name in ("pascal_voc_multilabel", "coco_multilabel"):
+        if name in results:
+            result = results[name]
+            table.append({
+                "dataset": result["dataset"], "task": "multilabel_classification",
+                "linear": result["metrics"],
+            })
     return table
 
 
@@ -94,6 +121,7 @@ def _write_summary(path, args, started_at, status, results, error=None):
         "architecture": args.arch,
         "model": model,
         "datasets_root": str(args.datasets_root),
+        "evaluation_identity": evaluation_identity(args),
         "started_at": started_at,
         "updated_at": updated_at,
         "completed_evaluations": list(results),
@@ -122,9 +150,24 @@ def _load_completed_result(path, args, evaluation_name):
         or model.get("checkpoint_fingerprint")
         != checkpoint_fingerprint(args.checkpoint)
         or model.get("checkpoint_key") != args.checkpoint_key
+        or result.get("evaluation_identity") != evaluation_identity(args)
     ):
         return None
     return result
+
+
+def _preflight_classification(args, evaluations):
+    # Fail on missing/invalid annotation manifests before expensive segmentation
+    # or 200-epoch classification work begins. No data is downloaded implicitly.
+    from evaluation.utils.classification_data import MULTILABEL_DATASETS, read_multilabel_manifest
+
+    names = {name for name, _, _ in evaluations}
+    for dataset_name, spec in MULTILABEL_DATASETS.items():
+        if f"{dataset_name}_multilabel" in names:
+            read_multilabel_manifest(
+                classification_manifest_root(args) / f"{dataset_name}.json",
+                args.datasets_root, dataset_name, spec["num_classes"],
+            )
 
 
 def main(argv=None):
@@ -135,6 +178,8 @@ def main(argv=None):
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     if not args.datasets_root.is_dir():
         raise FileNotFoundError(f"Datasets directory not found: {args.datasets_root}")
+    evaluations = [item for item in EVALUATIONS if args.evaluations is None or item[0] in args.evaluations]
+    _preflight_classification(args, evaluations)
     if args.output_dir is None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         args.output_dir = (
@@ -156,9 +201,9 @@ def main(argv=None):
         args.result_json, args, started_at, "running", results
     )
 
-    print(f"Starting {len(EVALUATIONS)} CRISP evaluations", flush=True)
+    print(f"Starting {len(evaluations)} evaluations", flush=True)
     for evaluation_index, (name, module, cache_name) in enumerate(
-        EVALUATIONS, start=1
+        evaluations, start=1
     ):
         result_path = args.output_dir / f"{name}.json"
         completed_result = _load_completed_result(result_path, args, name)
@@ -168,13 +213,13 @@ def main(argv=None):
                 args.result_json, args, started_at, "running", results
             )
             print(
-                f"[{evaluation_index}/{len(EVALUATIONS)}] "
+                f"[{evaluation_index}/{len(evaluations)}] "
                 f"Reusing completed {name}",
                 flush=True,
             )
             continue
         print(
-            f"\n[{evaluation_index}/{len(EVALUATIONS)}] Starting {name}",
+            f"\n[{evaluation_index}/{len(evaluations)}] Starting {name}",
             flush=True,
         )
         command = [
@@ -196,6 +241,8 @@ def main(argv=None):
             str(args.num_workers),
             "--seed",
             str(args.seed),
+            "--classification-manifests",
+            str(classification_manifest_root(args)),
         ]
         if cache_name is not None:
             cache_path = args.output_dir / "feature_cache" / f"{cache_name}.pth"

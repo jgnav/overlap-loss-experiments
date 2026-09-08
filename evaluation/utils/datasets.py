@@ -1,3 +1,6 @@
+from collections import Counter
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -161,25 +164,16 @@ def make_pascal_voc(root, split, transform=None, target_transform=None):
     augmented_train = _read_ids(augmented / "train.txt")
     augmented_val = _read_ids(augmented / "val.txt")
     if split == "trainaug":
-        # The standard VOC trainaug split contains each image once and excludes
-        # every official VOC validation image. Prefer the original VOC mask when
-        # an image is also present in SBD because it is the curated annotation.
-        validation_ids = set(original_val)
-        seen = set()
-        images = []
-        targets = []
-        for item in original_train:
-            if item in validation_ids or item in seen:
-                continue
-            seen.add(item)
-            images.append(original / "JPEGImages" / f"{item}.jpg")
-            targets.append(original / "SegmentationClass" / f"{item}.png")
-        for item in augmented_train + augmented_val:
-            if item in validation_ids or item in seen:
-                continue
-            seen.add(item)
-            images.append(augmented / "img" / f"{item}.jpg")
-            targets.append(augmented / "cls" / f"{item}.mat")
+        # Literal construction in facebookresearch/capi/data.py:VOC2012.
+        # CRISP A.2 specifies the released CAPI evaluator without modification.
+        # Preserve list order, repeated IDs, and original/SBD mask provenance.
+        # Upstream explicitly warns that this loader does not reproduce its
+        # paper's VOC scores. Record duplicates and validation overlap below;
+        # reproducing this code is not proof of reproducing the published scores.
+        images = [original / "JPEGImages" / f"{item}.jpg" for item in original_train]
+        targets = [original / "SegmentationClass" / f"{item}.png" for item in original_train]
+        images.extend(augmented / "img" / f"{item}.jpg" for item in augmented_train + augmented_val)
+        targets.extend(augmented / "cls" / f"{item}.mat" for item in augmented_train + augmented_val)
     elif split == "val":
         images = [original / "JPEGImages" / f"{item}.jpg" for item in original_val]
         targets = [
@@ -188,7 +182,38 @@ def make_pascal_voc(root, split, transform=None, target_transform=None):
         ]
     else:
         raise ValueError(f"Unknown PASCAL VOC split: {split}")
-    return PascalVOCDataset(images, targets, transform, target_transform)
+    dataset = PascalVOCDataset(images, targets, transform, target_transform)
+    ids = [path.stem for path in images]
+    counts = Counter(ids)
+    dataset.protocol_metadata = {
+        "construction": "capi_released_voc2012_trainaug_v1",
+        "source": "https://github.com/facebookresearch/capi/blob/main/data.py",
+        "split": split,
+        "unique_image_ids": len(counts),
+        "repeated_image_entries": len(ids) - len(counts),
+        "official_val_overlap_unique_ids": (
+            len(set(ids).intersection(original_val)) if split == "trainaug" else None
+        ),
+        "upstream_limitation": (
+            "CAPI's released VOC loader states it does not reproduce its paper's "
+            "results. Its trainaug concatenation retains repeated image IDs and "
+            "any official validation images present in SBD."
+        ),
+    }
+    return dataset
+
+
+def segmentation_manifest(dataset):
+    """Fingerprint ordered image/mask pairs, including duplicates and mask source."""
+    pairs = [[str(image.resolve()), str(target.resolve())]
+             for image, target in zip(dataset.images, dataset.targets, strict=True)]
+    return {
+        "ordered_pairs_sha256": hashlib.sha256(
+            json.dumps(pairs, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "samples": len(dataset),
+        **getattr(dataset, "protocol_metadata", {}),
+    }
 
 
 CITYSCAPES_TRAIN_ID = np.full(256, 255, dtype=np.uint8)

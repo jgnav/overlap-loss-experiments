@@ -19,6 +19,7 @@ from evaluation.utils.common import (
     print_progress,
     utc_now,
     write_json,
+    evaluation_identity,
 )
 
 
@@ -266,6 +267,7 @@ def run_imagenet_knn(args):
             "finished_at": utc_now(),
             "elapsed_seconds": time.monotonic() - start_time,
             "model": metadata,
+            "evaluation_identity": evaluation_identity(args),
             "dataset_sizes": {
                 "train": len(train_dataset),
                 "full_train": len(full_train_dataset),

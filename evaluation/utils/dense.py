@@ -19,13 +19,15 @@ from evaluation.utils.common import (
     load_backbone,
     prepare_paths,
     print_progress,
+    evaluation_identity,
     utc_now,
     write_json,
 )
-from evaluation.utils.datasets import DATASET_SPECS
+from evaluation.utils.datasets import DATASET_SPECS, segmentation_manifest
 
 
-DENSE_RESOLUTION = 224
+# User-selected CRISP A.2 convention: 16 x 16 patch tokens for ViT/16.
+DENSE_RESOLUTION = 256
 
 
 IMAGENET_NORMALIZE = T.Normalize(
@@ -148,6 +150,13 @@ def _build_dense_datasets(dataset_name, datasets_root, seed):
     return {"train": train, "val": validation, "test": test}
 
 
+def _dataset_metadata(datasets):
+    return {
+        "train": segmentation_manifest(datasets["train"].dataset),
+        "test": segmentation_manifest(datasets["test"]),
+    }
+
+
 def _load_or_extract_features(model, metadata, args, dataset_name):
     datasets = _build_dense_datasets(dataset_name, args.datasets_root, args.seed)
     expected = {
@@ -157,17 +166,18 @@ def _load_or_extract_features(model, metadata, args, dataset_name):
         "architecture": metadata["architecture"],
         "resolution": DENSE_RESOLUTION,
         "seed": args.seed,
+        "evaluation_identity": evaluation_identity(args),
+        "datasets": _dataset_metadata(datasets),
     }
     if args.feature_cache is not None:
         cache_path = args.feature_cache.expanduser().resolve()
         if cache_path.is_file():
             cached = torch.load(cache_path, map_location="cpu", weights_only=False)
             if cached.get("metadata") != expected:
-                raise ValueError(
-                    f"Feature cache metadata does not match this evaluation: {cache_path}"
-                )
-            print(f"Loading dense features from {cache_path}", flush=True)
-            return cached["features"], cached["labels"], datasets
+                print(f"Recomputing incompatible dense feature cache: {cache_path}", flush=True)
+            else:
+                print(f"Loading dense features from {cache_path}", flush=True)
+                return cached["features"], cached["labels"], datasets
 
     features = {}
     labels = {}
@@ -483,13 +493,15 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
         "finished_at": utc_now(),
         "elapsed_seconds": time.monotonic() - start_time,
         "model": metadata,
+        "evaluation_identity": evaluation_identity(args),
         "dataset_sizes": {key: len(value) for key, value in datasets.items()},
+        "dataset_manifests": _dataset_metadata(datasets),
         "protocol": {
             "source": "CRISP Appendix A.2 / official CAPI segmentation evaluation",
             "input_resolution": DENSE_RESOLUTION,
             "patch_tokens": (DENSE_RESOLUTION // metadata["patch_size"]) ** 2,
             "backbone_frozen": True,
-            "feature": "final normalized teacher patch tokens",
+            "feature": f"final normalized {args.checkpoint_key} patch tokens",
             "standardization": "StandardScaler fitted on train only",
             "validation_split": "seeded 10% of training set",
             "num_classes": spec["num_classes"],
