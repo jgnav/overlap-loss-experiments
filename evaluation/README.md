@@ -118,8 +118,55 @@ evaluation loader before saving. Identical output is reusable; a different
 existing manifest is not overwritten. Generated manifests live with the
 locally prepared datasets rather than being committed to Git.
 
-COCO still needs its explicitly selected version, images, annotations, and
-`coco.json` manifest; preparing VOC does not prepare or skip COCO.
+For COCO the selected baseline is **COCO 2017 train/val**: 118,287 training
+images, 5,000 validation images, and 80 object categories. This is an explicit
+experimental choice, not a verified reconstruction of CRISP's dataset split.
+Use the official `train2017.zip`, `val2017.zip`, and
+`annotations_trainval2017.zip` from the
+[COCO downloads](https://cocodataset.org/#download). The HTTPS S3 path-style
+endpoint `https://s3.amazonaws.com/images.cocodataset.org/` serves the same
+official bucket without the certificate-name mismatch of the image hostname.
+Archive SHA256 hashes can be checked against
+[TensorFlow Datasets' checksum registry](https://github.com/tensorflow/datasets/blob/master/tensorflow_datasets/url_checksums/coco.txt).
+
+Downloading the ZIPs alone is not sufficient. After checksum verification,
+extract the images and the two instance annotation files before generating the
+manifest or submitting an evaluation:
+
+```bash
+mkdir -p dataset/coco/images
+unzip -q -n dataset/coco/downloads/train2017.zip -d dataset/coco/images
+unzip -q -n dataset/coco/downloads/val2017.zip -d dataset/coco/images
+unzip -q -n dataset/coco/downloads/annotations_trainval2017.zip \
+  'annotations/instances_train2017.json' 'annotations/instances_val2017.json' \
+  -d dataset/coco
+```
+
+The local layout is:
+
+```text
+dataset/coco/images/train2017/*.jpg
+dataset/coco/images/val2017/*.jpg
+dataset/coco/annotations/instances_train2017.json
+dataset/coco/annotations/instances_val2017.json
+```
+
+Generate and validate the evaluator's manifest with:
+
+```bash
+python -m evaluation.prepare_coco_manifest --datasets-root dataset
+```
+
+The generator orders classes by ascending original category ID (COCO IDs are
+not contiguous). A class is positive if the image contains any instance of
+that category, including crowd annotations, and negative otherwise. All
+official images are retained, including images with no annotated instances.
+The manifest records both annotation hashes, original category IDs, and this
+label policy. Duplicate images, cross-split overlap, inconsistent vocabularies,
+unknown annotation references, and missing image files fail validation. A
+different existing manifest is never overwritten, and the new manifest is
+published atomically only after complete validation. Captions, keypoints, stuff,
+panoptic labels, and the unlabeled/test image archives are not needed here.
 
 Use `--classification-manifests /path/to/manifests` to locate those files
 elsewhere. Every file uses this schema (the example shows only two classes;

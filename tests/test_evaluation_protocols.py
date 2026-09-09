@@ -288,6 +288,24 @@ class ManifestTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "overlap"):
             self.read()
 
+    def test_rejects_file_symlink_overlap(self):
+        (self.root / "alias.png").symlink_to(self.root / "a.png")
+        self.manifest["splits"]["val"][0]["image"] = "alias.png"
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            self.read()
+
+    def test_rejects_parent_symlink_overlap(self):
+        (self.root / "alias").symlink_to(self.root, target_is_directory=True)
+        self.manifest["splits"]["val"][0]["image"] = "alias/a.png"
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            self.read()
+
+    def test_rejects_missing_files_and_directories(self):
+        for name in ("missing.png", "."):
+            self.manifest["splits"]["val"][0]["image"] = name
+            with self.subTest(name=name), self.assertRaises(FileNotFoundError):
+                self.read()
+
     def test_rejects_raw_voc_labels_and_invalid_vocabularies(self):
         for labels in ([-1, 1], [2, 1], [True, 0], [1], [None, None]):
             manifest = copy.deepcopy(self.manifest)

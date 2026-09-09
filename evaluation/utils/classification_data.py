@@ -3,6 +3,7 @@
 import hashlib
 import json
 from pathlib import Path
+import stat
 
 import numpy as np
 import torch
@@ -62,6 +63,7 @@ def read_multilabel_manifest(path, datasets_root, dataset_name, num_classes):
         raise ValueError(f"{path}: splits must contain exactly train and val")
     samples = {}
     seen_ids, seen_paths = set(), set()
+    resolved_parents = {}
     for split in ("train", "val"):
         rows = splits[split]
         if not isinstance(rows, list) or not rows:
@@ -73,7 +75,23 @@ def read_multilabel_manifest(path, datasets_root, dataset_name, num_classes):
             image = Path(row["image"])
             if not image.is_absolute():
                 image = Path(datasets_root) / image
-            image = image.expanduser().resolve()
+            image = image.expanduser()
+            # Large manifests share very few image directories. Resolve those
+            # directories once, not all their ancestors for every image. Keep
+            # resolving file symlinks so aliases cannot bypass overlap checks.
+            parent = image.parent
+            if parent not in resolved_parents:
+                resolved_parents[parent] = parent.resolve()
+            image = resolved_parents[parent] / image.name
+            try:
+                mode = image.lstat().st_mode
+            except (FileNotFoundError, NotADirectoryError):
+                raise FileNotFoundError(f"Manifest image does not exist: {image}") from None
+            if stat.S_ISLNK(mode):
+                image = image.resolve()
+                is_file = image.is_file()
+            else:
+                is_file = stat.S_ISREG(mode)
             image_id = row.get("id", str(image))
             if not isinstance(image_id, str) or not image_id:
                 raise ValueError(f"{path}: image IDs must be nonempty strings")
@@ -81,7 +99,7 @@ def read_multilabel_manifest(path, datasets_root, dataset_name, num_classes):
                 raise ValueError(f"{path}: duplicate image or train/val overlap: {image_id}")
             seen_ids.add(image_id)
             seen_paths.add(image)
-            if not image.is_file():
+            if not is_file:
                 raise FileNotFoundError(f"Manifest image does not exist: {image}")
             labels = row.get("labels")
             if (not isinstance(labels, list) or len(labels) != num_classes
