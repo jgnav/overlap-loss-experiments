@@ -92,29 +92,40 @@ class VOCConstructionTest(unittest.TestCase):
         for item in ("a", "d", "heldout"):
             Image.new("L", (8, 8)).save(masks / f"{item}.png")
 
-    def test_clean_sorted_ids_original_mask_precedence_and_zero_overlap(self):
-        dataset = make_pascal_voc(self.root, "trainaug")
-        self.assertEqual([p.stem for p in dataset.images], ["a", "b", "c", "d"])
+    def test_original_splits_ignore_sbd_and_have_zero_overlap(self):
+        dataset = make_pascal_voc(self.root, "train")
+        self.assertEqual([p.stem for p in dataset.images], ["a", "d"])
         self.assertEqual(dataset.targets[0], self.original / "SegmentationClass/a.png")
-        self.assertEqual(dataset.targets[1], self.augmented / "cls/b.mat")
-        self.assertEqual(dataset.targets[3], self.original / "SegmentationClass/d.png")
+        self.assertEqual(dataset.targets[1], self.original / "SegmentationClass/d.png")
         meta = segmentation_manifest(dataset)
-        self.assertEqual(meta["construction"], "voc2012_sbd_disjoint_trainaug_v1")
+        self.assertEqual(meta["construction"], "voc2012_original_segmentation_v1")
         self.assertEqual(meta["repeated_image_entries"], 0)
         self.assertEqual(meta["official_val_overlap_unique_ids"], 0)
-        self.assertEqual(meta["unique_image_ids"], 4)
-        self.assertEqual(meta["deduplicated_source_entries"], 2)
-        self.assertEqual(meta["excluded_official_val_unique_ids"], 1)
-        self.assertEqual(meta["source_image_entries"], 7)
+        self.assertEqual(meta["unique_image_ids"], 2)
         before = meta["ordered_pairs_sha256"]
-        dataset.targets[2] = dataset.targets[0]
+        dataset.targets[1] = dataset.targets[0]
         self.assertNotEqual(segmentation_manifest(dataset)["ordered_pairs_sha256"], before)
 
-    def test_prefers_original_masks_even_for_sbd_only_training_ids(self):
-        Image.new("L", (8, 8)).save(self.original / "SegmentationClass/b.png")
-        dataset = make_pascal_voc(self.root, "trainaug")
-        self.assertEqual(dataset.targets[1], self.original / "SegmentationClass/b.png")
-        self.assertEqual(dataset.images[1], self.original / "JPEGImages/b.jpg")
+    def test_works_without_sbd_and_preserves_official_order(self):
+        for path in self.augmented.iterdir():
+            path.unlink()
+        self.augmented.rmdir()
+        (self.original / "ImageSets/Segmentation/train.txt").write_text("d\na\n")
+        dataset = make_pascal_voc(self.root, "train")
+        self.assertEqual([p.stem for p in dataset.images], ["d", "a"])
+
+    def test_rejects_trainaug_instead_of_silently_changing_its_meaning(self):
+        with self.assertRaisesRegex(ValueError, "original train or val"):
+            make_pascal_voc(self.root, "trainaug")
+
+    def test_rejects_duplicate_train_and_cross_split_overlap(self):
+        path = self.original / "ImageSets/Segmentation/train.txt"
+        path.write_text("a\na\n")
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            make_pascal_voc(self.root, "train")
+        path.write_text("a\nheldout\n")
+        with self.assertRaisesRegex(ValueError, "overlapping"):
+            make_pascal_voc(self.root, "train")
 
     def test_official_validation_uses_only_original_masks(self):
         dataset = make_pascal_voc(self.root, "val")
@@ -127,7 +138,7 @@ class VOCConstructionTest(unittest.TestCase):
             make_pascal_voc(self.root, "val")
 
     def test_internal_holdout_is_image_disjoint_and_seeded(self):
-        (self.augmented / "val.txt").write_text("\n".join(["c", "d"] + [f"extra{i}" for i in range(20)]))
+        (self.original / "ImageSets/Segmentation/train.txt").write_text("\n".join(["a", "b", "c", "d"] + [f"extra{i}" for i in range(20)]))
         sets = dense._build_dense_datasets("pascal_voc", self.root, 0)
         train_ids = {sets["train"].dataset.images[i].stem for i in sets["train"].indices}
         holdout_ids = {sets["val"].dataset.images[i].stem for i in sets["val"].indices}
@@ -223,31 +234,8 @@ class SegmentationResolutionTest(unittest.TestCase):
         patches = dense._patchify_labels(labels[None], 16, 16)
         self.assertTrue(torch.equal(patches, torch.arange(256, dtype=torch.uint8)[:, None].expand(-1, 256)))
 
-    def test_old_cache_is_recomputed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "features.pth"
-            torch.save({"metadata": {"resolution": 224}}, path)
-            args = SimpleNamespace(datasets_root=Path(directory), seed=0, feature_cache=path, batch_size=2, num_workers=0)
-            metadata = {"checkpoint_fingerprint": "x", "checkpoint_key": "teacher", "architecture": "vit_small"}
-            sets = {split: object() for split in ("train", "val", "test")}
-            features, labels = torch.ones(2, 3), torch.zeros(2, 256, dtype=torch.uint8)
-            with mock.patch.object(dense, "_build_dense_datasets", return_value=sets), \
-                 mock.patch.object(dense, "_dataset_metadata", return_value={"revision": 2}), \
-                 mock.patch.object(dense, "evaluation_identity", return_value={"version": 2}), \
-                 mock.patch.object(dense, "_extract_features", return_value=(features, labels)) as extract:
-                dense._load_or_extract_features(None, metadata, args, "pascal_voc")
-                self.assertEqual(extract.call_count, 3)
-                extract.reset_mock()
-                dense._load_or_extract_features(None, metadata, args, "pascal_voc")
-                extract.assert_not_called()
-                # A cache at the current resolution but with the old leaky
-                # VOC construction must also be rejected, not only 224 caches.
-                cached = torch.load(path, map_location="cpu", weights_only=False)
-                self.assertEqual(cached["metadata"]["resolution"], 256)
-                cached["metadata"]["datasets"] = {"construction": "capi_released_voc2012_trainaug_v1"}
-                torch.save(cached, path)
-                dense._load_or_extract_features(None, metadata, args, "pascal_voc")
-                self.assertEqual(extract.call_count, 3)
+    def test_orchestrator_does_not_supply_legacy_feature_caches(self):
+        self.assertTrue(all(cache is None for _, _, cache in orchestrator.EVALUATIONS))
 
 
 class ManifestTest(unittest.TestCase):

@@ -6,10 +6,20 @@ CAPI supplies the segmentation implementation they cite.
 
 ## Selected segmentation protocol
 
-The user selected **CRISP's 256-patch-token convention** from Appendix A.2 of
-the local `25314_Consistent_Region_Inform.pdf` (page 16): ViT/16 inputs are
-**256 x 256**, producing a 16 x 16 token grid. This differs from the 224 x 224
-default in the CAPI protocol cited by CG-SSL. Classification remains 224 x 224.
+Segmentation calls the vendored official CAPI evaluator, pinned to revision
+`98b4fa17ee8eec8810c17022df9a27a44845368b`. Its classifiers, hyperparameter
+selection, refitting and scoring are copied from upstream; local adapters
+handle dataset paths, final normalized patch features, logging and JSON output.
+See [vendor provenance and integration changes](vendor/capi/README.md).
+
+**CRISP's 256-patch-token convention** is applied dynamically: the checkpoint's
+convolution kernel determines patch size, and input resolution is 16 times
+that size. Patch size 14 uses **224 x 224**; patch size 16 uses **256 x 256**.
+Both produce a 16 x 16 grid. Positional embeddings retain their checkpoint grid
+and interpolate during inference. Compatible iBOT-style ViT-S/B/L checkpoints
+are supported; this does not promise compatibility with arbitrary architectures
+(e.g. register tokens or different transformer blocks). Unsupported patch sizes
+fail explicitly. Classification remains 224 x 224.
 
 ADE20K, PASCAL VOC 2012 and Cityscapes use frozen final-block patch features,
 train-only StandardScaler, a seeded 10% training holdout for selecting probe
@@ -18,29 +28,50 @@ official validation set. k-NN tests k in {1, 3, 10, 30} with cosine/L2 distance;
 linear segmentation uses CAPI's cuML logistic-regression sweep. The paper-style
 mIoU percentage is `metrics.miou_percent`.
 
-VOC `trainaug` uses a **clean, disjoint split**:
-`unique(VOC train + SBD train + SBD val) - official VOC val`. Image IDs are
-sorted, each image appears once, and original VOC PNG masks are preferred
-where available; remaining images use SBD MAT masks. For the prepared dataset
-this gives **10,582 training images and 1,449 official validation images**, with
-zero intersection. The seeded internal 10% holdout is drawn only after cleaning
-the training list. Official validation is never used to fit or select probes.
+VOC segmentation now uses **only the original VOC2012 splits**, as explicitly
+requested: `ImageSets/Segmentation/train.txt` (1,464 images) and `val.txt`
+(1,449 images), with original `SegmentationClass` PNG masks and official file
+order. SBD is not discovered or loaded, even when installed; `trainaug` is
+rejected. Duplicate IDs and train/val overlap fail validation. The internal
+seeded holdout uses 146 training images, leaving 1,318 for probe selection;
+the final probe is refitted on all 1,464 images. Official validation is never
+used to fit or select probes.
 
-This intentionally differs from the released CAPI loader, whose concatenation
-previously produced 12,819 entries, 1,134 repetitions, and 1,103 official
-validation images in training on our data. That loader also warns that its VOC
-results do not reproduce its paper. Our clean split does not establish exact
-CG-SSL/CRISP published-score equivalence. Results record the new construction
-ID, mask policy, removed entries, zero final overlap, and ordered image/mask
-pair hashes under `dataset_manifests`.
+The selected CAPI split is **train**, not **trainaug**. The released loader
+supports both; neither CRISP's quoted passage nor CAPI Appendix H.2 establishes
+which split the authors selected. Exact published-score reproduction is therefore
+not established. The released CAPI `trainaug` loader also uses SBD; its concatenation
+would produce 12,819 entries, 1,134 repetitions, and 1,103 official validation
+images in training on our data; it also warns of non-reproduction of its paper.
+Removing SBD is the selected experimental choice, not a claim about the
+authors' unpublished image lists. Results record construction ID
+`voc2012_original_segmentation_v1`, mask policy, zero training/validation
+overlap, and ordered image/mask hashes under `dataset_manifests`.
 
 Re-evaluate official iBOT, the continued-iBOT control, and the overlap model
-under this same clean protocol; do not compare contaminated VOC scores as
-held-out results. Use a new output directory to preserve the old results for
-provenance. Backbone retraining is not required.
+under this same VOC-only protocol. Previous 100/200-epoch results used the
+clean 10,582-image VOC+SBD split at 224 resolution; those are a different
+protocol, not results of the later contaminated concatenation. Use a new
+output directory to preserve provenance. Backbone retraining is not required.
+
+### Other dataset split checks
+
+ADE20K uses official `training` (20,210 images) and `validation` (2,000),
+150 classes, ignoring labels 0 and 255. Cityscapes uses `leftImg8bit` with
+`gtFine` train (2,975) and val (500), maps the 19 evaluation classes to train
+IDs, and ignores other labels (255); coarse annotations and test images are
+not used. Both retain the same CAPI-style holdout/probes and CRISP's 256-token
+resolution. ImageNet classification uses official train/val with matching
+1,000-class vocabularies; k-NN uses a seeded stratified 10% training bank and
+linear probing uses all training images. VOC multilabel classification remains
+separate from segmentation: official VOC2012 `ImageSets/Main` train/val.
+COCO remains the explicitly selected 2017 train/val baseline. Exact CRISP
+classification split/recipe equivalence is **not established**; see below.
 
 Changes to resolution, dataset list construction, seed, source code, or manifest
-files invalidate old caches/results. Incompatible dense caches are recomputed.
+files invalidate old results. The pinned evaluator extracts fresh features for
+each probe; legacy feature caches are not used. This can increase runtime
+compared with reusing one feature bank across k-NN and linear tasks.
 Source hashes cover the local evaluation and backbone Python files. They do not
 hash every image's pixel content: use a new output directory if dataset files
 are edited in place. Retain result JSON files with the evaluated checkpoints.

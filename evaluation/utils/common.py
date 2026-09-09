@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -229,17 +230,37 @@ def load_backbone(checkpoint_path, checkpoint_key="teacher", arch="auto"):
         if patch_weight is not None
         else int(_checkpoint_argument(checkpoint, "patch_size") or 16)
     )
-    if patch_size != 16:
+    if patch_weight is None or patch_weight.ndim != 4 or patch_weight.shape[-2] != patch_size:
+        raise ValueError("Checkpoint must contain square patch_embed.proj.weight kernels")
+    if patch_size not in (14, 16):
         raise ValueError(
-            f"CRISP evaluation requested ViT patch size 16, got {patch_size}"
+            f"Supported evaluation patch sizes are 14 and 16, got {patch_size}"
         )
+    position = state.get("pos_embed")
+    if position is None or position.ndim != 3 or position.shape[0] != 1:
+        raise ValueError("Checkpoint must contain a ViT positional embedding")
+    position_grid = math.isqrt(position.shape[1] - 1)
+    if position_grid ** 2 != position.shape[1] - 1:
+        raise ValueError("Expected a square positional grid plus one CLS token")
     model = create_model(
         architecture,
+        img_size=[position_grid * patch_size],
         patch_size=patch_size,
         num_classes=0,
         return_all_tokens=True,
     )
     model_keys = set(model.state_dict())
+    unsupported = sorted(
+        key for key in state
+        if key not in model_keys and key.startswith(
+            ("blocks.", "patch_embed.", "norm.", "fc_norm.", "register_tokens", "reg_token")
+        )
+    )
+    if unsupported:
+        raise ValueError(
+            "Checkpoint uses unsupported backbone components; a matching model "
+            "adapter is required: " + ", ".join(unsupported[:10])
+        )
     filtered = {key: value for key, value in state.items() if key in model_keys}
     missing = sorted(model_keys - set(filtered))
     if missing:
@@ -254,6 +275,7 @@ def load_backbone(checkpoint_path, checkpoint_key="teacher", arch="auto"):
     metadata = {
         "architecture": architecture,
         "patch_size": patch_size,
+        "pretraining_position_grid": position_grid,
         "checkpoint_key": checkpoint_key,
         "checkpoint": str(Path(checkpoint_path).resolve()),
         "checkpoint_fingerprint": checkpoint_fingerprint(checkpoint_path),

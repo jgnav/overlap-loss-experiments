@@ -21,13 +21,13 @@ from evaluation.utils.common import (
 
 
 EVALUATIONS = (
-    ("pascal_voc_knn", "evaluation.utils.pascal_voc_knn", "pascal_voc"),
-    ("pascal_voc_linear", "evaluation.utils.pascal_voc_linear", "pascal_voc"),
+    ("pascal_voc_knn", "evaluation.utils.pascal_voc_knn", None),
+    ("pascal_voc_linear", "evaluation.utils.pascal_voc_linear", None),
     ("imagenet_knn", "evaluation.utils.imagenet_knn", None),
-    ("ade20k_knn", "evaluation.utils.ade20k_knn", "ade20k"),
-    ("ade20k_linear", "evaluation.utils.ade20k_linear", "ade20k"),
-    ("cityscapes_knn", "evaluation.utils.cityscapes_knn", "cityscapes"),
-    ("cityscapes_linear", "evaluation.utils.cityscapes_linear", "cityscapes"),
+    ("ade20k_knn", "evaluation.utils.ade20k_knn", None),
+    ("ade20k_linear", "evaluation.utils.ade20k_linear", None),
+    ("cityscapes_knn", "evaluation.utils.cityscapes_knn", None),
+    ("cityscapes_linear", "evaluation.utils.cityscapes_linear", None),
     ("imagenet_linear", "evaluation.utils.imagenet_linear", None),
     ("pascal_voc_multilabel", "evaluation.utils.pascal_voc_multilabel", None),
     ("coco_multilabel", "evaluation.utils.coco_multilabel", None),

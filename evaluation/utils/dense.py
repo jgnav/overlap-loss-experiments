@@ -1,13 +1,11 @@
-import gc
+import logging
+import tempfile
 import math
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from sklearn.metrics import jaccard_score
-from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms as T
 
@@ -26,8 +24,15 @@ from evaluation.utils.common import (
 from evaluation.utils.datasets import DATASET_SPECS, segmentation_manifest
 
 
-# User-selected CRISP A.2 convention: 16 x 16 patch tokens for ViT/16.
+# Compatibility default for callers without a model; production uses the
+# checkpoint's patch size through dense_resolution().
 DENSE_RESOLUTION = 256
+
+
+def dense_resolution(patch_size):
+    if patch_size not in (14, 16):
+        raise ValueError(f"Supported patch sizes are 14 and 16, got {patch_size}")
+    return 16 * patch_size
 
 
 IMAGENET_NORMALIZE = T.Normalize(
@@ -101,8 +106,8 @@ def _extract_features(model, dataset, batch_size, num_workers, description):
         images = images.cuda(non_blocking=True)
         tokens = model.get_intermediate_layers(images, n=1)[0][:, 1:]
         grid_size = math.isqrt(tokens.shape[1])
-        if grid_size * grid_size != tokens.shape[1]:
-            raise ValueError(f"Non-square patch-token grid: {tokens.shape[1]}")
+        if grid_size != 16 or tokens.shape[1] != 256:
+            raise ValueError(f"Expected 256 patch tokens, got {tokens.shape[1]}")
         batch_features = tokens.reshape(-1, tokens.shape[-1]).float().cpu()
         batch_labels = _patchify_labels(targets, grid_size, grid_size).cpu()
         if features is None:
@@ -127,9 +132,9 @@ def _extract_features(model, dataset, batch_size, num_workers, description):
     return features, labels
 
 
-def _build_dense_datasets(dataset_name, datasets_root, seed):
+def _build_dense_datasets(dataset_name, datasets_root, seed, resolution=DENSE_RESOLUTION):
     spec = DATASET_SPECS[dataset_name]
-    image_transform, target_transform = _dense_transforms()
+    image_transform, target_transform = _dense_transforms(resolution)
     full_train = spec["factory"](
         datasets_root,
         spec["train_split"],
@@ -150,376 +155,102 @@ def _build_dense_datasets(dataset_name, datasets_root, seed):
     return {"train": train, "val": validation, "test": test}
 
 
-def _dataset_metadata(datasets):
-    return {
-        "train": segmentation_manifest(datasets["train"].dataset),
-        "test": segmentation_manifest(datasets["test"]),
-    }
 
 
-def _load_or_extract_features(model, metadata, args, dataset_name):
-    datasets = _build_dense_datasets(dataset_name, args.datasets_root, args.seed)
-    expected = {
-        "dataset": dataset_name,
-        "checkpoint_fingerprint": metadata["checkpoint_fingerprint"],
-        "checkpoint_key": metadata["checkpoint_key"],
-        "architecture": metadata["architecture"],
-        "resolution": DENSE_RESOLUTION,
-        "seed": args.seed,
-        "evaluation_identity": evaluation_identity(args),
-        "datasets": _dataset_metadata(datasets),
-    }
-    if args.feature_cache is not None:
-        cache_path = args.feature_cache.expanduser().resolve()
-        if cache_path.is_file():
-            cached = torch.load(cache_path, map_location="cpu", weights_only=False)
-            if cached.get("metadata") != expected:
-                print(f"Recomputing incompatible dense feature cache: {cache_path}", flush=True)
-            else:
-                print(f"Loading dense features from {cache_path}", flush=True)
-                return cached["features"], cached["labels"], datasets
-
-    features = {}
-    labels = {}
-    for split in ("train", "val", "test"):
-        features[split], labels[split] = _extract_features(
-            model,
-            datasets[split],
-            args.batch_size,
-            args.num_workers,
-            f"{DATASET_SPECS[dataset_name]['display_name']} {split} features",
-        )
-    if args.feature_cache is not None:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {"metadata": expected, "features": features, "labels": labels},
-            cache_path,
-        )
-        print(f"Saved dense features to {cache_path}", flush=True)
-    return features, labels, datasets
-
-
-def _standardize(features):
-    print("Fitting CAPI StandardScaler on training features", flush=True)
-    scaler = StandardScaler()
-    scaler.fit(features["train"].numpy())
-    return {
-        split: torch.from_numpy(scaler.transform(values.numpy()))
-        for split, values in features.items()
-    }
-
-
-def _metric_values(target, prediction, ignore_labels):
-    target = target.flatten().cpu().numpy()
-    prediction = prediction.flatten().cpu().numpy()
-    mask = ~np.isin(target, ignore_labels)
-    if not mask.any():
-        raise ValueError("All evaluation labels are ignored")
-    accuracy = float(np.mean((target[mask] == prediction[mask]).astype(float)))
-    miou = float(jaccard_score(target[mask], prediction[mask], average="macro"))
-    return {
-        "miou": miou,
-        "miou_percent": 100.0 * miou,
-        "pixel_accuracy": accuracy,
-        "pixel_accuracy_percent": 100.0 * accuracy,
-    }
-
-
-class CAPIKNN:
-    def __init__(
-        self,
-        ignore_labels,
-        num_neighbors,
-        distance,
-        inference_batch_size=1024,
-        train_chunk_size=262144,
-    ):
-        self.ignore_labels = tuple(ignore_labels)
-        self.num_neighbors = num_neighbors
-        self.distance = distance
-        self.inference_batch_size = inference_batch_size
-        self.train_chunk_size = train_chunk_size
-
-    def fit(self, features, labels):
-        majority = labels.mode(dim=-1).values
-        keep = ~torch.isin(majority, torch.tensor(self.ignore_labels))
-        self.train_features = features[keep].float().cuda(non_blocking=True)
-        self.train_labels = labels[keep].cuda(non_blocking=True)
-
-    def clear(self):
-        if hasattr(self, "train_features"):
-            del self.train_features
-            del self.train_labels
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    def _distance(self, queries, keys):
-        if self.distance == "cosine":
-            queries = F.normalize(queries, dim=-1)
-            keys = F.normalize(keys, dim=-1)
-            return 1.0 - queries @ keys.T
-        if self.distance == "L2":
-            return torch.cdist(queries, keys, p=2)
-        raise ValueError(f"Unknown k-NN distance: {self.distance}")
-
-    @torch.compile(dynamic=True)
-    def _nearest_in_chunk(self, queries, keys, values):
-        distances = self._distance(queries, keys)
-        k = min(self.num_neighbors, distances.shape[-1])
-        nearest_distances, nearest_indices = torch.topk(
-            distances, k, dim=-1, largest=False
-        )
-        return nearest_distances, values[nearest_indices]
-
-    @torch.inference_mode()
-    def predict(self, features, description):
-        predictions = torch.empty(
-            features.shape[0],
-            self.train_labels.shape[-1],
-            dtype=self.train_labels.dtype,
-        )
-        ranges = range(0, features.shape[0], self.inference_batch_size)
-        total_batches = len(ranges)
-        print(f"{description}: starting {total_batches} batches", flush=True)
-        for batch_index, start in enumerate(ranges, start=1):
-            queries = features[start : start + self.inference_batch_size].float().cuda()
-            chunk_distances = []
-            chunk_labels = []
-            for chunk_start in range(0, self.train_features.shape[0], self.train_chunk_size):
-                keys = self.train_features[
-                    chunk_start : chunk_start + self.train_chunk_size
-                ]
-                values = self.train_labels[
-                    chunk_start : chunk_start + self.train_chunk_size
-                ]
-                nearest_distances, nearest_labels = self._nearest_in_chunk(
-                    queries,
-                    keys,
-                    values,
-                )
-                chunk_distances.append(nearest_distances.cpu())
-                chunk_labels.append(nearest_labels.cpu())
-            all_distances = torch.cat(chunk_distances, dim=1)
-            all_labels = torch.cat(chunk_labels, dim=1)
-            _, selected = torch.topk(
-                all_distances,
-                min(self.num_neighbors, all_distances.shape[1]),
-                dim=1,
-                largest=False,
-            )
-            selected_labels = torch.gather(
-                all_labels,
-                1,
-                selected[..., None].expand(
-                    *selected.shape, all_labels.shape[-1]
-                ),
-            )
-            batch_predictions = selected_labels.mode(dim=1).values
-            predictions[start : start + len(batch_predictions)] = batch_predictions
-            print_progress(description, batch_index, total_batches)
-        return predictions
-
-
-def _evaluate_knn(features, labels, ignore_labels):
+def _format_capi_result(raw, classifier_name):
+    """Translate upstream names into our existing JSON schema; do not rescore."""
+    key = "knn" if classifier_name == "knn" else "logreg"
+    grid = (
+        [{"num_neighbors": k, "distance": distance}
+         for k in (1, 3, 10, 30) for distance in ("cosine", "L2")]
+        if key == "knn" else
+        [{"C": float(c), "max_iter": 1000, "tol": 1e-12,
+          "linesearch_max_iter": 50, "lbfgs_hessian_rank": 5}
+         for c in 10 ** np.linspace(-6, 5, 8)]
+    )
     sweep = []
-    for num_neighbors in (1, 3, 10, 30):
-        for distance in ("cosine", "L2"):
-            classifier = CAPIKNN(ignore_labels, num_neighbors, distance)
-            classifier.fit(features["train"], labels["train"])
-            prediction = classifier.predict(
-                features["val"],
-                f"CAPI k-NN val k={num_neighbors} {distance}",
-            )
-            metrics = _metric_values(labels["val"], prediction, ignore_labels)
-            sweep.append(
-                {
-                    "num_neighbors": num_neighbors,
-                    "distance": distance,
-                    **metrics,
-                }
-            )
-            print(
-                f"k={num_neighbors} distance={distance}: "
-                f"val mIoU={metrics['miou_percent']:.3f}",
-                flush=True,
-            )
-            classifier.clear()
-    best = max(sweep, key=lambda item: item["miou"])
-    classifier = CAPIKNN(
-        ignore_labels, best["num_neighbors"], best["distance"]
-    )
-    classifier.fit(
-        torch.cat((features["train"], features["val"])),
-        torch.cat((labels["train"], labels["val"])),
-    )
-    prediction = classifier.predict(features["test"], "CAPI k-NN test")
-    test_metrics = _metric_values(labels["test"], prediction, ignore_labels)
-    classifier.clear()
+    for settings in grid:
+        suffix = "_".join(f"{name}={value}" for name, value in settings.items())
+        score = raw[f"hparam_fitting.{key}.mIoU_{suffix}"]
+        sweep.append({**settings, "miou": score, "miou_percent": 100 * score})
+    best = max(sweep, key=lambda entry: entry["miou"])
+    miou = raw[f"labels_{key}_mIoU"]
+    accuracy = raw[f"labels_{key}_acc"]
     return {
-        "classifier": "knn",
-        "selected_hyperparameters": {
-            "num_neighbors": best["num_neighbors"],
-            "distance": best["distance"],
-        },
+        "classifier": "knn" if key == "knn" else "linear_logistic_regression",
+        "selected_hyperparameters": {name: best[name] for name in grid[0]},
         "validation_sweep": sweep,
-        "metrics": test_metrics,
-    }
-
-
-class CAPILogisticRegression:
-    def __init__(self, ignore_labels, regularization):
-        try:
-            import cuml.linear_model
-        except ImportError as error:
-            raise ImportError(
-                "The exact CAPI linear protocol requires RAPIDS cuML. Install "
-                "the repository requirements.txt in the evaluation environment."
-            ) from error
-        self.ignore_labels = tuple(ignore_labels)
-        self.estimator = cuml.linear_model.LogisticRegression(
-            penalty="l2",
-            C=regularization,
-            max_iter=1000,
-            output_type="numpy",
-            tol=1e-12,
-            linesearch_max_iter=50,
-            verbose=False,
-        )
-        self.estimator.solver_model.lbfgs_memory = 5
-
-    def fit(self, features, labels):
-        majority = labels.mode(dim=-1).values
-        keep = ~torch.isin(majority, torch.tensor(self.ignore_labels))
-        self.patch_pixels = labels.shape[-1]
-        self.estimator.fit(
-            features[keep].numpy(), majority[keep].flatten().numpy()
-        )
-
-    def predict(self, features, description):
-        prediction = torch.empty(
-            features.shape[0], self.patch_pixels, dtype=torch.uint8
-        )
-        batch_size = 1024
-        ranges = range(0, features.shape[0], batch_size)
-        total_batches = len(ranges)
-        print(f"{description}: starting {total_batches} batches", flush=True)
-        for batch_index, start in enumerate(ranges, start=1):
-            labels = torch.from_numpy(
-                self.estimator.predict(features[start : start + batch_size].numpy())
-            ).to(torch.uint8)
-            prediction[start : start + len(labels)] = labels[:, None].expand(
-                -1, self.patch_pixels
-            )
-            print_progress(description, batch_index, total_batches)
-        return prediction
-
-
-def _evaluate_linear(features, labels, ignore_labels):
-    regularizations = tuple(float(value) for value in 10 ** np.linspace(-6, 5, 8))
-    sweep = []
-    for regularization in regularizations:
-        print(
-            f"Fitting CAPI linear probe with C={regularization:.6g}",
-            flush=True,
-        )
-        classifier = CAPILogisticRegression(ignore_labels, regularization)
-        classifier.fit(features["train"], labels["train"])
-        prediction = classifier.predict(
-            features["val"], f"CAPI linear val C={regularization:.3g}"
-        )
-        metrics = _metric_values(labels["val"], prediction, ignore_labels)
-        sweep.append({"C": regularization, **metrics})
-        print(
-            f"C={regularization:.6g}: val mIoU={metrics['miou_percent']:.3f}",
-            flush=True,
-        )
-        del classifier
-        gc.collect()
-        torch.cuda.empty_cache()
-    best = max(sweep, key=lambda item: item["miou"])
-    print(
-        f"Refitting CAPI linear probe on train+val with C={best['C']:.6g}",
-        flush=True,
-    )
-    classifier = CAPILogisticRegression(ignore_labels, best["C"])
-    classifier.fit(
-        torch.cat((features["train"], features["val"])),
-        torch.cat((labels["train"], labels["val"])),
-    )
-    prediction = classifier.predict(features["test"], "CAPI linear test")
-    test_metrics = _metric_values(labels["test"], prediction, ignore_labels)
-    return {
-        "classifier": "linear_logistic_regression",
-        "selected_hyperparameters": {
-            "C": best["C"],
-            "solver": "cuml L-BFGS",
-            "max_iter": 1000,
-            "tol": 1e-12,
-            "linesearch_max_iter": 50,
-            "lbfgs_hessian_rank": 5,
-        },
-        "validation_sweep": sweep,
-        "metrics": test_metrics,
+        "metrics": {"miou": miou, "miou_percent": 100 * miou,
+                    "pixel_accuracy": accuracy, "pixel_accuracy_percent": 100 * accuracy},
+        "capi_raw_metrics": raw,
     }
 
 
 def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
+    from evaluation.vendor.capi.eval_segmentation import eval_model
+    from evaluation.utils.capi_adapter import CAPI_REVISION
+
     started = utc_now()
     start_time = time.monotonic()
-    model, metadata = load_backbone(
-        args.checkpoint, args.checkpoint_key, args.arch
-    )
+    model, metadata = load_backbone(args.checkpoint, args.checkpoint_key, args.arch)
+    resolution = dense_resolution(metadata["patch_size"])
     model.cuda().eval()
-    features, labels, datasets = _load_or_extract_features(
-        model, metadata, args, dataset_name
-    )
-    model.cpu()
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
-    features = _standardize(features)
     spec = DATASET_SPECS[dataset_name]
-    if classifier_name == "knn":
-        evaluation = _evaluate_knn(features, labels, spec["ignore_labels"])
-    elif classifier_name == "linear":
-        evaluation = _evaluate_linear(features, labels, spec["ignore_labels"])
-    else:
-        raise ValueError(f"Unknown dense classifier: {classifier_name}")
+    full_train = spec["factory"](args.datasets_root, spec["train_split"])
+    test = spec["factory"](args.datasets_root, spec["test_split"])
+    manifests = {"train": segmentation_manifest(full_train), "test": segmentation_manifest(test)}
+    n_train, n_test = len(full_train), len(test)
+    identity = evaluation_identity(args)
+    if getattr(args, "feature_cache", None) is not None:
+        print("Pinned CAPI evaluator extracts fresh features; legacy feature cache is not reused.", flush=True)
+    print(
+        f"CAPI {CAPI_REVISION}: {dataset_name}, {spec['train_split']} -> "
+        f"{spec['test_split']}, resolution={resolution}, patch_size={metadata['patch_size']}, "
+        "patch_tokens=256, one GPU", flush=True,
+    )
+    # Upstream draws its holdout with NumPy's global RNG.
+    np.random.seed(args.seed)
+    raw = eval_model(
+        model,
+        train_dataset_name=full_train,
+        test_dataset_name=test,
+        classifiers=("knn" if classifier_name == "knn" else "logreg",),
+        standardization="StandardScaler",
+        autocast_dtype=torch.float,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        resolution=resolution,
+        ignore_labels=spec["ignore_labels"],
+        output_dir=str(args.output_dir),
+    )
     result = {
-        "evaluation": evaluation_name,
-        "dataset": spec["display_name"],
-        "status": "completed",
-        "started_at": started,
-        "finished_at": utc_now(),
+        "evaluation": evaluation_name, "dataset": spec["display_name"],
+        "status": "completed", "started_at": started, "finished_at": utc_now(),
         "elapsed_seconds": time.monotonic() - start_time,
-        "model": metadata,
-        "evaluation_identity": evaluation_identity(args),
-        "dataset_sizes": {key: len(value) for key, value in datasets.items()},
-        "dataset_manifests": _dataset_metadata(datasets),
+        "model": metadata, "evaluation_identity": identity,
+        "dataset_sizes": {"train": n_train - n_train // 10, "val": n_train // 10, "test": n_test},
+        "dataset_manifests": manifests,
         "protocol": {
-            "source": (
-                "CRISP-inspired / CAPI probes with a clean, disjoint VOC2012+SBD split"
-                if dataset_name == "pascal_voc"
-                else "CRISP Appendix A.2 / official CAPI segmentation evaluation"
-            ),
-            "input_resolution": DENSE_RESOLUTION,
-            "patch_tokens": (DENSE_RESOLUTION // metadata["patch_size"]) ** 2,
+            "source": "Pinned official CAPI segmentation evaluator with local I/O adapters",
+            "capi_revision": CAPI_REVISION,
+            "dataset_train_split": spec["train_split"], "dataset_test_split": spec["test_split"],
+            "input_resolution": resolution, "patch_tokens": 256,
+            "resolution_rule": "16 * checkpoint patch size",
             "backbone_frozen": True,
             "feature": f"final normalized {args.checkpoint_key} patch tokens",
             "standardization": "StandardScaler fitted on train only",
             "validation_split": "seeded 10% of training set",
-            "num_classes": spec["num_classes"],
-            "ignore_labels": list(spec["ignore_labels"]),
+            "num_classes": spec["num_classes"], "ignore_labels": list(spec["ignore_labels"]),
             "gpu_count": 1,
+            "published_score_equivalence": "Exact CRISP dataset lists and CAPI revision not established",
         },
-        **evaluation,
+        **_format_capi_result(raw, classifier_name),
     }
     write_json(args.result_json, result)
     print(
         f"{spec['display_name']} {classifier_name}: "
         f"mIoU={result['metrics']['miou_percent']:.3f}, "
-        f"accuracy={result['metrics']['pixel_accuracy_percent']:.3f}",
-        flush=True,
+        f"accuracy={result['metrics']['pixel_accuracy_percent']:.3f}", flush=True,
     )
     print(f"Saved results to {args.result_json}", flush=True)
     return result
@@ -536,13 +267,20 @@ def dense_entrypoint(module, dataset_name, classifier_name, evaluation_name):
         "--feature-cache",
         type=Path,
         default=None,
-        help="Optional reusable train/val/test patch-feature cache",
+        help="Deprecated compatibility argument; pinned CAPI always extracts fresh features",
     )
     args = prepare_paths(parser.parse_args(), evaluation_name)
     initialize_distributed(args.seed, allow_tf32=True)
-    try:
-        return run_dense_evaluation(
-            args, dataset_name, classifier_name, evaluation_name
-        )
-    finally:
-        cleanup_distributed()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    # CAPI's unchanged sweep uses distributed collectives even on one GPU.
+    import torch.distributed as dist
+    with tempfile.TemporaryDirectory(prefix="capi-rendezvous-") as rendezvous:
+        try:
+            if not dist.is_initialized():
+                dist.init_process_group(
+                    "nccl", init_method=Path(rendezvous, "store").as_uri(),
+                    rank=0, world_size=1,
+                )
+            return run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name)
+        finally:
+            cleanup_distributed()

@@ -89,22 +89,7 @@ def make_ade20k(root, split, transform=None, target_transform=None):
     return SegmentationDataset(images, targets, transform, target_transform)
 
 
-class PascalVOCDataset(SegmentationDataset):
-    def open_target(self, path):
-        if path.suffix == ".mat":
-            try:
-                import scipy.io
-            except ImportError as error:
-                raise ImportError(
-                    "PASCAL VOC augmented masks require scipy; install "
-                    "the repository requirements.txt"
-                ) from error
-            array = scipy.io.loadmat(path)["GTcls"][0]["Segmentation"][0]
-            return Image.fromarray(array.astype(np.uint8))
-        return Image.open(path)
-
-
-def _resolve_voc_roots(root):
+def _resolve_voc_root(root):
     original_candidates = [
         root / "VOCdevkit" / "VOC2012",
         root / "VOC2012",
@@ -128,94 +113,50 @@ def _resolve_voc_roots(root):
             f"Could not find VOCdevkit/VOC2012 below {root}"
         )
 
-    augmented_candidates = [
-        root / "benchmark_RELEASE" / "dataset",
-        root / "pascal_voc" / "benchmark_RELEASE" / "dataset",
-        root / "voc" / "benchmark_RELEASE" / "dataset",
-        root / "VOC" / "aug" / "benchmark_RELEASE" / "dataset",
-        root / "VOC2012" / "aug" / "benchmark_RELEASE" / "dataset",
-        original.parents[2] / "aug" / "benchmark_RELEASE" / "dataset",
-    ]
-    augmented = None
-    for candidate in augmented_candidates:
-        if (candidate / "train.txt").is_file() and (candidate / "val.txt").is_file():
-            augmented = candidate.resolve()
-            break
-    if augmented is None:
-        matches = sorted(root.rglob("benchmark_RELEASE/dataset/train.txt"))
-        if matches:
-            augmented = matches[0].parent.resolve()
-    if augmented is None:
-        raise FileNotFoundError(
-            "CRISP's CAPI-style VOC protocol requires the SBD augmented masks "
-            f"(benchmark_RELEASE/dataset) below {root}"
-        )
-    return original, augmented
+    return original
 
 
 def make_pascal_voc(root, split, transform=None, target_transform=None):
-    original, augmented = _resolve_voc_roots(root)
+    if split not in ("train", "val"):
+        raise ValueError(f"Unknown PASCAL VOC split: {split}; use original train or val")
+    original = _resolve_voc_root(root)
     original_train = _read_ids(
         original / "ImageSets" / "Segmentation" / "train.txt"
     )
     original_val = _read_ids(
         original / "ImageSets" / "Segmentation" / "val.txt"
     )
-    augmented_train = _read_ids(augmented / "train.txt")
-    augmented_val = _read_ids(augmented / "val.txt")
     validation_ids = set(original_val)
-    if len(validation_ids) != len(original_val):
-        raise ValueError("VOC official validation split contains duplicate image IDs")
-    source_ids = original_train + augmented_train + augmented_val
-    if split == "trainaug":
-        # One entry per image, with official validation excluded BEFORE the
-        # seeded probe holdout is drawn. Sorting makes the split reproducible.
-        # This deliberately corrects the released CAPI loader's concatenation.
-        train_ids = sorted(set(source_ids) - validation_ids)
-        original_mask_ids = {
-            path.stem for path in (original / "SegmentationClass").glob("*.png")
-        }
-        images, targets = [], []
-        for item in train_ids:
-            if item in original_mask_ids:
-                images.append(original / "JPEGImages" / f"{item}.jpg")
-                targets.append(original / "SegmentationClass" / f"{item}.png")
-            else:
-                images.append(augmented / "img" / f"{item}.jpg")
-                targets.append(augmented / "cls" / f"{item}.mat")
-    elif split == "val":
-        images = [original / "JPEGImages" / f"{item}.jpg" for item in original_val]
-        targets = [
-            original / "SegmentationClass" / f"{item}.png"
-            for item in original_val
-        ]
-    else:
-        raise ValueError(f"Unknown PASCAL VOC split: {split}")
-    dataset = PascalVOCDataset(images, targets, transform, target_transform)
+    for name, items in (("train", original_train), ("val", original_val)):
+        if not items or any(not item or Path(item).name != item for item in items):
+            raise ValueError(f"VOC official {name} split has empty or invalid image IDs")
+        if len(set(items)) != len(items):
+            raise ValueError(f"VOC official {name} split contains duplicate image IDs")
+    if set(original_train) & validation_ids:
+        raise ValueError("VOC official train/val splits have overlapping image IDs")
+    # Preserve the official list order. SBD is neither discovered nor loaded.
+    selected_ids = original_train if split == "train" else original_val
+    images = [original / "JPEGImages" / f"{item}.jpg" for item in selected_ids]
+    targets = [original / "SegmentationClass" / f"{item}.png" for item in selected_ids]
+    dataset = SegmentationDataset(images, targets, transform, target_transform)
     ids = [path.stem for path in images]
     counts = Counter(ids)
     dataset.protocol_metadata = {
-        "construction": "voc2012_sbd_disjoint_trainaug_v1",
-        "source": "VOC2012 ImageSets/Segmentation and SBD train/val lists",
-        "mask_policy": "original VOC PNG when available; otherwise SBD MAT",
-        "training_order": "sorted unique image IDs",
+        "construction": "voc2012_original_segmentation_v1",
+        "source": "VOC2012 ImageSets/Segmentation/{train,val}.txt only; no SBD",
+        "mask_policy": "original VOC SegmentationClass PNG only",
+        "training_order": "official split file order",
         "split": split,
         "unique_image_ids": len(counts),
         "repeated_image_entries": len(ids) - len(counts),
         "official_val_overlap_unique_ids": (
-            len(set(ids).intersection(validation_ids)) if split == "trainaug" else None
+            len(set(ids).intersection(validation_ids)) if split == "train" else None
         ),
         "published_score_equivalence": (
-            "Not established. This clean split differs from the released CAPI "
-            "concatenation: duplicates and official validation images are removed."
+            "Not established. User-selected original VOC splits exclude SBD, "
+            "unlike the released CAPI trainaug loader."
         ),
     }
-    if split == "trainaug":
-        dataset.protocol_metadata.update({
-            "source_image_entries": len(source_ids),
-            "deduplicated_source_entries": len(source_ids) - len(set(source_ids)),
-            "excluded_official_val_unique_ids": len(set(source_ids) & validation_ids),
-        })
     return dataset
 
 
@@ -281,7 +222,7 @@ DATASET_SPECS = {
     },
     "pascal_voc": {
         "display_name": "PASCAL VOC 2012",
-        "train_split": "trainaug",
+        "train_split": "train",
         "test_split": "val",
         "factory": make_pascal_voc,
         "ignore_labels": (255,),
