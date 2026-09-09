@@ -96,61 +96,6 @@ class iBOTLoss(nn.Module):
 
     @staticmethod
     @torch.no_grad()
-    def _sinkhorn_knopp(teacher_logits, teacher_temp, n_iterations):
-        """DINOv2's distributed assignment normalization on [tokens, prototypes].
-
-        See facebookresearch/dinov2, dinov2/loss/dino_clstoken_loss.py and
-        dinov2/loss/ibot_patch_loss.py. The token count is summed across ranks,
-        as in the patch loss, so ranks may contribute different token counts.
-        """
-        assignments = (teacher_logits.float() / teacher_temp).exp().t()
-        distributed = dist.is_available() and dist.is_initialized()
-        token_count = torch.tensor(
-            teacher_logits.shape[0], device=teacher_logits.device, dtype=torch.long
-        )
-        if distributed:
-            dist.all_reduce(token_count)
-        if token_count.item() == 0:
-            return assignments.t()
-
-        total_mass = assignments.sum()
-        if distributed:
-            dist.all_reduce(total_mass)
-        assignments /= total_mass
-        prototype_count = assignments.shape[0]
-        for _ in range(n_iterations):
-            prototype_mass = assignments.sum(dim=1, keepdim=True)
-            if distributed:
-                dist.all_reduce(prototype_mass)
-            assignments /= prototype_mass
-            assignments /= prototype_count
-            assignments /= assignments.sum(dim=0, keepdim=True)
-            assignments /= token_count
-        assignments *= token_count
-        return assignments.t()
-
-    @torch.no_grad()
-    def sinkhorn_knopp_teacher(
-        self, teacher_output, teacher_temp, teacher_patch_temp, n_iterations=3
-    ):
-        """Balance CLS and patch prototypes separately, without using centers.
-
-        Both global crops participate in each assignment problem. Unlike
-        DINOv2's masked-only patch targets, this repo needs every patch for the
-        region loss. Use the same dense targets when lambda3 is zero so the
-        iBOT control and region experiment share their teacher normalization.
-        """
-        teacher_cls, teacher_patch = teacher_output
-        cls_targets = self._sinkhorn_knopp(
-            teacher_cls, teacher_temp, n_iterations
-        )
-        patch_targets = self._sinkhorn_knopp(
-            teacher_patch.flatten(0, 1), teacher_patch_temp, n_iterations
-        ).reshape_as(teacher_patch)
-        return cls_targets, patch_targets
-
-    @staticmethod
-    @torch.no_grad()
     def _distribution_diagnostics(distributions, are_probabilities):
         """Summarize patch distributions without retaining a large graph."""
         entropy_sum = None
@@ -241,8 +186,10 @@ class iBOTLoss(nn.Module):
         student_local_cls,
         student_mask,
         crop_boxes,
+        *,
+        teacher_overlap_targets=None,
     ):
-        """Compute losses from student logits and pre-normalized teacher targets."""
+        """Use centered CLS/patch targets and optional independent overlap targets."""
         student_cls, student_patch = student_output
         teacher_cls, teacher_patch = teacher_targets
 
@@ -305,6 +252,7 @@ class iBOTLoss(nn.Module):
                 student_patch_c,
                 teacher_patch_c,
                 crop_boxes,
+                teacher_overlap_targets=teacher_overlap_targets,
             )
             region_raw = region_stats["loss"]
             total_loss3 = region_raw * region_weight

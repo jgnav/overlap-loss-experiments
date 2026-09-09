@@ -7,6 +7,10 @@ output_dir: output/train
 arch: vit_small
 
 # Loss and teacher
+# CLS and iBOT always use centering + softmax. This selects overlap targets:
+# centering reuses the iBOT probabilities; sinkhorn_knopp uses raw overlapping
+# patch logits, with 3 SK iterations before area-weighted pooling.
+# With lambda3: 0.0, both settings give the same pure iBOT objective (no SK).
 centering: centering  # centering or sinkhorn_knopp.
 lambda1: 1.0  # Global CLS loss
 lambda2: 1.0  # Masked patch loss
@@ -16,7 +20,7 @@ lambda3: 0.0  # Constant from the first epoch; set to 0.0 for pure iBOT.
 region_min_area: 0.10
 momentum_teacher: 0.9995
 teacher_temp: 0.07
-teacher_patch_temp: 0.07
+teacher_patch_temp: 0.07  # Also the epsilon for the independent overlap SK branch.
 
 # Training
 additional_epochs: 200

@@ -1,9 +1,20 @@
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .sinkhorn import sinkhorn_knopp
+
+
+@dataclass
+class OverlapTeacherTargets:
+    probabilities: torch.Tensor  # [batch, 2 views, prototypes], pooled after SK
+    patch_weights: torch.Tensor
+    valid: torch.Tensor
+    intersection_area: torch.Tensor
 
 
 def intersection_patch_weights(crop_boxes, patch_count, min_area):
@@ -84,20 +95,59 @@ class RegionLoss(nn.Module):
             raise ValueError("region_min_area must be between 0 and 1")
         self.min_area = min_area
 
+    @torch.no_grad()
+    def sinkhorn_knopp_teacher(self, teacher_patch_logits, crop_boxes, teacher_temp):
+        """Select raw overlapping patch logits, apply SK, then pool by area.
+
+        Both views and all ranks share one assignment problem. Invalid
+        intersections and patches with zero coverage never participate.
+        Every rank must call this, even if it has no valid local overlap.
+        """
+        weights, valid, intersection_area = intersection_patch_weights(
+            crop_boxes.float(), teacher_patch_logits.shape[1], self.min_area
+        )
+        batch_size = len(crop_boxes)
+        if teacher_patch_logits.shape[0] != 2 * batch_size:
+            raise ValueError("Overlap teacher logits must contain two global views")
+
+        # Model output is view-major: all samples of view 0, then view 1.
+        view_weights = weights.transpose(0, 1).reshape(teacher_patch_logits.shape[:2])
+        selected = view_weights > 0
+        assignments = sinkhorn_knopp(teacher_patch_logits[selected], teacher_temp)
+
+        normalized_weights = view_weights / view_weights.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1e-12)
+        # Reduce only selected patches instead of allocating another dense
+        # [2 * batch, patches, prototypes] probability tensor.
+        region_indices = selected.nonzero(as_tuple=True)[0]
+        assignments *= normalized_weights[selected].unsqueeze(-1)
+        pooled = assignments.new_zeros((2 * batch_size, teacher_patch_logits.shape[-1]))
+        pooled.index_add_(0, region_indices, assignments)
+        pooled = pooled.reshape(2, batch_size, -1).transpose(0, 1)
+        return OverlapTeacherTargets(pooled, weights, valid, intersection_area)
+
     def forward(
         self,
         student_patch_logits,
         teacher_patch_probabilities,
         crop_boxes,
+        *,
+        teacher_overlap_targets=None,
     ):
         if len(student_patch_logits) != 2 or len(teacher_patch_probabilities) != 2:
             raise ValueError("Region loss requires exactly two global crops")
 
-        weights, valid, intersection_area = intersection_patch_weights(
-            crop_boxes.float(),
-            student_patch_logits[0].shape[1],
-            self.min_area,
-        )
+        if teacher_overlap_targets is None:
+            weights, valid, intersection_area = intersection_patch_weights(
+                crop_boxes.float(),
+                student_patch_logits[0].shape[1],
+                self.min_area,
+            )
+        else:
+            weights = teacher_overlap_targets.patch_weights
+            valid = teacher_overlap_targets.valid
+            intersection_area = teacher_overlap_targets.intersection_area
         all_patch_weights = weights
 
         valid_count = valid.sum().float()
@@ -128,13 +178,18 @@ class RegionLoss(nn.Module):
                     ).squeeze(1)
                     / normalizer[:, view]
                 )
-                teacher_regions.append(
-                    torch.bmm(
-                        weights[:, view].unsqueeze(1),
-                        teacher_patch_probabilities[view][selector].float(),
-                    ).squeeze(1)
-                    / normalizer[:, view]
-                )
+                if teacher_overlap_targets is None:
+                    teacher_regions.append(
+                        torch.bmm(
+                            weights[:, view].unsqueeze(1),
+                            teacher_patch_probabilities[view][selector].float(),
+                        ).squeeze(1)
+                        / normalizer[:, view]
+                    )
+                else:
+                    teacher_regions.append(
+                        teacher_overlap_targets.probabilities[selector, view].detach()
+                    )
             student_region = torch.stack(student_regions, dim=1)
             teacher_region = torch.stack(teacher_regions, dim=1)
 

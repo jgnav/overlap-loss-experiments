@@ -22,6 +22,7 @@ class ContinuationConfigTest(unittest.TestCase):
         self.assertEqual(config.batch_size_per_gpu * config.gpu_count, 256)
         self.assertEqual(config.saveckp_freq, 50)
         self.assertEqual(config.centering, "centering")
+        self.assertEqual(config.teacher_target_version, 2)
 
     def test_teacher_normalization_choices_and_legacy_default(self):
         path = Path(__file__).parents[1] / "train.yaml"
@@ -105,8 +106,11 @@ class TeacherTargetTrainingTest(unittest.TestCase):
                  / loss.teacher_temp2_schedule[epoch]).softmax(-1),
             )
 
-            targets = get_teacher_targets(teacher, loss, epoch, "centering")
+            targets, overlap_targets = get_teacher_targets(
+                teacher, loss, epoch, "centering"
+            )
 
+            self.assertIsNone(overlap_targets)
             for actual, reference in zip(targets, expected):
                 torch.testing.assert_close(actual, reference)
             torch.testing.assert_close(
@@ -117,32 +121,78 @@ class TeacherTargetTrainingTest(unittest.TestCase):
                 old_patch_center * 0.9 + teacher[1].mean((0, 1)) * 0.1,
             )
 
-    def test_sk_uses_both_temperature_schedules_and_never_updates_centers(self):
-        loss = self._loss()
+    def test_sk_keeps_centered_targets_and_center_updates_in_both_schedules(self):
+        centered_loss = self._loss()
+        sk_loss = self._loss()
         teacher = (torch.randn(4, 3) * 0.1, torch.randn(4, 4, 5) * 0.1)
-        loss.center.fill_(0.1)
-        loss.center2.fill_(-0.2)
-        loss.update_center = mock.Mock(
-            side_effect=AssertionError("SK must not update centers")
-        )
-        loss.softmax_center_teacher = mock.Mock(
-            side_effect=AssertionError("SK must not use centering")
+        boxes = torch.tensor(
+            [[[0., 0., 1., 1., 0.], [0.25, 0., 1., 1., 0.]]] * 2
         )
         for epoch in (0, 1):
-            expected = loss.sinkhorn_knopp_teacher(
-                teacher,
-                loss.teacher_temp_schedule[epoch],
-                loss.teacher_temp2_schedule[epoch],
+            centered, _ = get_teacher_targets(
+                teacher, centered_loss, epoch, "centering", boxes
+            )
+            with mock.patch.object(
+                sk_loss.region_loss, "sinkhorn_knopp_teacher",
+                wraps=sk_loss.region_loss.sinkhorn_knopp_teacher,
+            ) as build_overlap:
+                sk, overlap = get_teacher_targets(
+                    teacher, sk_loss, epoch, "sinkhorn_knopp", boxes
+                )
+
+            for actual, reference in zip(sk, centered):
+                torch.testing.assert_close(actual, reference)
+            torch.testing.assert_close(sk_loss.center, centered_loss.center)
+            torch.testing.assert_close(sk_loss.center2, centered_loss.center2)
+            self.assertIsNotNone(overlap)
+            build_overlap.assert_called_once()
+            self.assertIs(build_overlap.call_args.args[0], teacher[1])
+            self.assertEqual(
+                build_overlap.call_args.args[2], sk_loss.teacher_temp2_schedule[epoch]
             )
 
-            targets = get_teacher_targets(teacher, loss, epoch, "sinkhorn_knopp")
+    def test_sk_overlap_targets_are_independent_of_centers(self):
+        teacher = (torch.randn(4, 3) * 0.1, torch.randn(4, 4, 5) * 0.1)
+        boxes = torch.tensor(
+            [[[0., 0., 1., 1., 0.], [0.5, 0., 1., 1., 0.]]] * 2
+        )
+        first = self._loss()
+        second = self._loss()
+        second.center.copy_(torch.tensor([[0.1, -0.1, 0.2]]))
+        second.center2.copy_(torch.linspace(-0.3, 0.3, 5).reshape(1, 1, 5))
 
-            for actual, reference in zip(targets, expected):
-                torch.testing.assert_close(actual, reference)
-        loss.update_center.assert_not_called()
-        loss.softmax_center_teacher.assert_not_called()
-        torch.testing.assert_close(loss.center, torch.full_like(loss.center, 0.1))
-        torch.testing.assert_close(loss.center2, torch.full_like(loss.center2, -0.2))
+        targets_a, overlap_a = get_teacher_targets(
+            teacher, first, 0, "sinkhorn_knopp", boxes
+        )
+        targets_b, overlap_b = get_teacher_targets(
+            teacher, second, 0, "sinkhorn_knopp", boxes
+        )
+
+        torch.testing.assert_close(overlap_a.probabilities, overlap_b.probabilities)
+        self.assertFalse(torch.allclose(targets_a[0], targets_b[0]))
+        self.assertFalse(torch.allclose(targets_a[1], targets_b[1]))
+
+    def test_zero_overlap_weight_skips_sk_and_matches_pure_ibot(self):
+        centered_loss = self._loss()
+        centered_loss.lambda3 = 0
+        sk_loss = self._loss()
+        sk_loss.lambda3 = 0
+        sk_loss.region_loss.sinkhorn_knopp_teacher = mock.Mock(
+            side_effect=AssertionError("No SK when lambda3 is zero")
+        )
+        teacher = (torch.randn(4, 3) * 0.1, torch.randn(4, 4, 5) * 0.1)
+        student = (torch.randn(4, 3), torch.randn(4, 4, 5))
+        masks = [torch.ones(2, 2, 2, dtype=torch.bool) for _ in range(2)]
+        centered, _ = get_teacher_targets(teacher, centered_loss, 0, "centering")
+        sk, overlap = get_teacher_targets(teacher, sk_loss, 0, "sinkhorn_knopp")
+
+        expected = centered_loss(student, centered, None, masks, None)
+        actual = sk_loss(student, sk, None, masks, None, teacher_overlap_targets=overlap)
+
+        self.assertIsNone(overlap)
+        sk_loss.region_loss.sinkhorn_knopp_teacher.assert_not_called()
+        for key in expected:
+            torch.testing.assert_close(actual[key], expected[key])
 
 
 if __name__ == "__main__":

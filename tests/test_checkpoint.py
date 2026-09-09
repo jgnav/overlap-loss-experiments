@@ -191,6 +191,33 @@ class RecordingScaler:
 
 
 class ResumeCheckpointTest(unittest.TestCase):
+    def test_resume_rejects_old_global_sk_but_accepts_overlap_sk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.pth"
+            checkpoint = self._make_checkpoint()
+            checkpoint["args"].centering = "sinkhorn_knopp"
+            args = SimpleNamespace(
+                resume_checkpoint=path, epochs=50, use_fp16=True,
+                centering="sinkhorn_knopp", teacher_target_version=2,
+            )
+            torch.save(checkpoint, path)
+            with self.assertRaisesRegex(ValueError, "teacher_target_version"):
+                read_resume_checkpoint(args)
+
+            checkpoint["args"].teacher_target_version = 2
+            torch.save(checkpoint, path)
+            read_resume_checkpoint(args)
+
+    def test_legacy_centering_remains_compatible_with_new_target_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.pth"
+            torch.save(self._make_checkpoint(), path)
+            args = SimpleNamespace(
+                resume_checkpoint=path, epochs=50, use_fp16=True,
+                centering="centering", teacher_target_version=2,
+            )
+            read_resume_checkpoint(args)
+
     def _make_checkpoint(self):
         student = nn.Linear(2, 2)
         teacher = nn.Linear(2, 2)

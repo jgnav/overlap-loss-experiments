@@ -47,6 +47,8 @@ def load_config(path):
     config = {**get_ibot_recipe(user_config["arch"]), **user_config}
     if config["centering"] not in ("centering", "sinkhorn_knopp"):
         raise ValueError("centering must be one of: centering, sinkhorn_knopp")
+    # Saved with args: version 2 restricts SK to the overlap branch.
+    config["teacher_target_version"] = 2
     if "additional_epochs" in user_config and "epochs" in user_config:
         raise ValueError(
             "Configure training length with additional_epochs, not both keys"
@@ -493,23 +495,30 @@ def train_ibot(args, wandb_run=None):
 
 
 @torch.no_grad()
-def get_teacher_targets(teacher_output, ibot_loss, epoch, centering):
-    """Select DINOv2-style teacher normalization before computing any losses."""
+def get_teacher_targets(teacher_output, ibot_loss, epoch, centering, crop_boxes=None):
+    """Center CLS/iBOT targets and optionally build separate SK overlap targets."""
+    if centering not in ("centering", "sinkhorn_knopp"):
+        raise ValueError(f"Unsupported teacher normalization: {centering!r}")
     teacher_temp = ibot_loss.teacher_temp_schedule[epoch]
     teacher_patch_temp = ibot_loss.teacher_temp2_schedule[epoch]
+    teacher_targets = ibot_loss.softmax_center_teacher(
+        teacher_output, teacher_temp, teacher_patch_temp
+    )
     if centering == "centering":
-        teacher_targets = ibot_loss.softmax_center_teacher(
-            teacher_output, teacher_temp, teacher_patch_temp
-        )
-        # Use the old centers for this batch, then update them for the next one.
-        ibot_loss.update_center(*teacher_output)
+        # The region loss pools the same centered patch probabilities as iBOT.
+        teacher_overlap_targets = None
     elif centering == "sinkhorn_knopp":
-        teacher_targets = ibot_loss.sinkhorn_knopp_teacher(
-            teacher_output, teacher_temp, teacher_patch_temp
+        # A parallel transformation of RAW overlap logits, never q_center.
+        teacher_overlap_targets = (
+            ibot_loss.region_loss.sinkhorn_knopp_teacher(
+                teacher_output[1], crop_boxes, teacher_patch_temp
+            )
+            if ibot_loss.lambda3 != 0
+            else None
         )
-    else:
-        raise ValueError(f"Unsupported teacher normalization: {centering!r}")
-    return teacher_targets
+    # Both modes use the old centers for this batch and update them once.
+    ibot_loss.update_center(*teacher_output)
+    return teacher_targets, teacher_overlap_targets
 
 
 def train_one_epoch(
@@ -581,8 +590,8 @@ def train_one_epoch(
         ):
             with torch.no_grad():
                 teacher_output = teacher(images[: args.global_crops_number])
-                teacher_targets = get_teacher_targets(
-                    teacher_output, ibot_loss, epoch, args.centering
+                teacher_targets, teacher_overlap_targets = get_teacher_targets(
+                    teacher_output, ibot_loss, epoch, args.centering, crop_boxes
                 )
             student_output = student(
                 images[: args.global_crops_number],
@@ -603,6 +612,7 @@ def train_one_epoch(
                 student_local_cls,
                 masks,
                 crop_boxes,
+                teacher_overlap_targets=teacher_overlap_targets,
             )
             loss = all_loss.pop("loss")
 

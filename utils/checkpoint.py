@@ -28,6 +28,7 @@ RESUME_COMPATIBILITY_KEYS = (
     "local_crops_scale",
     "student_temp",
     "centering",
+    "teacher_target_version",
     "center_momentum",
     "center_momentum2",
     "warmup_teacher_temp",
@@ -147,6 +148,13 @@ def _validate_resume_compatibility(checkpoint, args):
         if key == "centering" and saved_value is None:
             # Checkpoints written before this option always used centering.
             saved_value = "centering"
+        if key == "teacher_target_version" and saved_value is None:
+            # Old SK runs normalized CLS/iBOT with SK too. They cannot be
+            # resumed exactly under the new overlap-only normalization.
+            saved_value = (
+                1 if _checkpoint_argument(checkpoint, "centering") == "sinkhorn_knopp"
+                else 2
+            )
         if saved_value is None or not hasattr(args, key):
             continue
         configured_value = getattr(args, key)
