@@ -387,7 +387,7 @@ class OrchestrationTest(unittest.TestCase):
         table = orchestrator._result_table(results)
         self.assertEqual(len(table), 3)
         self.assertEqual({row["task"] for row in table}, {"semantic_segmentation", "multilabel_classification", "multiclass_classification"})
-        self.assertEqual(len(orchestrator.EVALUATIONS), 10)
+        self.assertEqual(len(orchestrator.EVALUATIONS), 15)
 
     def test_previous_results_and_changed_seed_are_not_reused(self):
         with tempfile.TemporaryDirectory() as directory:

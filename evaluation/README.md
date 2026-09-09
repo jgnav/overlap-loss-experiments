@@ -62,7 +62,7 @@ ADE20K uses official `training` (20,210 images) and `validation` (2,000),
 IDs, and ignores other labels (255); coarse annotations and test images are
 not used. Both retain the same CAPI-style holdout/probes and CRISP's 256-token
 resolution. ImageNet classification uses official train/val with matching
-1,000-class vocabularies; k-NN uses a seeded stratified 10% training bank and
+1,000-class vocabularies; k-NN uses 1%, 10%, and 100% training banks and
 linear probing uses all training images. VOC multilabel classification remains
 separate from segmentation: official VOC2012 `ImageSets/Main` train/val.
 COCO remains the explicitly selected 2017 train/val baseline. Exact CRISP
@@ -76,9 +76,9 @@ Source hashes cover the local evaluation and backbone Python files. They do not
 hash every image's pixel content: use a new output directory if dataset files
 are edited in place. Retain result JSON files with the evaluated checkpoints.
 
-## Full-data classification
+## Classification
 
-The three added evaluations cover these classification tasks from CG-SSL Table 2:
+Full-data linear probes use the following fixed settings:
 
 | Evaluation | Training data | Epochs | Metric |
 | --- | --- | --- | --- |
@@ -89,9 +89,38 @@ The three added evaluations cover these classification tasks from CG-SSL Table 2
 CRISP A.2 specifies 224 x 224 inputs, four GPUs, batch size 256 per GPU, learning
 rate 0.001, and these epoch counts. The frozen backbone remains in evaluation
 mode; only a linear layer is trained. The existing `imagenet_knn` remains the
-10% reference-bank evaluation used in the original repository's CRISP ablations.
-It is not paired with the full-data ImageNet linear score as if both used the
-same amount of labeled training data. No extra low-shot evaluation was added.
+10% reference-bank evaluation used in CRISP's ablations. The additional
+`imagenet_knn_1pct` and `imagenet_knn_100pct` evaluations complete CRISP Table 4's
+k-NN fractions. All three evaluate the **entire ImageNet validation set** and
+use the same iBOT weighted k-NN recipe: final CLS features, L2 normalization,
+temperature 0.07, and primary k=20 (also reporting k=10/100/200). The 1% and
+10% banks use deterministic proportional stratified sampling; 100% uses every
+training image in dataset order. The existing 10% sampler is unchanged. Each
+result records its fraction, seed, sample counts and index hash. CRISP does not
+provide the exact sampled images or detailed k-NN settings. Each task extracts
+its own features; the 100% bank needs substantially more GPU memory and work.
+
+`pascal_voc_1shot`, `pascal_voc_2shot`, and `pascal_voc_5shot` implement CRISP
+Table 3's low-shot classification settings. They use the same VOC classification
+manifest and 500-epoch linear recipe as the full-data probe. For each class,
+sample 1, 2, or 5 **positive training images** without replacement using a fixed
+seed, then train on the deduplicated union. Preserve all labels, including
+ignored labels, of each selected image. Multilabel overlap can make the number
+of positive examples for a class exceed the requested shot count; the number
+of unique images can be smaller than 20 times the shot count. No extra negative
+images are added. All three probes evaluate the full original validation set.
+
+For a fixed seed and manifest, per-class permutations are shared across shot
+counts, so 1-shot selections are contained in 2-shot, then 5-shot selections.
+Result JSON and `protocol.json` retain selected indices/images, per-class draws,
+actual positive counts, and a subset hash. CRISP does not specify the seed,
+overlap handling, or nesting: these are explicit reproducible implementation
+choices, not verified author splits. The batch size remains a maximum of 256
+images per GPU; low-shot datasets produce smaller batches with the existing
+distributed sampler. Use the same manifest and `--seed` for all models.
+
+Every regime has its own result row and probe-checkpoint directory. ImageNet
+linear probing continues to use 100% of the training images.
 
 ### Details not established by the papers
 
@@ -245,7 +274,7 @@ python evaluation/full-evaluation /path/to/checkpoint.pth \
   --datasets-root /path/to/datasets
 ```
 
-The full command runs ten evaluations and preflights the two multilabel
+The full command runs fifteen evaluations and preflights the two multilabel
 manifests before expensive work begins. Select tasks without adding alternative
 protocols:
 
@@ -253,6 +282,11 @@ protocols:
 python evaluation/full-evaluation /path/to/checkpoint.pth \
   --datasets-root /path/to/datasets \
   --evaluations imagenet_linear pascal_voc_multilabel coco_multilabel
+
+python evaluation/full-evaluation /path/to/checkpoint.pth \
+  --datasets-root /path/to/datasets --seed 0 \
+  --evaluations imagenet_knn_1pct imagenet_knn imagenet_knn_100pct \
+    pascal_voc_1shot pascal_voc_2shot pascal_voc_5shot
 
 python -m evaluation.utils.imagenet_linear /path/to/checkpoint.pth \
   --datasets-root /path/to/datasets

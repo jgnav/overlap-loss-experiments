@@ -1,4 +1,4 @@
-"""Full-data linear classification using the settings stated in CRISP A.2.
+"""Full-data and low-shot linear classification using CRISP A.2 settings.
 
 The papers do not specify a complete recipe. iBOT-derived implementation choices
 are identified in the saved protocol metadata and evaluation/README.md.
@@ -15,7 +15,9 @@ from torch import nn
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 from torchvision import datasets, transforms as T
 
-from evaluation.utils.classification_data import MULTILABEL_DATASETS, make_multilabel_datasets
+from evaluation.utils.classification_data import (
+    MULTILABEL_DATASETS, VOC_SHOT_EVALUATIONS, few_shot_dataset, make_multilabel_datasets,
+)
 from evaluation.utils.common import (
     base_parser, cleanup_distributed, evaluation_identity, initialize_distributed,
     launch_distributed_if_needed, load_backbone, prepare_paths, print_progress,
@@ -226,11 +228,23 @@ def evaluate(backbone, head, dataset, architecture, multilabel, device, rank, wo
 def run_classification(args, dataset_name, evaluation_name, rank, world_size):
     started, start_time = utc_now(), time.monotonic()
     train, val, dataset_metadata = _make_datasets(args, dataset_name)
+    shots = VOC_SHOT_EVALUATIONS.get(evaluation_name)
+    if shots is not None:
+        if dataset_name != "pascal_voc":
+            raise ValueError("Few-shot probes require PASCAL VOC")
+        train, sampling_metadata = few_shot_dataset(train, shots, args.seed)
+        dataset_metadata = {**dataset_metadata, "few_shot_sampling": sampling_metadata}
     device = torch.device("cuda", torch.cuda.current_device())
     backbone, metadata = load_backbone(args.checkpoint, args.checkpoint_key, args.arch)
     backbone.to(device).eval()
     architecture = metadata["architecture"]
     protocol = _protocol(dataset_name, architecture, args.checkpoint_key)
+    if shots is not None:
+        protocol.update({
+            "source": "CRISP Table 3 and Appendix A.2",
+            "shots_per_class": shots,
+            "validation_split": "full original classification validation set",
+        })
     epochs = protocol["epochs"]
     identity = evaluation_identity(args)
     multilabel = dataset_name != "imagenet"
@@ -294,7 +308,9 @@ def run_classification(args, dataset_name, evaluation_name, rank, world_size):
 
 
 def classification_entrypoint(module, dataset_name, evaluation_name):
-    parser = base_parser(f"Full-data {dataset_name} frozen linear classification (CRISP A.2 settings)")
+    shots = VOC_SHOT_EVALUATIONS.get(evaluation_name)
+    regime = "Full-data" if shots is None else f"{shots}-shot"
+    parser = base_parser(f"{regime} {dataset_name} frozen linear classification (CRISP A.2 settings)")
     # Show help before requiring GPUs or starting four processes.
     args = prepare_paths(parser.parse_args(), evaluation_name)
     launch_distributed_if_needed(module, required_world_size=GPU_COUNT)

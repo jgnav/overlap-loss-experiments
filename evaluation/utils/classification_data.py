@@ -1,4 +1,4 @@
-"""Explicit split and label inputs for full-data multilabel linear probing."""
+"""Explicit split and label inputs for full-data and low-shot linear probing."""
 
 import hashlib
 import json
@@ -8,13 +8,60 @@ import stat
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 
 
 MULTILABEL_DATASETS = {
     "pascal_voc": {"display_name": "PASCAL VOC", "num_classes": 20, "epochs": 500},
     "coco": {"display_name": "MS-COCO", "num_classes": 80, "epochs": 200},
 }
+VOC_SHOT_EVALUATIONS = {f"pascal_voc_{shots}shot": shots for shots in (1, 2, 5)}
+
+
+def sample_few_shot_indices(targets, shots, seed):
+    """Draw k positive images per class, then deduplicate their union.
+
+    Full per-class permutations make 1/2/5-shot selections nested for a fixed
+    seed. Other labels on each selected image remain available to the probe.
+    """
+    if shots not in (1, 2, 5):
+        raise ValueError("VOC supports 1-, 2-, or 5-shot classification")
+    targets = np.asarray(targets)
+    if targets.ndim != 2 or targets.shape[1] == 0:
+        raise ValueError("Few-shot targets must be an image-by-class matrix")
+    rng = np.random.default_rng(seed)
+    draws = []
+    for column in targets.T:
+        positives = np.flatnonzero(column == 1)
+        if len(positives) < shots:
+            raise ValueError(f"Few-shot sampling needs at least {shots} positive images per class")
+        draws.append(rng.permutation(positives)[:shots].tolist())
+    return sorted({index for draw in draws for index in draw}), draws
+
+
+def few_shot_dataset(dataset, shots, seed):
+    indices, draws = sample_few_shot_indices(dataset.targets, shots, seed)
+    subset = Subset(dataset, indices)
+    subset.classes = dataset.classes
+    metadata = {
+        "shots_per_class": shots, "seed": seed,
+        "sampling": "per-class positive permutation prefixes; deduplicated union; all image labels retained",
+        "full_train_images": len(dataset), "unique_train_images": len(indices),
+        "selected_indices": indices,
+        "selected_images": [str(dataset.images[i]) for i in indices],
+        "selected_indices_sha256": hashlib.sha256(json.dumps(indices).encode()).hexdigest(),
+        "drawn_indices_by_class": dict(zip(dataset.classes, draws, strict=True)),
+        "positive_counts_by_class": dict(zip(
+            dataset.classes, (dataset.targets[indices] == 1).sum(0).tolist(), strict=True,
+        )),
+        "equivalence_note": (
+            "CRISP specifies random images per class with a fixed seed, but does not publish "
+            "the seed, selected images, or multilabel overlap handling. These are explicit "
+            "implementation choices; shot count is the number drawn per class, not an exact "
+            "cap on positive labels after merging multilabel images."
+        ),
+    }
+    return subset, metadata
 
 
 class MultilabelDataset(Dataset):

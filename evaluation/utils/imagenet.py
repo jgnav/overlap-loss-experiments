@@ -30,6 +30,11 @@ IMAGENET_NORMALIZE = T.Normalize(
 GPU_COUNT = 4
 BATCH_SIZE_PER_GPU = 256
 IMAGENET_KNN_TRAINING_FRACTION = 0.10
+IMAGENET_KNN_FRACTIONS = {
+    "imagenet_knn_1pct": 0.01,
+    "imagenet_knn": IMAGENET_KNN_TRAINING_FRACTION,
+    "imagenet_knn_100pct": 1.0,
+}
 
 
 def _resolve_imagenet_root(datasets_root):
@@ -215,7 +220,9 @@ def _weighted_knn(
     }
 
 
-def run_imagenet_knn(args):
+def run_imagenet_knn(args, evaluation_name="imagenet_knn"):
+    fraction = IMAGENET_KNN_FRACTIONS[evaluation_name]
+    percent = round(100 * fraction)
     started = utc_now()
     start_time = time.monotonic()
     model, metadata = load_backbone(
@@ -226,17 +233,18 @@ def run_imagenet_knn(args):
     full_train_dataset = datasets.ImageFolder(
         root / "train", transform=_eval_transform()
     )
-    train_indices = _stratified_subset_indices(
-        full_train_dataset.targets,
-        IMAGENET_KNN_TRAINING_FRACTION,
-        args.seed,
-    )
+    if fraction == 1.0:
+        train_indices = list(range(len(full_train_dataset)))
+    else:
+        train_indices = _stratified_subset_indices(full_train_dataset.targets, fraction, args.seed)
     train_dataset = IndexedSubset(full_train_dataset, train_indices)
     val_dataset = IndexedImageFolder(root / "val", transform=_eval_transform())
+    if full_train_dataset.class_to_idx != val_dataset.class_to_idx or len(full_train_dataset.classes) != 1000:
+        raise ValueError("ImageNet train/val must share exactly the same 1,000 classes")
     if is_main_process():
         print(
             "ImageNet loaded: "
-            f"{len(train_dataset)}/{len(full_train_dataset)} train (10%), "
+            f"{len(train_dataset)}/{len(full_train_dataset)} train ({percent}%), "
             f"{len(val_dataset)} val; subset seed={args.seed}",
             flush=True,
         )
@@ -260,8 +268,8 @@ def run_imagenet_knn(args):
                 neighbors,
             )
         result = {
-            "evaluation": "imagenet_knn",
-            "dataset": "ImageNet-1K 10%",
+            "evaluation": evaluation_name,
+            "dataset": f"ImageNet-1K {percent}%",
             "status": "completed",
             "started_at": started,
             "finished_at": utc_now(),
@@ -274,18 +282,18 @@ def run_imagenet_knn(args):
                 "test": len(val_dataset),
             },
             "protocol": {
-                "source": "CRISP Section 4.4 / original iBOT weighted k-NN",
+                "source": "CRISP Table 4 (10% also Section 4.4) / original iBOT weighted k-NN",
                 "input_resolution": 224,
-                "training_fraction": IMAGENET_KNN_TRAINING_FRACTION,
-                "training_subset": "deterministic proportional stratified sample",
+                "training_fraction": fraction,
+                "training_subset": "all training images in dataset order" if fraction == 1.0 else "deterministic proportional stratified sample",
                 "training_subset_seed": args.seed,
                 "training_subset_indices_sha256": _indices_sha256(train_indices),
                 "subset_note": (
-                    "CRISP specifies a 10% ImageNet-1K k-NN evaluation but does "
+                    "CRISP specifies 1%, 10%, and 100% ImageNet-1K k-NN evaluations but does "
                     "not publish subset indices; the seed and index hash make "
                     "this implementation reproducible."
                 ),
-                "feature": "final normalized teacher CLS token",
+                "feature": f"final normalized {args.checkpoint_key} CLS token",
                 "feature_l2_normalization": True,
                 "temperature": 0.07,
                 "neighbors": [10, 20, 100, 200],
@@ -298,7 +306,7 @@ def run_imagenet_knn(args):
         }
         write_json(args.result_json, result)
         print(
-            f"ImageNet 10% k-NN (k=20): top-1={result['metrics']['top1']:.3f}, "
+            f"ImageNet {percent}% k-NN (k=20): top-1={result['metrics']['top1']:.3f}, "
             f"top-5={result['metrics']['top5']:.3f}",
             flush=True,
         )
@@ -307,14 +315,15 @@ def run_imagenet_knn(args):
     return result
 
 
-def imagenet_entrypoint(module, mode):
+def imagenet_entrypoint(module, mode, evaluation_name="imagenet_knn"):
     if mode != "knn":
-        raise ValueError("CRISP ablations only use ImageNet-1K 10% k-NN")
+        raise ValueError("This entrypoint supports only ImageNet k-NN")
+    percent = round(100 * IMAGENET_KNN_FRACTIONS[evaluation_name])
+    parser = base_parser(f"CRISP ImageNet-1K {percent}% k-NN evaluation")
+    args = prepare_paths(parser.parse_args(), evaluation_name)
     launch_distributed_if_needed(module, required_world_size=GPU_COUNT)
-    parser = base_parser("CRISP ImageNet-1K 10% k-NN evaluation")
-    args = prepare_paths(parser.parse_args(), f"imagenet_{mode}")
     initialize_distributed(args.seed, allow_tf32=False)
     try:
-        return run_imagenet_knn(args)
+        return run_imagenet_knn(args, evaluation_name)
     finally:
         cleanup_distributed()
