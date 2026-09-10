@@ -8,11 +8,7 @@ output_dir: /home/jovyan/overlap-loss-experiments/output/train
 arch: vit_small
 
 # Loss and teacher
-# CLS and iBOT always use centering + softmax. This selects overlap targets:
-# centering reuses the iBOT probabilities; sinkhorn_knopp uses raw overlapping
-# patch logits, with 3 SK iterations before area-weighted pooling.
-# With lambda3: 0.0, both settings give the same pure iBOT objective (no SK).
-centering: centering  # centering or sinkhorn_knopp.
+centering: sinkhorn_knopp  # centering or sinkhorn_knopp.
 lambda1: 1.0  # Global CLS loss
 lambda2: 1.0  # Masked patch loss
 lambda3: 1.0  # Constant from the first epoch; set to 0.0 for pure iBOT.
@@ -46,6 +42,9 @@ saveckp_freq: 50
 num_workers: 10
 
 # Weights & Biases
+wandb_mode: online  # online, offline, or disabled; online reads .wandb_key at repo root
 wandb_project: ibot-imagenet1k
 wandb_entity: null
 wandb_run_name: null
+wandb_run_id: null
+wandb_resume: null  # null, allow, must, never; requires wandb_run_id when set

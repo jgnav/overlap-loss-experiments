@@ -123,6 +123,9 @@ def classification_manifest_root(args):
 def evaluation_identity(args):
     """Invalidate results when the evaluator, selected inputs, or seed changes."""
     digest = hashlib.sha256()
+    entrypoint = REPO_ROOT / "evaluation.py"
+    digest.update(entrypoint.name.encode())
+    digest.update(entrypoint.read_bytes())
     for directory in (REPO_ROOT / "evaluation", REPO_ROOT / "model"):
         for path in sorted(directory.rglob("*.py")):
             digest.update(str(path.relative_to(REPO_ROOT)).encode())

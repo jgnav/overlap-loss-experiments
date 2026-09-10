@@ -14,7 +14,6 @@ from types import SimpleNamespace
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
-import wandb
 import yaml
 from tensorboardX import SummaryWriter
 
@@ -32,6 +31,7 @@ from utils.checkpoint import (
     source_equivalent_epoch,
 )
 from utils.recipe import get_ibot_recipe
+from utils.wandb_logging import configure_wandb, init_wandb_run
 
 
 def parse_args():
@@ -45,6 +45,7 @@ def load_config(path):
         user_config = yaml.safe_load(handle)
 
     config = {**get_ibot_recipe(user_config["arch"]), **user_config}
+    configure_wandb(config)
     if config["centering"] not in ("centering", "sinkhorn_knopp"):
         raise ValueError("centering must be one of: centering, sinkhorn_knopp")
     # Saved with args: version 2 restricts SK to the overlap branch.
@@ -117,12 +118,6 @@ def assign_run_output_directory(args):
     args.output_root = str(output_root)
     args.run_id = run_id
     args.output_dir = str(output_root / run_id)
-    args.wandb_run_id = os.environ.get("WANDB_RUN_ID") or None
-    args.wandb_resume = os.environ.get("WANDB_RESUME") or None
-    if args.wandb_resume and not args.wandb_run_id:
-        raise ValueError("WANDB_RESUME requires WANDB_RUN_ID")
-    if args.wandb_run_id and not args.wandb_resume:
-        args.wandb_resume = "must"
 
 
 def init_wandb(args):
@@ -130,16 +125,7 @@ def init_wandb(args):
         key: str(value) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
-    return wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=args.wandb_run_name,
-        dir=args.output_dir,
-        config=config,
-        job_type="pretraining-continuation",
-        id=args.wandb_run_id,
-        resume=args.wandb_resume,
-    )
+    return init_wandb_run(args, config, "pretraining-continuation")
 
 
 def train_ibot(args, wandb_run=None):

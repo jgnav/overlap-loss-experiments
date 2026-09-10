@@ -1,0 +1,42 @@
+# Paths are relative to this YAML file; absolute paths and ~ also work.
+checkpoint: output/region_loss/20260903T181757Z-slurm-1309714/checkpoint_source1000_continuation0200.pth
+checkpoint_key: teacher  # teacher or student
+arch: auto              # auto, vit_small, vit_base, vit_large
+datasets_root: dataset
+classification_manifests: null  # null = datasets_root/evaluation_manifests
+
+# null creates a unique run directory under output/evaluation.
+# Set an existing run directory to resume its compatible completed evaluations.
+output_dir: null
+result_json: null  # null = output_dir/full_evaluation.json
+
+seed: 0
+num_workers: 8
+segmentation_batch_size: 128  # Feature extraction only; probe recipes stay fixed.
+
+# Weights & Biases: online reads .wandb_key at the repository root.
+wandb_mode: online  # online, offline, or disabled
+wandb_project: ibot-evaluation
+wandb_entity: null
+wandb_run_name: null
+wandb_run_id: null
+wandb_resume: null  # null, allow, must, never; requires wandb_run_id when set
+
+# Set each evaluation to true or false. Omitted entries are disabled.
+# ImageNet k-NN percentages refer to training banks; all use full validation.
+evaluations:
+  pascal_voc_knn: true
+  pascal_voc_linear: true
+  ade20k_knn: true
+  ade20k_linear: true
+  cityscapes_knn: true
+  cityscapes_linear: true
+  imagenet_knn_1pct: true
+  imagenet_knn: true         # 10%
+  imagenet_knn_100pct: true
+  imagenet_linear: true     # 100% training data
+  pascal_voc_1shot: true
+  pascal_voc_2shot: true
+  pascal_voc_5shot: true
+  pascal_voc_multilabel: true
+  coco_multilabel: true

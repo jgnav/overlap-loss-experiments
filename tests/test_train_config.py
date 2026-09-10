@@ -11,6 +11,19 @@ from utils import training as utils
 
 
 class ContinuationConfigTest(unittest.TestCase):
+    def test_wandb_settings_come_from_yaml_instead_of_slurm_environment(self):
+        path = Path(__file__).parents[1] / 'train.yaml'
+        values = yaml.safe_load(path.read_text())
+        values.update(wandb_mode='offline', wandb_run_id='yaml-id', wandb_resume='allow')
+        with mock.patch.dict('os.environ', {'WANDB_MODE': 'online', 'WANDB_RUN_ID': 'env-id', 'WANDB_RESUME': 'must'}):
+            with mock.patch.object(Path, 'open', mock.mock_open(read_data=yaml.safe_dump(values))):
+                args = load_config(path)
+            from train import assign_run_output_directory
+            assign_run_output_directory(args)
+        self.assertEqual(args.wandb_mode, 'offline')
+        self.assertEqual(args.wandb_run_id, 'yaml-id')
+        self.assertEqual(args.wandb_resume, 'allow')
+
     def test_production_config_is_bf16_200_epochs_without_lr_warmup(self):
         config = load_config(Path(__file__).parents[1] / "train.yaml")
 

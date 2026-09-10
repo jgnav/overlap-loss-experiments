@@ -151,12 +151,15 @@ activemq-data/
 
 # Environments
 .env
+.wandb_key
 .envrc
 .venv
 env/
 venv/
 ENV/
 env.bak/
+.agents/
+.codex/
 venv.bak/
 
 # Spyder project settings
@@ -223,4 +226,3 @@ __marimo__/
 output/
 checkpoints/
 dataset/
-slurm/

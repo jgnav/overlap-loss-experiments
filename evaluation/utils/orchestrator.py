@@ -1,17 +1,9 @@
-import argparse
+"""Evaluation registry, reporting, resume checks and input preflight helpers."""
+
 import json
 import re
-import subprocess
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from evaluation.utils.common import (
-    ARCHITECTURES,
-    REPO_ROOT,
     checkpoint_fingerprint,
     classification_manifest_root,
     evaluation_identity,
@@ -38,44 +30,6 @@ EVALUATIONS = (
     ("coco_multilabel", "evaluation.utils.coco_multilabel", None),
 )
 
-
-def _parser():
-    parser = argparse.ArgumentParser(
-        description="Run segmentation and classification evaluations for one checkpoint"
-    )
-    parser.add_argument("checkpoint", type=Path)
-    parser.add_argument(
-        "--checkpoint-key", default="teacher", choices=("teacher", "student")
-    )
-    parser.add_argument(
-        "--arch", default="auto", choices=("auto", *ARCHITECTURES)
-    )
-    parser.add_argument(
-        "--datasets-root", type=Path, default=REPO_ROOT / "dataset"
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Run directory; defaults to a unique directory in output/evaluation",
-    )
-    parser.add_argument(
-        "--result-json",
-        type=Path,
-        default=None,
-        help="Final table path; defaults to <output-dir>/full_evaluation.json",
-    )
-    parser.add_argument("--num-workers", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--classification-manifests", type=Path, default=None,
-        help="Multilabel split/label JSON directory; defaults to <datasets-root>/evaluation_manifests",
-    )
-    parser.add_argument(
-        "--evaluations", nargs="+", choices=[name for name, _, _ in EVALUATIONS],
-        default=None, help="Run selected evaluations (default: all fifteen)",
-    )
-    return parser
 
 
 def _safe_name(value):
@@ -129,6 +83,8 @@ def _write_summary(path, args, started_at, status, results, error=None):
         "architecture": args.arch,
         "model": model,
         "datasets_root": str(args.datasets_root),
+        "config_path": str(args.config_path) if getattr(args, "config_path", None) else None,
+        "selected_evaluations": getattr(args, "evaluations", None),
         "evaluation_identity": evaluation_identity(args),
         "started_at": started_at,
         "updated_at": updated_at,
@@ -183,127 +139,3 @@ def _preflight_classification(args, evaluations):
             )
             if shot_counts:
                 sample_few_shot_indices([row[1] for row in samples["train"]], max(shot_counts), args.seed)
-
-
-def main(argv=None):
-    args = _parser().parse_args(argv)
-    args.checkpoint = args.checkpoint.expanduser().resolve()
-    args.datasets_root = args.datasets_root.expanduser().resolve()
-    if not args.checkpoint.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
-    if not args.datasets_root.is_dir():
-        raise FileNotFoundError(f"Datasets directory not found: {args.datasets_root}")
-    evaluations = [item for item in EVALUATIONS if args.evaluations is None or item[0] in args.evaluations]
-    _preflight_classification(args, evaluations)
-    if args.output_dir is None:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        args.output_dir = (
-            REPO_ROOT
-            / "output"
-            / "evaluation"
-            / f"{_safe_name(args.checkpoint.stem)}-{timestamp}"
-        )
-    else:
-        args.output_dir = args.output_dir.expanduser().resolve()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    if args.result_json is None:
-        args.result_json = args.output_dir / "full_evaluation.json"
-    else:
-        args.result_json = args.result_json.expanduser().resolve()
-    started_at = utc_now()
-    results = {}
-    _write_summary(
-        args.result_json, args, started_at, "running", results
-    )
-
-    print(f"Starting {len(evaluations)} evaluations", flush=True)
-    for evaluation_index, (name, module, cache_name) in enumerate(
-        evaluations, start=1
-    ):
-        result_path = args.output_dir / f"{name}.json"
-        completed_result = _load_completed_result(result_path, args, name)
-        if completed_result is not None:
-            results[name] = completed_result
-            _write_summary(
-                args.result_json, args, started_at, "running", results
-            )
-            print(
-                f"[{evaluation_index}/{len(evaluations)}] "
-                f"Reusing completed {name}",
-                flush=True,
-            )
-            continue
-        print(
-            f"\n[{evaluation_index}/{len(evaluations)}] Starting {name}",
-            flush=True,
-        )
-        command = [
-            sys.executable,
-            "-m",
-            module,
-            str(args.checkpoint),
-            "--checkpoint-key",
-            args.checkpoint_key,
-            "--arch",
-            args.arch,
-            "--datasets-root",
-            str(args.datasets_root),
-            "--output-dir",
-            str(args.output_dir),
-            "--result-json",
-            str(result_path),
-            "--num-workers",
-            str(args.num_workers),
-            "--seed",
-            str(args.seed),
-            "--classification-manifests",
-            str(classification_manifest_root(args)),
-        ]
-        if cache_name is not None:
-            cache_path = args.output_dir / "feature_cache" / f"{cache_name}.pth"
-            command.extend(("--feature-cache", str(cache_path)))
-        completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
-        if completed.returncode != 0:
-            error = f"{name} exited with status {completed.returncode}"
-            _write_summary(
-                args.result_json,
-                args,
-                started_at,
-                "failed",
-                results,
-                error=error,
-            )
-            print(f"Full evaluation stopped: {error}", flush=True)
-            return completed.returncode
-        try:
-            with result_path.open("r", encoding="utf-8") as handle:
-                results[name] = json.load(handle)
-        except (OSError, json.JSONDecodeError) as error_object:
-            error = f"{name} did not produce a valid result JSON: {error_object}"
-            _write_summary(
-                args.result_json,
-                args,
-                started_at,
-                "failed",
-                results,
-                error=error,
-            )
-            print(f"Full evaluation stopped: {error}", flush=True)
-            return 1
-        _write_summary(
-            args.result_json, args, started_at, "running", results
-        )
-        print(f"Completed {name}", flush=True)
-
-    _write_summary(
-        args.result_json, args, started_at, "completed", results
-    )
-    print(
-        f"Full evaluation completed. Result table: {args.result_json}",
-        flush=True,
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

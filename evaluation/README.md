@@ -269,33 +269,78 @@ Use Python 3.10/3.11 and the repository's CUDA requirements in production
 (PyTorch 2.3's torch.compile does not support Python 3.12). All
 classification probes require four visible GPUs; dense probes require one.
 
-```bash
-python evaluation/full-evaluation /path/to/checkpoint.pth \
-  --datasets-root /path/to/datasets
-```
-
-The full command runs fifteen evaluations and preflights the two multilabel
-manifests before expensive work begins. Select tasks without adding alternative
-protocols:
+The main entrypoint is [`evaluation.py`](../evaluation.py); edit
+[`evaluation.yaml`](../evaluation.yaml) to choose the checkpoint, checkpoint
+key, architecture, dataset/manifest paths, output paths, seed, worker count,
+segmentation extraction batch size, and individual evaluations. Numerical
+probe recipes remain the fixed protocols described above.
 
 ```bash
-python evaluation/full-evaluation /path/to/checkpoint.pth \
-  --datasets-root /path/to/datasets \
-  --evaluations imagenet_linear pascal_voc_multilabel coco_multilabel
-
-python evaluation/full-evaluation /path/to/checkpoint.pth \
-  --datasets-root /path/to/datasets --seed 0 \
-  --evaluations imagenet_knn_1pct imagenet_knn imagenet_knn_100pct \
-    pascal_voc_1shot pascal_voc_2shot pascal_voc_5shot
-
-python -m evaluation.utils.imagenet_linear /path/to/checkpoint.pth \
-  --datasets-root /path/to/datasets
+python evaluation.py                    # Uses evaluation.yaml beside the script
+python evaluation.py /path/to/run.yaml  # Uses another configuration
+sbatch slurm/slurm_evaluation.sh        # Same evaluation.yaml on Slurm
+sbatch slurm/slurm_evaluation.sh /path/to/run.yaml
 ```
+
+The Slurm script contains scheduler resources and environment setup; it passes
+the YAML filename to Python. It no longer chooses the checkpoint, dataset,
+output directory, workers, or evaluation list. Request enough GPUs in Slurm for
+the enabled tasks (four for classification, one for segmentation).
+CUDA library paths for cuML are discovered from the active Python environment
+by the evaluator, so the Slurm launcher follows the training launcher's layout.
+
+### Weights & Biases
+
+Set `wandb_mode`, `wandb_project`, `wandb_entity`, `wandb_run_name`,
+`wandb_run_id`, and `wandb_resume` in `evaluation.yaml`. The corresponding
+training settings live in `train.yaml` (or `train_iptc.yaml`). Slurm contains no
+W&B settings. `wandb_mode` accepts `online`, `offline`, or `disabled`.
+
+Both training and evaluation read online authentication from `.wandb_key` at
+the repository root, regardless of the YAML location. The file contains only
+the API key; it is Git-ignored and is never included in YAML snapshots,
+checkpoint arguments, or W&B run configuration. Offline/disabled modes do not
+require a key. On another machine, place the key in the same root file.
+
+Evaluation logs each task's scalar metrics under its own name, including
+reused results, and records completion/failure in W&B. Training retains its
+existing metric logging. To resume a W&B run, set `wandb_run_id` and
+`wandb_resume: must` or `allow` in the YAML; specifying an ID alone defaults to
+`must`. Resuming W&B does not itself resume model training or select a saved
+evaluation directory; configure those paths separately.
+
+### Selecting tasks and resuming evaluation
+
+Each entry under `evaluations` is a YAML boolean. The supplied config enables
+all fifteen tasks. Set unwanted tasks to `false`; omitted tasks are also
+disabled. For example, replace that section with the following to run only
+ImageNet 10% k-NN and VOC 1-shot classification:
+
+```yaml
+evaluations:
+  imagenet_knn: true
+  pascal_voc_1shot: true
+```
+
+Unknown keys/evaluations, duplicate keys, non-boolean switches and an empty
+selection fail before launching workers. Only enabled multilabel tasks require
+their manifests. Tasks run sequentially in the registry's fixed order.
+
+Relative paths resolve against the YAML file's directory, independently of the
+working directory. Absolute paths and `~` are supported. `output_dir: null`
+creates a unique directory under the repository's `output/evaluation`;
+`result_json: null` writes `full_evaluation.json` inside it. Each run saves
+`evaluation_config.yaml` with resolved paths and all enabled/disabled switches.
+The old `evaluation/full-evaluation` launcher has been replaced by `evaluation.py`.
+Per-task modules in `evaluation/utils` are internal worker entrypoints.
 
 The final JSON table distinguishes semantic segmentation, multiclass
 classification and multilabel classification. Use `map_percent` for mAP on a
-0-100 scale. Per-class AP is also retained. To resume, pass the same `--output-dir`;
-the probe checkpoint is accepted only if the model, data and recipe match.
+0-100 scale. Per-class AP is also retained. To resume, set `output_dir` to the
+existing run directory, or run `python evaluation.py /path/to/run/evaluation_config.yaml`.
+Completed results and probe checkpoints are accepted only if the model, data
+and recipe match. Changing the selection alone preserves reusable results for
+tasks that remain enabled.
 
 ## Sources
 
