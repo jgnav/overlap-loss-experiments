@@ -13,6 +13,25 @@ from model.vision_transformer import VisionTransformer
 
 
 class CAPIIntegrationTest(unittest.TestCase):
+    def test_distributed_parameter_ties_preserve_single_rank_grid_order(self):
+        classifier = capi.Classifier()
+        classifier.hparam_grids = {'choice': (0, 1, 2)}
+        classifier.ignore_labels = ()
+        classifier.fit = mock.Mock()
+        classifier.unfit = mock.Mock()
+        classifier.predict = mock.Mock(return_value=torch.zeros(1))
+
+        def gather(destination, value):
+            destination[:] = [{0: 0.5, 2: 0.8}, {1: 0.8}]
+
+        with mock.patch.object(torch.distributed, 'get_rank', return_value=0), \
+             mock.patch.object(torch.distributed, 'get_world_size', return_value=2), \
+             mock.patch.object(torch.distributed, 'barrier'), \
+             mock.patch.object(torch.distributed, 'all_gather_object', side_effect=gather), \
+             mock.patch.dict(capi.metrics_dict, {'mIoU': lambda *a: 0.8}):
+            classifier.select_hparams(*(torch.zeros(1) for _ in range(4)))
+        self.assertEqual(classifier.choice, 1)
+
     def test_patch_sizes_preserve_256_tokens_and_pixel_alignment(self):
         for ps in (14, 16):
             with self.subTest(patch_size=ps):

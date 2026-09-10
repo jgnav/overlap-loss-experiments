@@ -286,30 +286,26 @@ def load_backbone(checkpoint_path, checkpoint_key="teacher", arch="auto"):
     return model, metadata
 
 
-def launch_distributed_if_needed(module, required_world_size):
+def launch_distributed_if_needed(module):
+    """Use all visible CUDA devices; honor an existing torchrun launch."""
+    available = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if available == 0:
+        raise RuntimeError("Evaluation requires at least one visible NVIDIA GPU")
     current_world_size = int(os.environ.get("WORLD_SIZE", "1"))
     launched = "RANK" in os.environ or "LOCAL_RANK" in os.environ
     if launched:
-        if current_world_size != required_world_size:
-            raise RuntimeError(
-                f"This CRISP protocol requires {required_world_size} GPUs, but "
-                f"torchrun launched {current_world_size} processes"
-            )
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if current_world_size < 1 or not 0 <= local_rank < available:
+            raise RuntimeError("torchrun rank configuration does not match the visible GPUs")
         return
-    if required_world_size == 1:
-        return
-    if not torch.cuda.is_available() or torch.cuda.device_count() < required_world_size:
-        raise RuntimeError(
-            f"This CRISP protocol requires {required_world_size} visible GPUs; "
-            f"PyTorch reports {torch.cuda.device_count()}"
-        )
+    print(f"Launching evaluation on {available} visible GPU(s)", flush=True)
     command = [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--standalone",
         "--nproc_per_node",
-        str(required_world_size),
+        str(available),
         "--module",
         module,
         *sys.argv[1:],
@@ -321,7 +317,7 @@ def launch_distributed_if_needed(module, required_world_size):
 
 def initialize_distributed(seed=0, allow_tf32=False):
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size > 1:
+    if "RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
         dist.init_process_group(

@@ -129,7 +129,8 @@ class Classifier:
             gathered_results = [{} for _ in range(torch.distributed.get_world_size())]
             torch.distributed.all_gather_object(gathered_results, rank_results)
             all_results = reduce(lambda x, y: {**x, **y}, gathered_results)
-            best_hparam_idx, best_score = max(all_results.items(), key=lambda x: x[1])
+            # Preserve the single-rank grid order when scores tie across ranks.
+            best_hparam_idx, best_score = max(all_results.items(), key=lambda x: (x[1], -x[0]))
             best_hparam_set = hparam_grid[best_hparam_idx]
             # log a bit
             for idx, score in all_results.items():
@@ -468,5 +469,4 @@ def eval_model(
     logger.info("Results:\n" + "\n".join([f"{k}: {results_dict[k]:.4g}" for k in sorted(results_dict.keys())]))
     torch.distributed.barrier()
     return results_dict
-
 

@@ -11,11 +11,16 @@ selection, and `eval_model`. Local integration changes are limited to:
 - Postpone type annotations and omit annotation-only jaxtyping imports.
 - Import cuML inside the logistic-regression fit rather than at module import.
 - Omit upstream's OmegaConf CLI (`main`); retain our existing CLI/JSON output.
+- Break equal-score parameter ties by original grid index, preserving the
+  single-rank choice when the search is distributed across ranks.
 
 The classifier calculations and evaluation flow are unchanged. The adapter
 supplies pre-downloaded datasets (VOC `train`, not `trainaug`), final normalized
 backbone patch tokens, row-major patch pixel labels, and plain progress prints.
-Only one GPU is supported by this adapter. CAPI still performs its own NumPy
+The adapter shards extraction across all visible GPUs and restores original
+image order on every rank using bounded tensor transfers. CAPI distributes
+parameter candidates across ranks; its final refit/scoring remains on rank 0.
+CAPI still performs its own NumPy
 10% holdout, feature standardization, sweep, refit, and final scoring.
 
 Resolution is passed explicitly as `16 * patch_size`: 224 for patch size 14,

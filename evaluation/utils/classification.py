@@ -26,8 +26,9 @@ from evaluation.utils.common import (
 from evaluation.utils.imagenet import IMAGENET_NORMALIZE, _resolve_imagenet_root
 
 
-GPU_COUNT = 4
+REFERENCE_GPU_COUNT = 4
 BATCH_SIZE_PER_GPU = 256
+GLOBAL_BATCH_SIZE = REFERENCE_GPU_COUNT * BATCH_SIZE_PER_GPU
 LEARNING_RATE = 0.001
 
 
@@ -129,13 +130,16 @@ def _make_datasets(args, dataset_name):
     return train, val, {"root": str(root), "classes": train.classes, "training_fraction": 1.0}
 
 
-def _protocol(dataset_name, architecture, checkpoint_key):
+def _protocol(dataset_name, architecture, checkpoint_key, world_size=REFERENCE_GPU_COUNT):
     n, average_patches = feature_spec(architecture)
     return {
         "source": "CRISP Appendix A.2; CG-SSL Table 2 task coverage",
         "equivalence": "Matches stated CRISP settings; unpublished choices remain unverified",
-        "input_resolution": 224, "gpu_count": GPU_COUNT,
-        "batch_size_per_gpu": BATCH_SIZE_PER_GPU,
+        "input_resolution": 224, "gpu_count": world_size,
+        "batch_size_per_gpu": max(1, GLOBAL_BATCH_SIZE // world_size),
+        "global_batch_size": max(1, GLOBAL_BATCH_SIZE // world_size) * world_size,
+        "reference_global_batch_size": GLOBAL_BATCH_SIZE,
+        "feature_microbatch_size": BATCH_SIZE_PER_GPU,
         "learning_rate": LEARNING_RATE,
         "learning_rate_scaled_by_batch_size": False,
         "epochs": MULTILABEL_DATASETS.get(dataset_name, {"epochs": 200})["epochs"],
@@ -164,7 +168,10 @@ def train_epoch(backbone, head, optimizer, loader, architecture, multilabel, dev
     total = torch.zeros(2, dtype=torch.float64, device=device)
     for step, (images, targets) in enumerate(loader, start=1):
         images, targets = images.to(device), targets.to(device)
-        features = classification_features(backbone, images, architecture)
+        features = torch.cat([
+            classification_features(backbone, chunk, architecture)
+            for chunk in images.split(BATCH_SIZE_PER_GPU)
+        ])
         loss = classification_loss(head(features), targets, multilabel)
         if not torch.isfinite(loss):
             raise RuntimeError(f"Non-finite probe loss at epoch {epoch + 1}, batch {step}")
@@ -238,7 +245,7 @@ def run_classification(args, dataset_name, evaluation_name, rank, world_size):
     backbone, metadata = load_backbone(args.checkpoint, args.checkpoint_key, args.arch)
     backbone.to(device).eval()
     architecture = metadata["architecture"]
-    protocol = _protocol(dataset_name, architecture, args.checkpoint_key)
+    protocol = _protocol(dataset_name, architecture, args.checkpoint_key, world_size)
     if shots is not None:
         protocol.update({
             "source": "CRISP Table 3 and Appendix A.2",
@@ -254,7 +261,7 @@ def run_classification(args, dataset_name, evaluation_name, rank, world_size):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     sampler = DistributedSampler(train, shuffle=True, seed=args.seed)
     loader = DataLoader(
-        train, sampler=sampler, batch_size=BATCH_SIZE_PER_GPU,
+        train, sampler=sampler, batch_size=protocol["batch_size_per_gpu"],
         num_workers=args.num_workers, pin_memory=True,
         # Per-epoch worker reseeding makes resumed augmentations reproducible.
         persistent_workers=False,
@@ -311,9 +318,9 @@ def classification_entrypoint(module, dataset_name, evaluation_name):
     shots = VOC_SHOT_EVALUATIONS.get(evaluation_name)
     regime = "Full-data" if shots is None else f"{shots}-shot"
     parser = base_parser(f"{regime} {dataset_name} frozen linear classification (CRISP A.2 settings)")
-    # Show help before requiring GPUs or starting four processes.
+    # Show help before requiring GPUs or starting workers.
     args = prepare_paths(parser.parse_args(), evaluation_name)
-    launch_distributed_if_needed(module, required_world_size=GPU_COUNT)
+    launch_distributed_if_needed(module)
     rank, world_size = initialize_distributed(args.seed, allow_tf32=False)
     try:
         run_classification(args, dataset_name, evaluation_name, rank, world_size)

@@ -13,6 +13,7 @@ from evaluation.utils.common import (
     base_parser,
     cleanup_distributed,
     initialize_distributed,
+    is_main_process,
     launch_distributed_if_needed,
     load_backbone,
     prepare_paths,
@@ -206,7 +207,7 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
     print(
         f"CAPI {CAPI_REVISION}: {dataset_name}, {spec['train_split']} -> "
         f"{spec['test_split']}, resolution={resolution}, patch_size={metadata['patch_size']}, "
-        "patch_tokens=256, one GPU", flush=True,
+        "patch_tokens=256, distributed feature extraction and probe search", flush=True,
     )
     # Upstream draws its holdout with NumPy's global RNG.
     np.random.seed(args.seed)
@@ -223,6 +224,9 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
         ignore_labels=spec["ignore_labels"],
         output_dir=str(args.output_dir),
     )
+    if not is_main_process():
+        return None
+    import torch.distributed as dist
     result = {
         "evaluation": evaluation_name, "dataset": spec["display_name"],
         "status": "completed", "started_at": started, "finished_at": utc_now(),
@@ -241,7 +245,7 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
             "standardization": "StandardScaler fitted on train only",
             "validation_split": "seeded 10% of training set",
             "num_classes": spec["num_classes"], "ignore_labels": list(spec["ignore_labels"]),
-            "gpu_count": 1,
+            "gpu_count": dist.get_world_size(),
             "published_score_equivalence": "Exact CRISP dataset lists and CAPI revision not established",
         },
         **_format_capi_result(raw, classifier_name),
@@ -257,7 +261,6 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
 
 
 def dense_entrypoint(module, dataset_name, classifier_name, evaluation_name):
-    launch_distributed_if_needed(module, required_world_size=1)
     parser = base_parser(
         f"CRISP {DATASET_SPECS[dataset_name]['display_name']} "
         f"{classifier_name} evaluation"
@@ -270,6 +273,7 @@ def dense_entrypoint(module, dataset_name, classifier_name, evaluation_name):
         help="Deprecated compatibility argument; pinned CAPI always extracts fresh features",
     )
     args = prepare_paths(parser.parse_args(), evaluation_name)
+    launch_distributed_if_needed(module)
     initialize_distributed(args.seed, allow_tf32=True)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     # CAPI's unchanged sweep uses distributed collectives even on one GPU.

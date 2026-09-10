@@ -12,6 +12,8 @@ result_json: null  # null = output_dir/full_evaluation.json
 
 seed: 0
 num_workers: 8
+# Evaluations automatically use all GPUs visible through CUDA_VISIBLE_DEVICES.
+# Slurm's GPU allocation controls how many devices are visible to the job.
 segmentation_batch_size: 128  # Feature extraction only; probe recipes stay fixed.
 
 # Weights & Biases: online reads .wandb_key at the repository root.

@@ -1,6 +1,6 @@
 """Local I/O adapters for the pinned CAPI segmentation evaluator.
 
-Single-GPU extraction uses the same final patch features and row-major pixel
+Distributed extraction uses the same final patch features and row-major pixel
 labels as CAPI's extract_features. No classifier or scoring logic lives here.
 """
 
@@ -34,14 +34,21 @@ class MetricLogger:
 
 def extract_features(model, dataset, batch_size, num_workers, *, gather_on_cpu=False):
     from evaluation.utils.dense import _extract_features
+    from evaluation.utils.distributed_features import gather_image_shards
     import torch.distributed as dist
+    from torch.utils.data import Subset
 
-    if dist.get_world_size() != 1 or not gather_on_cpu:
-        raise ValueError("Local CAPI extraction requires one GPU and CPU feature storage")
-    features, labels = _extract_features(
-        model, dataset, batch_size, num_workers, "CAPI segmentation features"
-    )
-    return (
-        features.reshape(len(dataset), 16, 16, -1),
-        labels.reshape(len(dataset), 16, 16, -1),
-    )
+    if not gather_on_cpu:
+        raise ValueError("CAPI extraction requires CPU feature storage")
+    rank, world_size = dist.get_rank(), dist.get_world_size()
+    shard = Subset(dataset, range(rank, len(dataset), world_size))
+    features = labels = None
+    if len(shard):
+        features, labels = _extract_features(
+            model, shard, batch_size, num_workers, f"CAPI features rank {rank}"
+        )
+        features = features.reshape(len(shard), 16, 16, -1)
+        labels = labels.reshape(len(shard), 16, 16, -1)
+    if world_size == 1:
+        return features, labels
+    return gather_image_shards(features, labels, len(dataset))

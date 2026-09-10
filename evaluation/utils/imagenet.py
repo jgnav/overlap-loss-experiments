@@ -27,7 +27,6 @@ IMAGENET_NORMALIZE = T.Normalize(
     mean=(0.485, 0.456, 0.406),
     std=(0.229, 0.224, 0.225),
 )
-GPU_COUNT = 4
 BATCH_SIZE_PER_GPU = 256
 IMAGENET_KNN_TRAINING_FRACTION = 0.10
 IMAGENET_KNN_FRACTIONS = {
@@ -156,19 +155,19 @@ def _extract_distributed_features(model, dataset, args, description):
         dist.all_gather(gathered_features, batch_features)
         dist.all_gather(gathered_labels, batch_labels)
         dist.all_gather(gathered_indices, indices)
+        all_features = torch.cat(gathered_features)
+        all_labels = torch.cat(gathered_labels)
+        all_indices = torch.cat(gathered_indices)
+        if features is None:
+            features = torch.empty(
+                len(dataset), all_features.shape[-1], device="cuda"
+            )
+            labels = torch.empty(
+                len(dataset), dtype=all_labels.dtype, device="cuda"
+            )
+        features.index_copy_(0, all_indices, all_features)
+        labels.index_copy_(0, all_indices, all_labels)
         if is_main_process():
-            all_features = torch.cat(gathered_features)
-            all_labels = torch.cat(gathered_labels)
-            all_indices = torch.cat(gathered_indices)
-            if features is None:
-                features = torch.empty(
-                    len(dataset), all_features.shape[-1], device="cuda"
-                )
-                labels = torch.empty(
-                    len(dataset), dtype=all_labels.dtype, device="cuda"
-                )
-            features.index_copy_(0, all_indices, all_features)
-            labels.index_copy_(0, all_indices, all_labels)
             print_progress(description, batch_index, len(loader))
     return features, labels
 
@@ -183,13 +182,17 @@ def _weighted_knn(
     temperature=0.07,
     num_classes=1000,
 ):
+    if dist.is_initialized():
+        rank, world_size = dist.get_rank(), dist.get_world_size()
+        test_features = test_features[rank::world_size]
+        test_labels = test_labels[rank::world_size]
     train_features = train_features.T
     top1 = 0.0
     top5 = 0.0
     total = 0
     images_per_chunk = max(1, test_labels.shape[0] // 100)
     ranges = range(0, test_labels.shape[0], images_per_chunk)
-    one_hot = torch.zeros(neighbors, num_classes, device="cuda")
+    one_hot = torch.zeros(neighbors, num_classes, device=test_features.device)
     description = f"ImageNet weighted k-NN k={neighbors}"
     total_chunks = len(ranges)
     print(f"{description}: starting {total_chunks} chunks", flush=True)
@@ -214,6 +217,12 @@ def _weighted_knn(
         top5 += correct[:, :5].sum().item()
         total += target.shape[0]
         print_progress(description, chunk_index, total_chunks)
+    if dist.is_initialized():
+        counts = torch.tensor([top1, top5, total], dtype=torch.float64, device=test_features.device)
+        dist.all_reduce(counts)
+        top1, top5, total = counts.tolist()
+    if total == 0:
+        raise ValueError("ImageNet validation set is empty")
     return {
         "top1": 100.0 * top1 / total,
         "top5": 100.0 * top5 / total,
@@ -254,19 +263,19 @@ def run_imagenet_knn(args, evaluation_name="imagenet_knn"):
     test_features, test_labels = _extract_distributed_features(
         model, val_dataset, args, "ImageNet val features"
     )
+    train_features = nn.functional.normalize(train_features, dim=1, p=2)
+    test_features = nn.functional.normalize(test_features, dim=1, p=2)
+    evaluations = {}
+    for neighbors in (10, 20, 100, 200):
+        evaluations[str(neighbors)] = _weighted_knn(
+            train_features,
+            train_labels,
+            test_features,
+            test_labels,
+            neighbors,
+        )
     result = None
     if is_main_process():
-        train_features = nn.functional.normalize(train_features, dim=1, p=2)
-        test_features = nn.functional.normalize(test_features, dim=1, p=2)
-        evaluations = {}
-        for neighbors in (10, 20, 100, 200):
-            evaluations[str(neighbors)] = _weighted_knn(
-                train_features,
-                train_labels,
-                test_features,
-                test_labels,
-                neighbors,
-            )
         result = {
             "evaluation": evaluation_name,
             "dataset": f"ImageNet-1K {percent}%",
@@ -298,7 +307,7 @@ def run_imagenet_knn(args, evaluation_name="imagenet_knn"):
                 "temperature": 0.07,
                 "neighbors": [10, 20, 100, 200],
                 "primary_neighbors": 20,
-                "gpu_count": GPU_COUNT,
+                "gpu_count": dist.get_world_size() if dist.is_initialized() else 1,
                 "batch_size_per_gpu": BATCH_SIZE_PER_GPU,
             },
             "metrics": evaluations["20"],
@@ -321,7 +330,7 @@ def imagenet_entrypoint(module, mode, evaluation_name="imagenet_knn"):
     percent = round(100 * IMAGENET_KNN_FRACTIONS[evaluation_name])
     parser = base_parser(f"CRISP ImageNet-1K {percent}% k-NN evaluation")
     args = prepare_paths(parser.parse_args(), evaluation_name)
-    launch_distributed_if_needed(module, required_world_size=GPU_COUNT)
+    launch_distributed_if_needed(module)
     initialize_distributed(args.seed, allow_tf32=False)
     try:
         return run_imagenet_knn(args, evaluation_name)

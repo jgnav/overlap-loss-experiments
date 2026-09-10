@@ -10,6 +10,7 @@ Segmentation calls the vendored official CAPI evaluator, pinned to revision
 `98b4fa17ee8eec8810c17022df9a27a44845368b`. Its classifiers, hyperparameter
 selection, refitting and scoring are copied from upstream; local adapters
 handle dataset paths, final normalized patch features, logging and JSON output.
+Equal-scoring parameter choices retain the original grid order across GPU counts.
 See [vendor provenance and integration changes](vendor/capi/README.md).
 
 **CRISP's 256-patch-token convention** is applied dynamically: the checkpoint's
@@ -87,7 +88,8 @@ Full-data linear probes use the following fixed settings:
 | `coco_multilabel` | Explicit COCO classification train split, 80 classes | 200 | mAP |
 
 CRISP A.2 specifies 224 x 224 inputs, four GPUs, batch size 256 per GPU, learning
-rate 0.001, and these epoch counts. The frozen backbone remains in evaluation
+rate 0.001, and these epoch counts. Automatic GPU scaling targets the same total
+training batch of 1,024 images; see the GPU behavior below. The frozen backbone remains in evaluation
 mode; only a linear layer is trained. The existing `imagenet_knn` remains the
 10% reference-bank evaluation used in CRISP's ablations. The additional
 `imagenet_knn_1pct` and `imagenet_knn_100pct` evaluations complete CRISP Table 4's
@@ -115,8 +117,7 @@ counts, so 1-shot selections are contained in 2-shot, then 5-shot selections.
 Result JSON and `protocol.json` retain selected indices/images, per-class draws,
 actual positive counts, and a subset hash. CRISP does not specify the seed,
 overlap handling, or nesting: these are explicit reproducible implementation
-choices, not verified author splits. The batch size remains a maximum of 256
-images per GPU; low-shot datasets produce smaller batches with the existing
+choices, not verified author splits. Low-shot datasets produce smaller batches with the existing
 distributed sampler. Use the same manifest and `--seed` for all models.
 
 Every regime has its own result row and probe-checkpoint directory. ImageNet
@@ -266,8 +267,32 @@ does not claim that a newly invented split reproduces either paper.
 ## Running
 
 Use Python 3.10/3.11 and the repository's CUDA requirements in production
-(PyTorch 2.3's torch.compile does not support Python 3.12). All
-classification probes require four visible GPUs; dense probes require one.
+(PyTorch 2.3's torch.compile does not support Python 3.12). Every evaluator
+automatically launches one worker per visible NVIDIA GPU, including a proper
+distributed process group on a single GPU. No GPU-count setting is required.
+An explicit existing `torchrun` launch is respected. Zero GPUs fails clearly.
+
+- Linear classification uses `max(1, floor(1024 / GPU count))` images per GPU
+  per training step. This preserves a total batch of 1,024 for 1/2/4/8 GPUs;
+  other counts use the nearest lower multiple (3 GPUs: 1,023). Frozen backbone
+  forwards use chunks of at most 256 images to limit activation memory. The
+  learning rate stays 0.001. Results record actual GPU/batch counts. Smaller
+  datasets/final batches remain smaller. Changing GPU count can change
+  stochastic augmentation and sampling, so it does not promise identical scores.
+- ImageNet k-NN distributes both feature extraction and validation queries.
+  Each GPU holds the training bank; global top-1/top-5 count every validation
+  image once.
+- Segmentation distributes image extraction and CAPI's parameter sweep.
+  Ordered features are replicated on CPU for the sweep using bounded tensor
+  transfers. CAPI's final refit/scoring remains on rank 0, which alone writes
+  the result JSON. Host memory requirements grow with worker count. The fixed
+  eight-candidate search can use at most eight GPUs concurrently; extraction
+  can use more. This is a requested hardware adaptation of CRISP's one-GPU
+  segmentation setting.
+
+To restrict device use, set `CUDA_VISIBLE_DEVICES` before launching. When
+resuming an unfinished linear probe, keep the same GPU count: its saved
+protocol includes GPU/batch settings. Completed compatible scores remain reusable.
 
 The main entrypoint is [`evaluation.py`](../evaluation.py); edit
 [`evaluation.yaml`](../evaluation.yaml) to choose the checkpoint, checkpoint
@@ -284,8 +309,9 @@ sbatch slurm/slurm_evaluation.sh /path/to/run.yaml
 
 The Slurm script contains scheduler resources and environment setup; it passes
 the YAML filename to Python. It no longer chooses the checkpoint, dataset,
-output directory, workers, or evaluation list. Request enough GPUs in Slurm for
-the enabled tasks (four for classification, one for segmentation).
+output directory, workers, or evaluation list. Slurm determines the allocated
+GPUs: request one, eight, or another count using its `--gres` option. Python uses
+the devices visible inside that allocation; it cannot acquire unallocated GPUs.
 CUDA library paths for cuML are discovered from the active Python environment
 by the evaluator, so the Slurm launcher follows the training launcher's layout.
 
