@@ -1,13 +1,14 @@
 # Paths are relative to this YAML file; absolute paths and ~ also work.
-checkpoint: /home/jovyan/overlap-loss-experiments/checkpoints/checkpoint_source0850_continuation0050.pth
+checkpoint: output/train/20260908T111307Z-slurm-1311903/checkpoint.pth
 checkpoint_key: teacher  # teacher or student
 arch: auto              # auto, vit_small, vit_base, vit_large
-datasets_root: /home/jovyan/datasets
+datasets_root: dataset
 classification_manifests: null  # null = datasets_root/evaluation_manifests
 
-# null creates a unique run directory under output/evaluation.
+# null creates output/evaluation/<checkpoint-name>-<timestamp>/ for each launch.
+# Keep null for independent evaluations to avoid overwriting another run.
 # Set an existing run directory to resume its compatible completed evaluations.
-output_dir: /home/jovyan/overlap-loss-experiments/output/evaluation/checkpoint_source0850_continuation0050-20260910T204431374741Z
+output_dir: null
 result_json: null  # null = output_dir/full_evaluation.json
 
 seed: 0
@@ -33,12 +34,13 @@ evaluations:
   ade20k_linear: true
   cityscapes_knn: true
   cityscapes_linear: true
+  imagenet_knn: true
+
   imagenet_knn_1pct: false
-  imagenet_knn: true         # 10%
   imagenet_knn_100pct: false
-  imagenet_linear: true     # 100% training data
-  pascal_voc_1shot: true
-  pascal_voc_2shot: true
-  pascal_voc_5shot: true
-  pascal_voc_multilabel: true
-  coco_multilabel: true
+  imagenet_linear: false
+  pascal_voc_1shot: false
+  pascal_voc_2shot: false
+  pascal_voc_5shot: false
+  pascal_voc_multilabel: false
+  coco_multilabel: false
