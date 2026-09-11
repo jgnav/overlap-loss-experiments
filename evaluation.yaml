@@ -1,13 +1,13 @@
 # Paths are relative to this YAML file; absolute paths and ~ also work.
-checkpoint: output/train/20260908T111307Z-slurm-1311903/checkpoint_source0850_continuation0050.pth
+checkpoint: /home/jovyan/overlap-loss-experiments/checkpoints/checkpoint_source0850_continuation0050.pth
 checkpoint_key: teacher  # teacher or student
 arch: auto              # auto, vit_small, vit_base, vit_large
-datasets_root: dataset
+datasets_root: /home/jovyan/datasets
 classification_manifests: null  # null = datasets_root/evaluation_manifests
 
 # null creates a unique run directory under output/evaluation.
 # Set an existing run directory to resume its compatible completed evaluations.
-output_dir: null
+output_dir: /home/jovyan/overlap-loss-experiments/output/evaluation/checkpoint_source0850_continuation0050-20260910T204431374741Z
 result_json: null  # null = output_dir/full_evaluation.json
 
 seed: 0
@@ -17,7 +17,7 @@ num_workers: 8
 segmentation_batch_size: 128  # Feature extraction only; probe recipes stay fixed.
 
 # Weights & Biases: online reads .wandb_key at the repository root.
-wandb_mode: online  # online, offline, or disabled
+wandb_mode: offline  # online, offline, or disabled
 wandb_project: ibot-evaluation
 wandb_entity: null
 wandb_run_name: null
