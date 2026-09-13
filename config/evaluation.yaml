@@ -1,5 +1,5 @@
 # Paths are relative to this YAML file; absolute paths and ~ also work.
-checkpoint: output/train/20260908T111307Z-slurm-1311903/checkpoint.pth
+checkpoint: output/train/20260909T184813Z-slurm-1312600/checkpoint.pth
 checkpoint_key: teacher  # teacher or student
 arch: auto              # auto, vit_small, vit_base, vit_large
 datasets_root: dataset
@@ -36,11 +36,11 @@ evaluations:
   cityscapes_linear: true
   imagenet_knn: true
 
-  imagenet_knn_1pct: false
-  imagenet_knn_100pct: false
-  imagenet_linear: false
-  pascal_voc_1shot: false
-  pascal_voc_2shot: false
-  pascal_voc_5shot: false
-  pascal_voc_multilabel: false
-  coco_multilabel: false
+  imagenet_knn_1pct: true
+  imagenet_knn_100pct: true
+  imagenet_linear: true
+  pascal_voc_1shot: true
+  pascal_voc_2shot: true
+  pascal_voc_5shot: true
+  pascal_voc_multilabel: true
+  coco_multilabel: true

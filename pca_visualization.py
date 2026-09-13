@@ -34,16 +34,16 @@ CHECKPOINTS = {
     "200 epoch control": (
         REPO_ROOT
         / "output"
-        / "region_loss"
-        / "20260903T181757Z-slurm-1309714"
-        / "checkpoint_source1000_continuation0200.pth"
+        / "train"
+        / "20260908T111307Z-slurm-1311903"
+        / "checkpoint_1311903_69.pth"
     ),
     "Overlap": (
         REPO_ROOT
         / "output"
-        / "region_loss"
-        / "20260904T062926Z-slurm-1309971"
-        / "checkpoint_source1000_continuation0200.pth"
+        / "train"
+        / "20260909T184813Z-slurm-1312600"
+        / "checkpoint_1312600_epoch74.pth"
     ),
 }
 
@@ -54,7 +54,7 @@ ARCH = "vit_small"
 # Alignment is per image, over corresponding patch positions in that image.
 PCA_REFERENCE_MODEL = "Official iBOT"
 
-N_IMAGES = 100
+N_IMAGES = 20
 SEED = 0
 
 # 560 is divisible by the ViT-S/16 patch size and gives a 35 x 35 dense grid.
