@@ -33,6 +33,7 @@ from utils.checkpoint import (
 from utils.recipe import get_ibot_recipe
 from utils.collapse_diagnostics import FeatureCollapseDiagnostics, prototype_geometry_metrics
 from utils.wandb_logging import configure_wandb, init_wandb_run
+from evaluation.online_probes import OnlineProbeRunner
 
 
 def parse_args():
@@ -54,6 +55,24 @@ def load_config(path):
     ):
         if type(config[name]) is not int or config[name] < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
+    if type(config["online_probes_enabled"]) is not bool:
+        raise ValueError("online_probes_enabled must be a boolean")
+    for name, minimum in (
+        ("online_probe_frequency", 1),
+        ("online_probe_imagenet_train_size", 1),
+        ("online_probe_imagenet_val_size", 1),
+        ("online_probe_voc_train_size", 1),
+        ("online_probe_voc_val_size", 1),
+        ("online_probe_k", 1),
+        ("online_probe_batch_size", 1),
+        ("online_probe_max_concurrent_jobs", 1),
+    ):
+        if type(config[name]) is not int or config[name] < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}")
+    if type(config["online_probe_num_workers"]) is not int or config["online_probe_num_workers"] < 0:
+        raise ValueError("online_probe_num_workers must be an integer >= 0")
+    if type(config["online_probe_wait_at_exit"]) is not bool:
+        raise ValueError("online_probe_wait_at_exit must be a boolean")
     if config["centering"] not in ("centering", "sinkhorn_knopp"):
         raise ValueError("centering must be one of: centering, sinkhorn_knopp")
     # Saved with args: version 2 restricts SK to the overlap branch.
@@ -100,6 +119,12 @@ def load_config(path):
     config["use_fp16"] = requested_precision == "fp16"
     for key in ("data_path", "initial_checkpoint", "output_dir"):
         config[key] = os.path.expandvars(os.path.expanduser(config[key]))
+    if config["online_probe_datasets_root"] is not None:
+        config["online_probe_datasets_root"] = os.path.expandvars(
+            os.path.expanduser(config["online_probe_datasets_root"])
+        )
+    elif config["online_probes_enabled"]:
+        raise ValueError("online_probe_datasets_root is required when probes are enabled")
     config["initial_checkpoint"] = Path(config["initial_checkpoint"])
     if config["resume_checkpoint"] is not None:
         config["resume_checkpoint"] = Path(
@@ -383,6 +408,12 @@ def train_ibot(args, wandb_run=None):
         "checkpoint does not store scheduler state or original args."
     )
 
+    output_checkpoint = Path(args.output_dir) / "checkpoint.pth"
+    probe_runner = (
+        OnlineProbeRunner(args)
+        if args.online_probes_enabled and utils.is_main_process()
+        else None
+    )
     start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
         data_epoch = source_equivalent_epoch(args.source_checkpoint_epoch, epoch)
@@ -405,6 +436,8 @@ def train_ibot(args, wandb_run=None):
             fp16_scaler,
             args,
         )
+        if probe_runner is not None:
+            train_stats.update(probe_runner.collect_completed())
         train_stats.update(prototype_geometry_metrics(
             student, teacher_without_ddp, args.diagnostic_prototype_chunk_size
         ))
@@ -431,6 +464,10 @@ def train_ibot(args, wandb_run=None):
         utils.save_on_master(
             save_dict, os.path.join(args.output_dir, "checkpoint.pth")
         )
+        if probe_runner is not None:
+            # The runner copies the completed checkpoint before spawning a worker;
+            # no probe ever reads the path that the next epoch may overwrite.
+            probe_runner.submit(completed_continuation_epoch, output_checkpoint)
         if (
             args.saveckp_freq
             and completed_continuation_epoch % args.saveckp_freq == 0
@@ -474,6 +511,9 @@ def train_ibot(args, wandb_run=None):
                     },
                     step=epoch + 1,
                 )
+
+    if probe_runner is not None:
+        probe_runner.close(wait=args.online_probe_wait_at_exit)
 
     if writer is not None:
         writer.close()

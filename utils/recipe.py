@@ -32,6 +32,21 @@ COMMON_IBOT_RECIPE = {
     "diagnostic_feature_batches": 1,
     "diagnostic_max_patch_features_per_batch": 4096,
     "diagnostic_prototype_chunk_size": 256,
+    # Fixed online representation probes are opt-in because they require the
+    # ImageNet and VOC datasets in addition to the pre-training data.
+    "online_probes_enabled": False,
+    "online_probe_frequency": 10,
+    "online_probe_datasets_root": "dataset",
+    "online_probe_imagenet_train_size": 10000,
+    "online_probe_imagenet_val_size": 5000,
+    "online_probe_voc_train_size": 400,
+    "online_probe_voc_val_size": 200,
+    "online_probe_k": 20,
+    "online_probe_batch_size": 256,
+    "online_probe_num_workers": 0,
+    "online_probe_max_concurrent_jobs": 2,
+    "online_probe_wait_at_exit": False,
+    "online_probe_gpu": None,
 }
 
 
