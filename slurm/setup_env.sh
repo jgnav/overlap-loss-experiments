@@ -1,21 +1,14 @@
 #!/bin/bash
+set -e
 
-#SBATCH --job-name=prepare_data
-#SBATCH --partition=2080ti,3090,a100,rtx8000,rtx5000
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=16G
-#SBATCH --time=1:00:00
+cd "$(dirname "$0")/.."
 
-#SBATCH --output=output/prepare_data_%j.out
-#SBATCH --error=output/prepare_data_%j.err
+rm -rf .conda-env
 
-cd "$SLURM_SUBMIT_DIR"
+conda create -y -p ./.conda-env python=3.11 pip
 
-source .venv/bin/activate
+./.conda-env/bin/python -m pip install --upgrade pip
+./.conda-env/bin/python -m pip install -r requirements.txt
 
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
-
-python3 prepare_data.py /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
+./.conda-env/bin/python --version
+./.conda-env/bin/python -c "import torch, torchvision; print(torch.__version__, torchvision.__version__)"
