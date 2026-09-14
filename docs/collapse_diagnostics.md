@@ -7,6 +7,13 @@ model forward computation, or checkpoint state. Settings live in the existing
 
 ## Prototype geometry
 
+The existing head topology is selectable in `config/train.yaml`. With
+`shared_head: true`, CLS and patch tokens use the same final prototype layer;
+with `shared_head: false`, they use separate CLS and patch prototype layers
+constructed by the same weight-normalized implementation. The single setting
+is applied to both the student and EMA teacher; the diagnostic reports a shared
+layer only once as the patch layer.
+
 Reference: [Why Prototypes Collapse, Definition 2.1](https://arxiv.org/html/2510.20108v2#S2).
 The official [proto-decoupling repository](https://github.com/dsb-ifi/proto-decoupling)
 was inspected at commit `d40f4f092640b1428c4e3adea53372ee0caee268` (2026-09-14),

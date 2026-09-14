@@ -53,6 +53,28 @@ class ContinuationConfigTest(unittest.TestCase):
                     config = load_config(path)
                 self.assertEqual(config.centering, mode or "centering")
 
+    def test_head_topology_is_selectable_from_yaml(self):
+        path = Path(__file__).parents[1] / "config" / "train.yaml"
+        values = yaml.safe_load(path.read_text())
+        for shared in (True, False):
+            with self.subTest(shared=shared):
+                configured = dict(values, shared_head=shared)
+                with mock.patch.object(
+                    Path, "open", mock.mock_open(read_data=yaml.safe_dump(configured))
+                ):
+                    config = load_config(path)
+                self.assertEqual(config.shared_head, shared)
+
+    def test_head_topology_must_be_boolean(self):
+        path = Path(__file__).parents[1] / "config" / "train.yaml"
+        values = yaml.safe_load(path.read_text())
+        values["shared_head"] = "false"
+        with mock.patch.object(
+            Path, "open", mock.mock_open(read_data=yaml.safe_dump(values))
+        ):
+            with self.assertRaisesRegex(ValueError, "shared_head must be a boolean"):
+                load_config(path)
+
     def test_invalid_teacher_normalization_fails_at_config_load(self):
         path = Path(__file__).parents[1] / "config" / "train.yaml"
         values = yaml.safe_load(path.read_text())

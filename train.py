@@ -73,6 +73,8 @@ def load_config(path):
         raise ValueError("online_probe_num_workers must be an integer >= 0")
     if type(config["online_probe_wait_at_exit"]) is not bool:
         raise ValueError("online_probe_wait_at_exit must be a boolean")
+    if type(config["shared_head"]) is not bool:
+        raise ValueError("shared_head must be a boolean")
     if config["centering"] not in ("centering", "sinkhorn_knopp"):
         raise ValueError("centering must be one of: centering, sinkhorn_knopp")
     # Saved with args: version 2 restricts SK to the overlap branch.
@@ -255,7 +257,7 @@ def train_ibot(args, wandb_run=None):
             patch_out_dim=args.patch_out_dim,
             norm=args.norm_in_head,
             act=args.act_in_head,
-            shared_head=args.shared_head_teacher,
+            shared_head=args.shared_head,
         ),
     )
     student, teacher = student.cuda(), teacher.cuda()
@@ -274,7 +276,7 @@ def train_ibot(args, wandb_run=None):
         parameter.requires_grad = False
     print(f"Student and Teacher are built: they are both {args.arch} network.")
 
-    same_dim = args.shared_head or args.shared_head_teacher
+    same_dim = args.shared_head
     ibot_loss = iBOTLoss(
         args.out_dim,
         args.out_dim if same_dim else args.patch_out_dim,

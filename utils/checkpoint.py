@@ -10,7 +10,6 @@ RESUME_COMPATIBILITY_KEYS = (
     "out_dim",
     "patch_out_dim",
     "shared_head",
-    "shared_head_teacher",
     "norm_in_head",
     "act_in_head",
     "norm_last_layer",

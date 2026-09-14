@@ -2,8 +2,8 @@ COMMON_IBOT_RECIPE = {
     "patch_size": 16,
     "out_dim": 8192,
     "patch_out_dim": 8192,
+    # Reuse the final prototype layer for CLS and patch tokens by default.
     "shared_head": True,
-    "shared_head_teacher": True,
     "norm_in_head": None,
     "act_in_head": "gelu",
     "use_masked_im_modeling": True,
