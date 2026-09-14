@@ -35,7 +35,9 @@ wget -c -P "$DOWNLOAD_DIR" https://s3.amazonaws.com/images.cocodataset.org/annot
 
 Download manually after logging in and accepting the dataset terms:
 
-- [ImageNet downloads](https://www.image-net.org/download.php):
+- [Kaggle ImageNet downloads](https://www.kaggle.com/competitions/imagenet-object-localization-challenge/data):
+  `imagenet-object-localization-challenge.zip` (includes validation labels).
+  Alternatively, [original ImageNet downloads](https://www.image-net.org/download.php):
   `ILSVRC2012_img_train.tar`, `ILSVRC2012_img_val.tar`,
   `ILSVRC2012_devkit_t12.tar.gz`.
 - [Cityscapes downloads](https://www.cityscapes-dataset.com/downloads/):
@@ -43,18 +45,21 @@ Download manually after logging in and accepting the dataset terms:
 
 ## 3. Prepare datasets
 
-Once all ten archives are downloaded:
+Once all eight archives are downloaded (ten with the original ImageNet tars):
 
 ```bash
 python prepare_data.py "$DOWNLOAD_DIR"
-# Optional: choose a different prepared-data location.
-python prepare_data.py "$DOWNLOAD_DIR" --output /path/to/dataset
 ```
 
-Run either command. By default, data is prepared in `DOWNLOAD_DIR/prepared/`.
+Data is prepared directly inside `$DOWNLOAD_DIR`, alongside the archives:
+`imagenet/`, `ade20k/`, `pascal_voc/`, `cityscapes/`, `coco/`, and
+`evaluation_manifests/`.
 The script extracts archives, organizes ImageNet classes, creates VOC/COCO
-manifests, and validates the data. Archives are retained. Use a fresh output
-directory; partial/existing dataset directories are not overwritten.
+manifests, and validates the data. Archives are retained;
+partial/existing dataset directories are not overwritten.
+Kaggle ImageNet is detected automatically, including ZIPs containing a nested
+ImageNet tar. Validation images are classified using `LOC_val_solution.csv`;
+test images are skipped. No separate ImageNet devkit is needed for this format.
 
 ## 4. Download iBOT checkpoints
 
