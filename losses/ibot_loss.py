@@ -97,10 +97,9 @@ class iBOTLoss(nn.Module):
     @staticmethod
     @torch.no_grad()
     def _distribution_diagnostics(distributions, are_probabilities):
-        """Summarize patch distributions without retaining a large graph."""
+        """Assignment sharpness only; this does not measure prototype geometry."""
         entropy_sum = None
         maximum_sum = None
-        prototype_sum = None
         token_count = 0
         for distribution in distributions:
             rows = distribution.detach().flatten(0, 1)
@@ -115,7 +114,6 @@ class iBOTLoss(nn.Module):
                     probabilities * log_probabilities
                 ).sum(dim=-1).sum()
                 chunk_maximum = probabilities.amax(dim=-1).sum()
-                chunk_prototype_sum = probabilities.sum(dim=0)
                 entropy_sum = (
                     chunk_entropy
                     if entropy_sum is None
@@ -126,21 +124,11 @@ class iBOTLoss(nn.Module):
                     if maximum_sum is None
                     else maximum_sum + chunk_maximum
                 )
-                prototype_sum = (
-                    chunk_prototype_sum
-                    if prototype_sum is None
-                    else prototype_sum + chunk_prototype_sum
-                )
                 token_count += len(chunk)
 
-        mean_probability = prototype_sum / token_count
-        usage_entropy = -(
-            mean_probability * mean_probability.clamp_min(1e-12).log()
-        ).sum()
         return {
             "entropy": entropy_sum / token_count,
             "max_probability": maximum_sum / token_count,
-            "effective_prototypes": usage_entropy.exp(),
         }
 
     @staticmethod
@@ -290,12 +278,6 @@ class iBOTLoss(nn.Module):
             ],
             "teacher_patch_max_probability": teacher_diagnostics[
                 "max_probability"
-            ],
-            "student_patch_effective_prototypes": student_diagnostics[
-                "effective_prototypes"
-            ],
-            "teacher_patch_effective_prototypes": teacher_diagnostics[
-                "effective_prototypes"
             ],
             "region": total_loss3,
             "region_raw": region_raw,

@@ -216,8 +216,6 @@ class PureIBOTAndDiagnosticsTest(unittest.TestCase):
             "teacher_patch_entropy",
             "student_patch_max_probability",
             "teacher_patch_max_probability",
-            "student_patch_effective_prototypes",
-            "teacher_patch_effective_prototypes",
         ):
             self.assertTrue(torch.isfinite(result[key]).item(), key)
 

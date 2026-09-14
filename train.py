@@ -31,6 +31,7 @@ from utils.checkpoint import (
     source_equivalent_epoch,
 )
 from utils.recipe import get_ibot_recipe
+from utils.collapse_diagnostics import FeatureCollapseDiagnostics, prototype_geometry_metrics
 from utils.wandb_logging import configure_wandb, init_wandb_run
 
 
@@ -46,6 +47,13 @@ def load_config(path):
 
     config = {**get_ibot_recipe(user_config["arch"]), **user_config}
     configure_wandb(config)
+    for name, minimum in (
+        ("diagnostic_feature_batches", 1),
+        ("diagnostic_max_patch_features_per_batch", 2),
+        ("diagnostic_prototype_chunk_size", 1),
+    ):
+        if type(config[name]) is not int or config[name] < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}")
     if config["centering"] not in ("centering", "sinkhorn_knopp"):
         raise ValueError("centering must be one of: centering, sinkhorn_knopp")
     # Saved with args: version 2 restricts SK to the overlap branch.
@@ -397,6 +405,9 @@ def train_ibot(args, wandb_run=None):
             fp16_scaler,
             args,
         )
+        train_stats.update(prototype_geometry_metrics(
+            student, teacher_without_ddp, args.diagnostic_prototype_chunk_size
+        ))
 
         completed_continuation_epoch = epoch + 1
         completed_source_epoch = source_equivalent_epoch(
@@ -522,6 +533,10 @@ def train_one_epoch(
     args,
 ):
     metric_logger = utils.MetricLogger(delimiter="  ")
+    feature_diagnostics = FeatureCollapseDiagnostics(
+        teacher_without_ddp.backbone.embed_dim,
+        args.diagnostic_max_patch_features_per_batch,
+    )
     source_epoch = source_equivalent_epoch(args.source_checkpoint_epoch, epoch)
     source_final = source_equivalent_epoch(
         args.source_checkpoint_epoch, args.epochs
@@ -575,7 +590,14 @@ def train_one_epoch(
             enabled=autocast_enabled,
         ):
             with torch.no_grad():
-                teacher_output = teacher(images[: args.global_crops_number])
+                if iteration < args.diagnostic_feature_batches:
+                    backbone_features, teacher_output = teacher(
+                        images[: args.global_crops_number], return_backbone_feat=True
+                    )
+                    feature_diagnostics.update(backbone_features[:, 1:])
+                    del backbone_features
+                else:
+                    teacher_output = teacher(images[: args.global_crops_number])
                 teacher_targets, teacher_overlap_targets = get_teacher_targets(
                     teacher_output, ibot_loss, epoch, args.centering, crop_boxes
                 )
@@ -668,7 +690,10 @@ def train_one_epoch(
 
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {key: meter.global_avg for key, meter in metric_logger.meters.items()}
+    stats = {key: meter.global_avg for key, meter in metric_logger.meters.items()}
+    # These nonlinear diagnostics are already global; never average per-rank ranks.
+    stats.update(feature_diagnostics.compute(device=next(teacher.parameters()).device))
+    return stats
 
 
 def main():

@@ -29,6 +29,9 @@ COMMON_IBOT_RECIPE = {
     "dist_url": "env://",
     "saveckp_freq": 40,
     "print_freq": 10,
+    "diagnostic_feature_batches": 1,
+    "diagnostic_max_patch_features_per_batch": 4096,
+    "diagnostic_prototype_chunk_size": 256,
 }
 
 

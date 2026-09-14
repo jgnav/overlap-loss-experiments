@@ -12,7 +12,7 @@ from utils import training as utils
 
 class ContinuationConfigTest(unittest.TestCase):
     def test_wandb_settings_come_from_yaml_instead_of_slurm_environment(self):
-        path = Path(__file__).parents[1] / 'train.yaml'
+        path = Path(__file__).parents[1] / 'config' / 'train.yaml'
         values = yaml.safe_load(path.read_text())
         values.update(wandb_mode='offline', wandb_run_id='yaml-id', wandb_resume='allow')
         with mock.patch.dict('os.environ', {'WANDB_MODE': 'online', 'WANDB_RUN_ID': 'env-id', 'WANDB_RESUME': 'must'}):
@@ -25,7 +25,7 @@ class ContinuationConfigTest(unittest.TestCase):
         self.assertEqual(args.wandb_resume, 'allow')
 
     def test_production_config_is_bf16_200_epochs_without_lr_warmup(self):
-        config = load_config(Path(__file__).parents[1] / "train.yaml")
+        config = load_config(Path(__file__).parents[1] / "config" / "train.yaml")
 
         self.assertEqual(config.additional_epochs, 200)
         self.assertEqual(config.epochs, 200)
@@ -34,11 +34,11 @@ class ContinuationConfigTest(unittest.TestCase):
         self.assertEqual(config.warmup_epochs, 0)
         self.assertEqual(config.batch_size_per_gpu * config.gpu_count, 256)
         self.assertEqual(config.saveckp_freq, 50)
-        self.assertEqual(config.centering, "centering")
+        self.assertEqual(config.centering, "sinkhorn_knopp")
         self.assertEqual(config.teacher_target_version, 2)
 
     def test_teacher_normalization_choices_and_legacy_default(self):
-        path = Path(__file__).parents[1] / "train.yaml"
+        path = Path(__file__).parents[1] / "config" / "train.yaml"
         config_values = yaml.safe_load(path.read_text())
         for mode in (None, "centering", "sinkhorn_knopp"):
             with self.subTest(mode=mode):
@@ -54,7 +54,7 @@ class ContinuationConfigTest(unittest.TestCase):
                 self.assertEqual(config.centering, mode or "centering")
 
     def test_invalid_teacher_normalization_fails_at_config_load(self):
-        path = Path(__file__).parents[1] / "train.yaml"
+        path = Path(__file__).parents[1] / "config" / "train.yaml"
         values = yaml.safe_load(path.read_text())
         values["centering"] = "sinkhorn"
         with mock.patch.object(
@@ -83,7 +83,7 @@ class ContinuationConfigTest(unittest.TestCase):
                 "IBOT_GPU_COUNT_OVERRIDE": "1",
             },
         ):
-            config = load_config(Path(__file__).parents[1] / "train.yaml")
+            config = load_config(Path(__file__).parents[1] / "config" / "train.yaml")
 
         self.assertEqual(config.precision, "fp32")
         self.assertEqual(config.batch_size_per_gpu, 4)

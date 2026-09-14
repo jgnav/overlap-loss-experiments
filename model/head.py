@@ -141,6 +141,15 @@ class DINOHead(nn.Module):
 
 
 class iBOTHead(DINOHead):
+    def prototype_layers(self):
+        """Final learned prototype layers, naming a shared layer only as patch."""
+        patch = self.last_layer2 if self.last_layer2 is not None else self.mlp2
+        cls = self.last_layer if self.last_layer is not None else self.mlp[-1]
+        layers = {"patch": patch}
+        if cls is not patch:
+            layers["cls"] = cls
+        return layers
+
     def __init__(self, *args, patch_out_dim=8192, norm=None, act='gelu',
                  last_norm=None, nlayers=3, hidden_dim=2048,
                  bottleneck_dim=256, norm_last_layer=True,
