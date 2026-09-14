@@ -126,6 +126,28 @@ class TeacherNormalizationTest(unittest.TestCase):
         targets = sinkhorn_knopp(logits, 0.07)
         torch.testing.assert_close(targets, torch.full_like(targets, 1 / 3))
 
+    def test_masked_teacher_sinkhorn_assigns_only_masked_patches(self):
+        loss = make_loss()
+        logits = torch.randn(4, 4, 3, generator=torch.Generator().manual_seed(23))
+        masks = [
+            torch.tensor(
+                [[[1, 0], [0, 1]], [[0, 1], [1, 0]]], dtype=torch.bool
+            ),
+            torch.tensor(
+                [[[1, 1], [0, 0]], [[0, 1], [0, 0]]], dtype=torch.bool
+            ),
+        ]
+        targets, flat_mask = loss.sinkhorn_knopp_masked_teacher(
+            logits, masks, 0.07
+        )
+        selected = torch.cat([mask.flatten(1) for mask in masks], dim=0).flatten()
+        self.assertTrue(torch.equal(flat_mask.flatten(), selected))
+        torch.testing.assert_close(
+            targets.flatten(0, 1)[selected].sum(-1),
+            torch.ones(int(selected.sum())),
+        )
+        self.assertEqual(targets.flatten(0, 1)[~selected].abs().sum().item(), 0.0)
+
     @unittest.skipUnless(
         dist.is_available() and dist.is_gloo_available(), "Gloo required"
     )

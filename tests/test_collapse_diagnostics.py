@@ -241,7 +241,8 @@ class TrainingDiagnosticIntegrationTest(unittest.TestCase):
         args = SimpleNamespace(
             source_checkpoint_epoch=800, epochs=1, print_freq=100,
             precision="fp32", global_crops_number=2, use_masked_im_modeling=True,
-            centering="sinkhorn_knopp", clip_grad=0, freeze_last_layer=0,
+            teacher_target_cls="centering", teacher_target_ibot="centering",
+            teacher_target_overlap="sinkhorn_knopp", clip_grad=0, freeze_last_layer=0,
             diagnostic_feature_batches=sampled_batches,
             diagnostic_max_patch_features_per_batch=8,
         )

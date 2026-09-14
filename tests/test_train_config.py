@@ -26,6 +26,7 @@ class ContinuationConfigTest(unittest.TestCase):
 
     def test_production_config_is_bf16_200_epochs_without_lr_warmup(self):
         config = load_config(Path(__file__).parents[1] / "config" / "train.yaml")
+        self.assertFalse(hasattr(config, "centering"))
 
         self.assertEqual(config.additional_epochs, 200)
         self.assertEqual(config.epochs, 200)
@@ -34,24 +35,35 @@ class ContinuationConfigTest(unittest.TestCase):
         self.assertEqual(config.warmup_epochs, 0)
         self.assertEqual(config.batch_size_per_gpu * config.gpu_count, 256)
         self.assertEqual(config.saveckp_freq, 50)
-        self.assertEqual(config.centering, "sinkhorn_knopp")
-        self.assertEqual(config.teacher_target_version, 2)
+        self.assertEqual(config.teacher_target_cls, "centering")
+        self.assertEqual(config.teacher_target_ibot, "centering")
+        self.assertEqual(config.teacher_target_overlap, "sinkhorn_knopp")
 
-    def test_teacher_normalization_choices_and_legacy_default(self):
+    def test_per_objective_teacher_modes_are_loaded(self):
         path = Path(__file__).parents[1] / "config" / "train.yaml"
-        config_values = yaml.safe_load(path.read_text())
-        for mode in (None, "centering", "sinkhorn_knopp"):
-            with self.subTest(mode=mode):
-                values = dict(config_values)
-                if mode is None:
-                    values.pop("centering")
-                else:
-                    values["centering"] = mode
-                with mock.patch.object(
-                    Path, "open", mock.mock_open(read_data=yaml.safe_dump(values))
-                ):
-                    config = load_config(path)
-                self.assertEqual(config.centering, mode or "centering")
+        values = yaml.safe_load(path.read_text())
+        values.update(
+            teacher_target_cls="sinkhorn_knopp",
+            teacher_target_ibot="centering",
+            teacher_target_overlap="sinkhorn_knopp",
+        )
+        with mock.patch.object(
+            Path, "open", mock.mock_open(read_data=yaml.safe_dump(values))
+        ):
+            config = load_config(path)
+        self.assertEqual(config.teacher_target_cls, "sinkhorn_knopp")
+        self.assertEqual(config.teacher_target_ibot, "centering")
+        self.assertEqual(config.teacher_target_overlap, "sinkhorn_knopp")
+
+    def test_per_objective_teacher_modes_validate_values(self):
+        path = Path(__file__).parents[1] / "config" / "train.yaml"
+        values = yaml.safe_load(path.read_text())
+        values["teacher_target_ibot"] = "sinkhorn"
+        with mock.patch.object(
+            Path, "open", mock.mock_open(read_data=yaml.safe_dump(values))
+        ):
+            with self.assertRaisesRegex(ValueError, "teacher_target_ibot"):
+                load_config(path)
 
     def test_head_topology_is_selectable_from_yaml(self):
         path = Path(__file__).parents[1] / "config" / "train.yaml"
@@ -73,16 +85,6 @@ class ContinuationConfigTest(unittest.TestCase):
             Path, "open", mock.mock_open(read_data=yaml.safe_dump(values))
         ):
             with self.assertRaisesRegex(ValueError, "shared_head must be a boolean"):
-                load_config(path)
-
-    def test_invalid_teacher_normalization_fails_at_config_load(self):
-        path = Path(__file__).parents[1] / "config" / "train.yaml"
-        values = yaml.safe_load(path.read_text())
-        values["centering"] = "sinkhorn"
-        with mock.patch.object(
-            Path, "open", mock.mock_open(read_data=yaml.safe_dump(values))
-        ):
-            with self.assertRaisesRegex(ValueError, "centering, sinkhorn_knopp"):
                 load_config(path)
 
     def test_continuation_cosine_schedule_starts_at_configured_lr(self):
@@ -141,11 +143,19 @@ class TeacherTargetTrainingTest(unittest.TestCase):
                  / loss.teacher_temp2_schedule[epoch]).softmax(-1),
             )
 
-            targets, overlap_targets = get_teacher_targets(
-                teacher, loss, epoch, "centering"
+            targets, overlap_targets, overlap_patch_targets = get_teacher_targets(
+                teacher,
+                loss,
+                epoch,
+                target_modes={
+                    "cls": "centering",
+                    "ibot": "centering",
+                    "overlap": "centering",
+                },
             )
 
             self.assertIsNone(overlap_targets)
+            self.assertIsNone(overlap_patch_targets)
             for actual, reference in zip(targets, expected):
                 torch.testing.assert_close(actual, reference)
             torch.testing.assert_close(
@@ -164,15 +174,31 @@ class TeacherTargetTrainingTest(unittest.TestCase):
             [[[0., 0., 1., 1., 0.], [0.25, 0., 1., 1., 0.]]] * 2
         )
         for epoch in (0, 1):
-            centered, _ = get_teacher_targets(
-                teacher, centered_loss, epoch, "centering", boxes
+            centered, _, _ = get_teacher_targets(
+                teacher,
+                centered_loss,
+                epoch,
+                crop_boxes=boxes,
+                target_modes={
+                    "cls": "centering",
+                    "ibot": "centering",
+                    "overlap": "centering",
+                },
             )
             with mock.patch.object(
                 sk_loss.region_loss, "sinkhorn_knopp_teacher",
                 wraps=sk_loss.region_loss.sinkhorn_knopp_teacher,
             ) as build_overlap:
-                sk, overlap = get_teacher_targets(
-                    teacher, sk_loss, epoch, "sinkhorn_knopp", boxes
+                sk, overlap, _ = get_teacher_targets(
+                    teacher,
+                    sk_loss,
+                    epoch,
+                    crop_boxes=boxes,
+                    target_modes={
+                        "cls": "centering",
+                        "ibot": "centering",
+                        "overlap": "sinkhorn_knopp",
+                    },
                 )
 
             for actual, reference in zip(sk, centered):
@@ -196,11 +222,27 @@ class TeacherTargetTrainingTest(unittest.TestCase):
         second.center.copy_(torch.tensor([[0.1, -0.1, 0.2]]))
         second.center2.copy_(torch.linspace(-0.3, 0.3, 5).reshape(1, 1, 5))
 
-        targets_a, overlap_a = get_teacher_targets(
-            teacher, first, 0, "sinkhorn_knopp", boxes
+        targets_a, overlap_a, _ = get_teacher_targets(
+            teacher,
+            first,
+            0,
+            crop_boxes=boxes,
+            target_modes={
+                "cls": "centering",
+                "ibot": "centering",
+                "overlap": "sinkhorn_knopp",
+            },
         )
-        targets_b, overlap_b = get_teacher_targets(
-            teacher, second, 0, "sinkhorn_knopp", boxes
+        targets_b, overlap_b, _ = get_teacher_targets(
+            teacher,
+            second,
+            0,
+            crop_boxes=boxes,
+            target_modes={
+                "cls": "centering",
+                "ibot": "centering",
+                "overlap": "sinkhorn_knopp",
+            },
         )
 
         torch.testing.assert_close(overlap_a.probabilities, overlap_b.probabilities)
@@ -218,8 +260,17 @@ class TeacherTargetTrainingTest(unittest.TestCase):
         teacher = (torch.randn(4, 3) * 0.1, torch.randn(4, 4, 5) * 0.1)
         student = (torch.randn(4, 3), torch.randn(4, 4, 5))
         masks = [torch.ones(2, 2, 2, dtype=torch.bool) for _ in range(2)]
-        centered, _ = get_teacher_targets(teacher, centered_loss, 0, "centering")
-        sk, overlap = get_teacher_targets(teacher, sk_loss, 0, "sinkhorn_knopp")
+        modes = {
+            "cls": "centering",
+            "ibot": "centering",
+            "overlap": "sinkhorn_knopp",
+        }
+        centered, _, _ = get_teacher_targets(
+            teacher, centered_loss, 0, target_modes=modes
+        )
+        sk, overlap, _ = get_teacher_targets(
+            teacher, sk_loss, 0, target_modes=modes
+        )
 
         expected = centered_loss(student, centered, None, masks, None)
         actual = sk_loss(student, sk, None, masks, None, teacher_overlap_targets=overlap)
@@ -228,6 +279,60 @@ class TeacherTargetTrainingTest(unittest.TestCase):
         sk_loss.region_loss.sinkhorn_knopp_teacher.assert_not_called()
         for key in expected:
             torch.testing.assert_close(actual[key], expected[key])
+
+    def test_all_sinkhorn_targets_skip_centering_and_centers(self):
+        loss = self._loss()
+        teacher = (torch.randn(4, 3) * 0.1, torch.randn(4, 4, 5) * 0.1)
+        masks = [
+            torch.tensor(
+                [[[1, 0], [0, 1]], [[0, 1], [1, 0]]], dtype=torch.bool
+            ),
+            torch.tensor(
+                [[[1, 1], [0, 0]], [[0, 1], [1, 0]]], dtype=torch.bool
+            ),
+        ]
+        boxes = torch.tensor(
+            [[[0., 0., 1., 1., 0.], [0.25, 0., 1., 1., 0.]]] * 2
+        )
+        old_cls_center = loss.center.clone()
+        old_patch_center = loss.center2.clone()
+        with mock.patch.object(
+            loss, "softmax_center_teacher_cls", wraps=loss.softmax_center_teacher_cls
+        ) as center_cls, mock.patch.object(
+            loss, "softmax_center_teacher_patch", wraps=loss.softmax_center_teacher_patch
+        ) as center_patch, mock.patch.object(
+            loss, "update_center", wraps=loss.update_center
+        ) as update_center:
+            targets, overlap, overlap_patch = get_teacher_targets(
+                teacher,
+                loss,
+                0,
+                crop_boxes=boxes,
+                masks=masks,
+                target_modes={
+                    "cls": "sinkhorn_knopp",
+                    "ibot": "sinkhorn_knopp",
+                    "overlap": "sinkhorn_knopp",
+                },
+            )
+
+        center_cls.assert_not_called()
+        center_patch.assert_not_called()
+        update_center.assert_not_called()
+        torch.testing.assert_close(loss.center, old_cls_center)
+        torch.testing.assert_close(loss.center2, old_patch_center)
+        self.assertIsNotNone(overlap)
+        self.assertIsNone(overlap_patch)
+        torch.testing.assert_close(
+            targets[0].sum(-1), torch.ones(targets[0].shape[:-1])
+        )
+        flat_targets = targets[1].flatten(0, 1)
+        flat_masks = torch.cat([mask.flatten(1) for mask in masks], dim=0).flatten()
+        torch.testing.assert_close(
+            flat_targets[flat_masks].sum(-1),
+            torch.ones(flat_masks.sum(), dtype=flat_targets.dtype),
+        )
+        self.assertEqual(flat_targets[~flat_masks].abs().sum().item(), 0.0)
 
 
 if __name__ == "__main__":

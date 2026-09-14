@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +24,7 @@ from model import create_model, iBOTHead
 from utils import training as utils
 from utils.checkpoint import (
     continuation_provenance,
+    centers_required,
     load_continuation_state,
     load_resume_state,
     milestone_checkpoint_name,
@@ -75,10 +77,15 @@ def load_config(path):
         raise ValueError("online_probe_wait_at_exit must be a boolean")
     if type(config["shared_head"]) is not bool:
         raise ValueError("shared_head must be a boolean")
-    if config["centering"] not in ("centering", "sinkhorn_knopp"):
-        raise ValueError("centering must be one of: centering, sinkhorn_knopp")
-    # Saved with args: version 2 restricts SK to the overlap branch.
-    config["teacher_target_version"] = 2
+    for name in (
+        "teacher_target_cls",
+        "teacher_target_ibot",
+        "teacher_target_overlap",
+    ):
+        if config[name] not in ("centering", "sinkhorn_knopp"):
+            raise ValueError(
+                f"{name} must be one of: centering, sinkhorn_knopp"
+            )
     if "additional_epochs" in user_config and "epochs" in user_config:
         raise ValueError(
             "Configure training length with additional_epochs, not both keys"
@@ -316,6 +323,7 @@ def train_ibot(args, wandb_run=None):
             ibot_loss,
             optimizer,
             fp16_scaler,
+            restore_centers=centers_required(args),
         )
     else:
         optimizer_restored = True
@@ -326,6 +334,7 @@ def train_ibot(args, wandb_run=None):
             ibot_loss,
             optimizer,
             fp16_scaler,
+            restore_centers=centers_required(args),
         )
 
     source_has_scaler = "fp16_scaler" in checkpoint
@@ -357,9 +366,12 @@ def train_ibot(args, wandb_run=None):
     )
     if args.resume_checkpoint is None:
         if optimizer_restored:
+            restored_state = "student, teacher, projection heads"
+            if centers_required(args):
+                restored_state += ", iBOT centers"
             print(
-                "Loaded student, teacher, projection heads, iBOT centers, and "
-                "AdamW first/second moments from the continuation source."
+                f"Loaded {restored_state}, and AdamW first/second moments "
+                "from the continuation source."
             )
         else:
             print(
@@ -367,7 +379,9 @@ def train_ibot(args, wandb_run=None):
                 "was reconstructed with zero first/second moments."
             )
     else:
-        restored_state = "student, teacher, iBOT centers, and optimizer"
+        restored_state = "student, teacher, and optimizer"
+        if centers_required(args):
+            restored_state = "student, teacher, iBOT centers, and optimizer"
         if fp16_scaler is not None:
             restored_state += ", including the FP16 scaler"
         print(
@@ -534,30 +548,93 @@ def train_ibot(args, wandb_run=None):
 
 
 @torch.no_grad()
-def get_teacher_targets(teacher_output, ibot_loss, epoch, centering, crop_boxes=None):
-    """Center CLS/iBOT targets and optionally build separate SK overlap targets."""
-    if centering not in ("centering", "sinkhorn_knopp"):
-        raise ValueError(f"Unsupported teacher normalization: {centering!r}")
+def get_teacher_targets(
+    teacher_output,
+    ibot_loss,
+    epoch,
+    crop_boxes=None,
+    *,
+    masks=None,
+    target_modes,
+):
+    """Build teacher targets with an independent mode for each objective.
+
+    ``target_modes`` must provide one of ``centering`` or ``sinkhorn_knopp``
+    for each of the CLS, iBOT patch, and overlap objectives.  A separate
+    overlap patch target is returned when overlap centering needs a full patch
+    field in addition to masked iBOT Sinkhorn assignments.
+    """
+    if not isinstance(target_modes, Mapping):
+        raise ValueError("target_modes must be a mapping for cls, ibot, and overlap")
+
+    required_modes = {"cls", "ibot", "overlap"}
+    if set(target_modes) != required_modes:
+        raise ValueError(
+            "target_modes must contain exactly cls, ibot, and overlap"
+        )
+    for name, mode in target_modes.items():
+        if mode not in ("centering", "sinkhorn_knopp"):
+            raise ValueError(
+                f"Unsupported teacher normalization for {name}: {mode!r}"
+            )
+
+    teacher_cls, teacher_patch = teacher_output
     teacher_temp = ibot_loss.teacher_temp_schedule[epoch]
     teacher_patch_temp = ibot_loss.teacher_temp2_schedule[epoch]
-    teacher_targets = ibot_loss.softmax_center_teacher(
-        teacher_output, teacher_temp, teacher_patch_temp
-    )
-    if centering == "centering":
-        # The region loss pools the same centered patch probabilities as iBOT.
-        teacher_overlap_targets = None
-    elif centering == "sinkhorn_knopp":
-        # A parallel transformation of RAW overlap logits, never q_center.
-        teacher_overlap_targets = (
-            ibot_loss.region_loss.sinkhorn_knopp_teacher(
-                teacher_output[1], crop_boxes, teacher_patch_temp
-            )
-            if ibot_loss.lambda3 != 0
-            else None
+
+    if target_modes["cls"] == "centering":
+        teacher_cls_target = ibot_loss.softmax_center_teacher_cls(
+            teacher_cls, teacher_temp
         )
-    # Both modes use the old centers for this batch and update them once.
-    ibot_loss.update_center(*teacher_output)
-    return teacher_targets, teacher_overlap_targets
+    else:
+        teacher_cls_target = ibot_loss.sinkhorn_knopp_teacher(
+            teacher_cls, teacher_temp
+        )
+
+    teacher_overlap_targets = None
+    teacher_overlap_patch_targets = None
+
+    if target_modes["ibot"] == "centering":
+        teacher_ibot_patch_target = ibot_loss.softmax_center_teacher_patch(
+            teacher_patch, teacher_patch_temp
+        )
+    else:
+        teacher_ibot_patch_target, _ = (
+            ibot_loss.sinkhorn_knopp_masked_teacher(
+                teacher_patch, masks, teacher_patch_temp
+            )
+        )
+
+    if ibot_loss.lambda3 != 0:
+        if target_modes["overlap"] == "sinkhorn_knopp":
+            # A parallel transformation of RAW overlap logits, never q_center.
+            teacher_overlap_targets = (
+                ibot_loss.region_loss.sinkhorn_knopp_teacher(
+                    teacher_patch, crop_boxes, teacher_patch_temp
+                )
+            )
+        elif target_modes["ibot"] != "centering":
+            # iBOT SK stores only masked assignments; overlap centering still
+            # needs a full centered patch-probability field for geometric pooling.
+            teacher_overlap_patch_targets = (
+                ibot_loss.softmax_center_teacher_patch(
+                    teacher_patch, teacher_patch_temp
+                )
+            )
+
+    update_cls = target_modes["cls"] == "centering"
+    update_patch = (
+        target_modes["ibot"] == "centering"
+        or (ibot_loss.lambda3 != 0 and target_modes["overlap"] == "centering")
+    )
+    if update_cls or update_patch:
+        ibot_loss.update_center(
+            teacher_cls if update_cls else None,
+            teacher_patch if update_patch else None,
+        )
+
+    teacher_targets = (teacher_cls_target, teacher_ibot_patch_target)
+    return teacher_targets, teacher_overlap_targets, teacher_overlap_patch_targets
 
 
 def train_one_epoch(
@@ -640,8 +717,21 @@ def train_one_epoch(
                     del backbone_features
                 else:
                     teacher_output = teacher(images[: args.global_crops_number])
-                teacher_targets, teacher_overlap_targets = get_teacher_targets(
-                    teacher_output, ibot_loss, epoch, args.centering, crop_boxes
+                (
+                    teacher_targets,
+                    teacher_overlap_targets,
+                    teacher_overlap_patch_targets,
+                ) = get_teacher_targets(
+                    teacher_output,
+                    ibot_loss,
+                    epoch,
+                    crop_boxes=crop_boxes,
+                    masks=masks[: args.global_crops_number],
+                    target_modes={
+                        "cls": args.teacher_target_cls,
+                        "ibot": args.teacher_target_ibot,
+                        "overlap": args.teacher_target_overlap,
+                    },
                 )
             student_output = student(
                 images[: args.global_crops_number],
@@ -663,6 +753,12 @@ def train_one_epoch(
                 masks,
                 crop_boxes,
                 teacher_overlap_targets=teacher_overlap_targets,
+                teacher_overlap_patch_targets=teacher_overlap_patch_targets,
+                teacher_ibot_mask=(
+                    masks[: args.global_crops_number]
+                    if args.teacher_target_ibot == "sinkhorn_knopp"
+                    else None
+                ),
             )
             loss = all_loss.pop("loss")
 

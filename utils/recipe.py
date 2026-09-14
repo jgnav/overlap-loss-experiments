@@ -17,7 +17,9 @@ COMMON_IBOT_RECIPE = {
     "local_crops_number": 10,
     "local_crop_size": 96,
     "student_temp": 0.1,
-    "centering": "centering",
+    "teacher_target_cls": "centering",
+    "teacher_target_ibot": "centering",
+    "teacher_target_overlap": "centering",
     "center_momentum": 0.9,
     "center_momentum2": 0.9,
     # A pretrained iBOT checkpoint has already completed temperature warmup.

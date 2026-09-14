@@ -10,7 +10,9 @@ arch: vit_small
 shared_head: true
 
 # Loss and teacher
-centering: sinkhorn_knopp  # centering or sinkhorn_knopp.
+teacher_target_cls: centering       # CLS objective: centering or sinkhorn_knopp.
+teacher_target_ibot: centering      # iBOT patch objective: centering or sinkhorn_knopp.
+teacher_target_overlap: sinkhorn_knopp  # Overlap objective: centering or sinkhorn_knopp.
 lambda1: 1.0  # Global CLS loss
 lambda2: 1.0  # Masked patch loss
 lambda3: 1.0  # Constant from the first epoch; set to 0.0 for pure iBOT.

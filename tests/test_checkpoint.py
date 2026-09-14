@@ -75,6 +75,62 @@ class PretrainedCheckpointTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "official full checkpoint"):
                 read_pretrained_checkpoint(args)
 
+    def test_sinkhorn_only_checkpoint_does_not_require_center_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory) / "checkpoint.pth"
+            source_student = nn.Linear(2, 2)
+            source_teacher = nn.Linear(2, 2)
+            source_loss = make_loss().state_dict()
+            source_loss.pop("center")
+            source_loss.pop("center2")
+            torch.save(
+                {
+                    "student": source_student.state_dict(),
+                    "teacher": source_teacher.state_dict(),
+                    "ibot_loss": source_loss,
+                },
+                checkpoint_path,
+            )
+            args = SimpleNamespace(
+                initial_checkpoint=checkpoint_path,
+                teacher_target_cls="sinkhorn_knopp",
+                teacher_target_ibot="sinkhorn_knopp",
+                teacher_target_overlap="sinkhorn_knopp",
+            )
+            checkpoint = read_pretrained_checkpoint(args)
+            student = nn.Linear(2, 2)
+            teacher = nn.Linear(2, 2)
+            loss = make_loss()
+            load_pretrained_state(
+                checkpoint,
+                student,
+                teacher,
+                loss,
+                restore_centers=False,
+            )
+
+    def test_centering_checkpoint_requires_and_restores_center_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory) / "checkpoint.pth"
+            source_loss = make_loss().state_dict()
+            source_loss.pop("center2")
+            torch.save(
+                {
+                    "student": nn.Linear(2, 2).state_dict(),
+                    "teacher": nn.Linear(2, 2).state_dict(),
+                    "ibot_loss": source_loss,
+                },
+                checkpoint_path,
+            )
+            args = SimpleNamespace(
+                initial_checkpoint=checkpoint_path,
+                teacher_target_cls="centering",
+                teacher_target_ibot="sinkhorn_knopp",
+                teacher_target_overlap="sinkhorn_knopp",
+            )
+            with self.assertRaisesRegex(ValueError, "pretrained centers"):
+                read_pretrained_checkpoint(args)
+
     def test_completed_continuation_can_become_a_new_source(self):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint_path = Path(directory) / "checkpoint.pth"
@@ -191,33 +247,6 @@ class RecordingScaler:
 
 
 class ResumeCheckpointTest(unittest.TestCase):
-    def test_resume_rejects_old_global_sk_but_accepts_overlap_sk(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "checkpoint.pth"
-            checkpoint = self._make_checkpoint()
-            checkpoint["args"].centering = "sinkhorn_knopp"
-            args = SimpleNamespace(
-                resume_checkpoint=path, epochs=50, use_fp16=True,
-                centering="sinkhorn_knopp", teacher_target_version=2,
-            )
-            torch.save(checkpoint, path)
-            with self.assertRaisesRegex(ValueError, "teacher_target_version"):
-                read_resume_checkpoint(args)
-
-            checkpoint["args"].teacher_target_version = 2
-            torch.save(checkpoint, path)
-            read_resume_checkpoint(args)
-
-    def test_legacy_centering_remains_compatible_with_new_target_version(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "checkpoint.pth"
-            torch.save(self._make_checkpoint(), path)
-            args = SimpleNamespace(
-                resume_checkpoint=path, epochs=50, use_fp16=True,
-                centering="centering", teacher_target_version=2,
-            )
-            read_resume_checkpoint(args)
-
     def _make_checkpoint(self):
         student = nn.Linear(2, 2)
         teacher = nn.Linear(2, 2)
@@ -234,6 +263,9 @@ class ResumeCheckpointTest(unittest.TestCase):
                 epochs=50,
                 lambda3=0.2,
                 use_fp16=True,
+                teacher_target_cls="centering",
+                teacher_target_ibot="centering",
+                teacher_target_overlap="sinkhorn_knopp",
                 source_checkpoint_epoch=800,
             ),
             "ibot_loss": loss.state_dict(),
@@ -287,25 +319,23 @@ class ResumeCheckpointTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "lambda3"):
                 read_resume_checkpoint(args)
 
-    def test_resume_checks_normalization_and_treats_legacy_as_centering(self):
+    def test_resume_checks_per_objective_teacher_modes(self):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint_path = Path(directory) / "checkpoint.pth"
-            for saved_mode in (None, "centering", "sinkhorn_knopp"):
-                checkpoint = self._make_checkpoint()
-                if saved_mode is not None:
-                    checkpoint["args"].centering = saved_mode
-                torch.save(checkpoint, checkpoint_path)
-                for requested_mode in ("centering", "sinkhorn_knopp"):
-                    with self.subTest(saved=saved_mode, requested=requested_mode):
-                        args = SimpleNamespace(
-                            resume_checkpoint=checkpoint_path, epochs=50,
-                            use_fp16=True, centering=requested_mode,
-                        )
-                        if requested_mode == (saved_mode or "centering"):
-                            read_resume_checkpoint(args)
-                        else:
-                            with self.assertRaisesRegex(ValueError, "centering"):
-                                read_resume_checkpoint(args)
+            torch.save(self._make_checkpoint(), checkpoint_path)
+            args = SimpleNamespace(
+                resume_checkpoint=checkpoint_path,
+                epochs=50,
+                use_fp16=True,
+                teacher_target_cls="centering",
+                teacher_target_ibot="centering",
+                teacher_target_overlap="sinkhorn_knopp",
+            )
+            read_resume_checkpoint(args)
+
+            args.teacher_target_ibot = "sinkhorn_knopp"
+            with self.assertRaisesRegex(ValueError, "teacher_target_ibot"):
+                read_resume_checkpoint(args)
 
 
 if __name__ == "__main__":
