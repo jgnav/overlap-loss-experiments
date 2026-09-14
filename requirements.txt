@@ -9,5 +9,6 @@ tensorboardX>=2.6
 wandb>=0.19.10
 scikit-learn==1.5.2
 scipy==1.14.1
+matplotlib>=3.7
 tqdm==4.67.1
 cuml-cu12==24.6.1
