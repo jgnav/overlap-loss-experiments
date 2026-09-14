@@ -6,7 +6,10 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
-from prepare_data import KAGGLE_IMAGENET, IMAGENET_ARCHIVES, main, prepare_kaggle_imagenet, required_archives
+from prepare_data import (
+    KAGGLE_IMAGENET, IMAGENET_ARCHIVES, extract_tar, extract_zip, main,
+    prepare_kaggle_imagenet, required_archives,
+)
 
 
 class KagglePreparationTest(unittest.TestCase):
@@ -78,10 +81,18 @@ class KagglePreparationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'duplicate'):
             prepare_kaggle_imagenet(self.archive, self.output, expected=(2, 2, 2))
 
-    def test_existing_destination(self):
+    def test_existing_destination_is_resumed(self):
+        self.write_archive()
         self.output.mkdir()
-        with self.assertRaises(FileExistsError):
-            prepare_kaggle_imagenet(self.archive, self.output)
+        prepare_kaggle_imagenet(self.archive, self.output, expected=(2, 2, 2))
+        self.check_layout()
+
+    def test_interrupted_destination_is_resumed(self):
+        self.write_archive()
+        prepare_kaggle_imagenet(self.archive, self.output, expected=(2, 2, 2))
+        (self.output / 'train/n00000002/n00000002_1.JPEG').unlink()
+        prepare_kaggle_imagenet(self.archive, self.output, expected=(2, 2, 2))
+        self.check_layout()
 
     def test_traversal(self):
         self.images['../ILSVRC/Data/CLS-LOC/train/n00000001/escape.JPEG'] = b'bad'
@@ -99,6 +110,29 @@ class KagglePreparationTest(unittest.TestCase):
         with patch('sys.argv', ['prepare_data.py', str(self.root)]), patch('prepare_data.prepare') as prepare:
             main()
         prepare.assert_called_once_with(self.root.resolve(), self.root.resolve())
+
+
+class ArchiveExtractionResumeTest(unittest.TestCase):
+    def test_tar_and_zip_extraction_are_idempotent(self):
+        with tempfile.TemporaryDirectory(prefix='archive-resume-') as directory:
+            root = Path(directory)
+            tar_archive = root / 'sample.tar'
+            with tarfile.open(tar_archive, 'w') as archive:
+                contents = b'tar payload'
+                member = tarfile.TarInfo('nested/tar.txt')
+                member.size = len(contents)
+                archive.addfile(member, io.BytesIO(contents))
+            extract_tar(tar_archive, root / 'output')
+            extract_tar(tar_archive, root / 'output')
+
+            zip_archive = root / 'sample.zip'
+            with zipfile.ZipFile(zip_archive, 'w') as archive:
+                archive.writestr('nested/zip.txt', b'zip payload')
+            extract_zip(zip_archive, root / 'output')
+            extract_zip(zip_archive, root / 'output')
+
+            self.assertEqual((root / 'output/nested/tar.txt').read_bytes(), b'tar payload')
+            self.assertEqual((root / 'output/nested/zip.txt').read_bytes(), b'zip payload')
 
 
 if __name__ == '__main__':

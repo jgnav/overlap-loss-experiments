@@ -55,8 +55,12 @@ Data is prepared directly inside `$DOWNLOAD_DIR`, alongside the archives:
 `imagenet/`, `ade20k/`, `pascal_voc/`, `cityscapes/`, `coco/`, and
 `evaluation_manifests/`.
 The script extracts archives, organizes ImageNet classes, creates VOC/COCO
-manifests, and validates the data. Archives are retained;
-partial/existing dataset directories are not overwritten.
+manifests, and validates the data. Archives are retained. Preparation is
+resumable: the script records completed phases in
+`$DOWNLOAD_DIR/.prepare_data_state.json`, skips phases that finished in an
+earlier run, and continues interrupted archive extraction from files already
+written. A final validation pass still checks the complete dataset before it
+reports success.
 Kaggle ImageNet is detected automatically, including ZIPs containing a nested
 ImageNet tar. Validation images are classified using `LOC_val_solution.csv`;
 test images are skipped. No separate ImageNet devkit is needed for this format.
