@@ -1,5 +1,5 @@
 # Paths
-data_path: dataset/imagenet/train
+data_path: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
 initial_checkpoint: checkpoints/ibot_vit_small.pth
 output_dir: output/train
 
