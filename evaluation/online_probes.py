@@ -117,6 +117,22 @@ def _validate_k(k):
         raise ValueError("k must be a positive integer")
 
 
+def validate_probe_data(datasets_root):
+    """Check both datasets before allocating a model or starting training."""
+    root = Path(os.path.expandvars(str(datasets_root))).expanduser().resolve()
+    imagenet = _resolve_imagenet_root(root)
+    classes = [{p.name for p in (imagenet / split).iterdir() if p.is_dir()}
+               for split in ("train", "val")]
+    if len(classes[0]) != 1000 or classes[0] != classes[1]:
+        raise ValueError("ImageNet train/val must share exactly the same 1,000 classes")
+    for split in ("train", "val"):
+        voc = make_pascal_voc(root, split)
+        for path in (*voc.images, *voc.targets):
+            if not path.is_file():
+                raise FileNotFoundError(f"VOC {split} file missing: {path}")
+    return root
+
+
 def _cosine_neighbor_rows(train_features, train_labels, query_features, k, chunk_size=256):
     """Return top-k labels/similarities without materializing all pairwise scores."""
     _validate_k(k)
@@ -128,7 +144,7 @@ def _cosine_neighbor_rows(train_features, train_labels, query_features, k, chunk
         raise ValueError("k-NN requires nonempty train and query features")
     if k > len(train_features):
         raise ValueError(f"k={k} exceeds the {len(train_features)} training features")
-    train_labels = torch.as_tensor(train_labels, dtype=torch.long)
+    train_labels = torch.as_tensor(train_labels, dtype=torch.long, device=train_features.device)
     if len(train_labels) != len(train_features):
         raise ValueError("Training labels and features have different lengths")
     train_features = F.normalize(train_features.float(), dim=1)
@@ -143,7 +159,7 @@ def _cosine_neighbor_rows(train_features, train_labels, query_features, k, chunk
         neighbors.append(chunk_neighbors)
     values = torch.cat(values)
     labels = train_labels[torch.cat(neighbors)]
-    return labels, values
+    return labels.cpu(), values.cpu()
 
 
 def _cosine_neighbors(train_features, train_labels, query_features, k):
@@ -153,17 +169,24 @@ def _cosine_neighbors(train_features, train_labels, query_features, k):
 
 
 def _vote_predictions(labels, values, train_labels):
-    classes = torch.unique(train_labels, sorted=True)
-    # Vote count is primary; summed similarity and class index make ties stable.
-    predictions = []
-    for row_labels, row_values in zip(labels, values, strict=True):
-        scores = []
-        for label in classes:
-            mask = row_labels == label
-            scores.append((int(mask.sum()), float(row_values[mask].sum()), -int(label)))
-        winner = max(zip(scores, classes.tolist(), strict=True))[1]
-        predictions.append(winner)
-    return torch.tensor(predictions, dtype=torch.long)
+    return _vote_rankings(labels, values, train_labels, top=1)[:, 0]
+
+
+def _vote_rankings(labels, values, train_labels, top=5):
+    """Batch voting with stable count, similarity, then class-ID tie breaks."""
+    classes = torch.unique(torch.as_tensor(train_labels).cpu(), sorted=True)
+    rankings = []
+    for start in range(0, len(labels), 256):
+        row_labels, row_values = labels[start:start + 256], values[start:start + 256]
+        indices = torch.searchsorted(classes, row_labels)
+        counts = torch.zeros(len(indices), len(classes), dtype=torch.long)
+        similarities = torch.zeros(len(indices), len(classes), dtype=row_values.dtype)
+        counts.scatter_add_(1, indices, torch.ones_like(indices))
+        similarities.scatter_add_(1, indices, row_values)
+        order = similarities.argsort(dim=1, descending=True, stable=True)
+        count_order = counts.gather(1, order).argsort(dim=1, descending=True, stable=True)
+        rankings.append(classes[order.gather(1, count_order)[:, :top]])
+    return torch.cat(rankings)
 
 
 def knn_classification_metrics(
@@ -173,26 +196,11 @@ def knn_classification_metrics(
     neighbor_labels, neighbor_similarities = _cosine_neighbor_rows(
         train_features, train_labels, query_features, k
     )
-    predictions = _vote_predictions(neighbor_labels, neighbor_similarities, train_labels)
-    query_labels = torch.as_tensor(query_labels, dtype=torch.long)
+    rankings = _vote_rankings(neighbor_labels, neighbor_similarities, train_labels)
+    predictions = rankings[:, 0]
+    query_labels = torch.as_tensor(query_labels, dtype=torch.long).cpu()
     if len(predictions) != len(query_labels):
         raise ValueError("Query labels and features have different lengths")
-    classes = torch.unique(torch.as_tensor(train_labels, dtype=torch.long), sorted=True)
-    # A k-NN vote produces one class.  Report top-5 from vote/similarity ranking
-    # so top-5 remains meaningful even though top-1 uses the winning vote.
-    rankings = []
-    for row, row_sim in zip(neighbor_labels, neighbor_similarities, strict=True):
-        ranking = sorted(
-            classes.tolist(),
-            key=lambda label: (
-                int((row == label).sum()),
-                float(row_sim[row == label].sum()),
-                -int(label),
-            ),
-            reverse=True,
-        )
-        rankings.append(ranking[:5])
-    rankings = torch.as_tensor(rankings, dtype=torch.long)
     return {
         "top1": 100.0 * (predictions == query_labels).float().mean().item(),
         "top5": 100.0 * rankings.eq(query_labels[:, None]).any(dim=1).float().mean().item(),
@@ -288,7 +296,8 @@ def run_imagenet_probe(
         model, validation, batch_size, num_workers, device=device
     )
     return {
-        **knn_classification_metrics(train_features, train_labels, val_features, val_labels, k),
+        **knn_classification_metrics(train_features.to(device), train_labels,
+                                     val_features.to(device), val_labels, k),
         "dataset": "ImageNet-1K",
         "feature": "teacher final normalized CLS token",
         "input_resolution": 224,
@@ -434,7 +443,8 @@ def run_voc_dense_probe(
         model, validation, batch_size, num_workers, device=device, include_patch_labels=False
     )
     predicted = _cosine_neighbors(
-        train_features[valid_train], train_labels[valid_train], validation_features, k
+        train_features[valid_train].to(device), train_labels[valid_train],
+        validation_features.to(device), k
     )
     # Re-load validation masks only through the already transformed subset; the
     # feature extractor intentionally keeps only patch labels, so reconstruct
@@ -474,6 +484,11 @@ def run_probe_checkpoint(
     _validate_k(k)
     if type(frequency) is not int or frequency <= 0:
         raise ValueError("frequency must be a positive integer")
+    datasets_root = validate_probe_data(datasets_root)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
     started = utc_now()
     timer = time.monotonic()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -499,6 +514,7 @@ def run_probe_checkpoint(
         "finished_at": utc_now(),
         "elapsed_seconds": time.monotonic() - timer,
         "checkpoint": str(Path(checkpoint).resolve()),
+        "datasets_root": str(datasets_root),
         "model": model_metadata,
         "protocol": {
             "teacher_checkpoint_key": "teacher",
@@ -549,6 +565,7 @@ class OnlineProbeRunner:
         self.processes = []
         self.submitted_results = []
         self.completed_results = set()
+        self.process_results = {}
 
     def _reap(self):
         active = []
@@ -557,6 +574,14 @@ class OnlineProbeRunner:
                 active.append((process, log))
             else:
                 log.close()
+                entry = self.process_results.pop(process.pid, None)
+                if entry is not None:
+                    epoch, result_path = entry
+                    if not result_path.is_file():
+                        result_path.write_text(json.dumps({
+                            "status": "failed", "epoch": epoch,
+                            "error": f"Worker exited with code {process.returncode} without a result",
+                        }) + "\n", encoding="utf-8")
         self.processes = active
 
     def submit(self, epoch, checkpoint):
@@ -567,7 +592,7 @@ class OnlineProbeRunner:
             return None
         self._reap()
         maximum = self.args.online_probe_max_concurrent_jobs
-        root = Path(self.args.output_dir) / "online_probes"
+        root = Path(self.args.output_dir).resolve() / "online_probes"
         # The copy is made even when all worker slots are occupied, so every
         # scheduled epoch remains an immutable, retryable teacher snapshot.
         snapshot = immutable_checkpoint_copy(
@@ -585,7 +610,8 @@ class OnlineProbeRunner:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         command = [
             sys.executable, "-m", "evaluation.online_probes",
-            "--checkpoint", str(snapshot), "--datasets-root", str(self.args.online_probe_datasets_root),
+            "--checkpoint", str(snapshot), "--datasets-root",
+            str(Path(os.path.expandvars(str(self.args.online_probe_datasets_root))).expanduser().resolve()),
             "--output", str(result), "--arch", self.args.arch, "--seed", str(self.args.seed),
             "--imagenet-train-size", str(self.args.online_probe_imagenet_train_size),
             "--imagenet-val-size", str(self.args.online_probe_imagenet_val_size),
@@ -596,6 +622,9 @@ class OnlineProbeRunner:
             "--frequency", str(self.args.online_probe_frequency),
         ]
         environment = os.environ.copy()
+        # A probe is a single-process worker, not another torchrun rank.
+        for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
+            environment.pop(key, None)
         gpu = getattr(self.args, "online_probe_gpu", None)
         if gpu not in (None, "", "none", "None"):
             environment["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -603,17 +632,18 @@ class OnlineProbeRunner:
         process = subprocess.Popen(command, cwd=self.repository_root, env=environment, stdout=log, stderr=subprocess.STDOUT)
         self.processes.append((process, log))
         self.submitted_results.append((epoch, result))
+        self.process_results[process.pid] = (epoch, result)
         print(f"Online probes: launched epoch {epoch} from {snapshot}", flush=True)
         return {"epoch": epoch, "checkpoint": snapshot, "result": result, "pid": process.pid}
 
     def collect_completed(self):
-        """Return metrics from newly finished jobs in training-stat form.
+        """Return one record per finished probe, including failures.
 
         A job that is still running is left for the next epoch.  Failed jobs
         remain visible in their per-epoch log and do not fabricate metrics.
         """
         self._reap()
-        metrics = {}
+        records = []
         completed = getattr(self, "completed_results", set())
         for _, result_path in getattr(self, "submitted_results", []):
             if result_path in completed or not result_path.is_file():
@@ -623,11 +653,16 @@ class OnlineProbeRunner:
             except (OSError, json.JSONDecodeError):
                 continue
             if result.get("status") != "completed":
+                print(f"Online probes: FAILED epoch {result['epoch']}: {result.get('error', 'unknown error')}", flush=True)
+                records.append({"online_probe_epoch": int(result["epoch"]),
+                                "online_probe_success": 0})
                 completed.add(result_path)
                 continue
             image = result.get("imagenet_cls_knn", {})
             dense = result.get("voc_dense_knn", {})
-            metrics.update({
+            records.append({
+                "online_probe_epoch": int(result["epoch"]),
+                "online_probe_success": 1,
                 "online_imagenet_cls_knn_top1": float(image["top1"]),
                 "online_imagenet_cls_knn_top5": float(image["top5"]),
                 "online_voc_dense_knn_miou": float(dense["miou"]),
@@ -640,13 +675,14 @@ class OnlineProbeRunner:
             })
             completed.add(result_path)
         self.completed_results = completed
-        return metrics
+        return records
 
     def close(self, wait=False):
         """Reap completed jobs; optionally wait for all outstanding probes."""
         if wait:
             for process, _ in self.processes:
                 process.wait()
+        self._reap()
         for _, log in self.processes:
             log.close()
         self.processes = []

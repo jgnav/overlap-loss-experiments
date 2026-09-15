@@ -35,7 +35,7 @@ from utils.checkpoint import (
 from utils.recipe import get_ibot_recipe
 from utils.collapse_diagnostics import FeatureCollapseDiagnostics, prototype_geometry_metrics
 from utils.wandb_logging import configure_wandb, init_wandb_run
-from evaluation.online_probes import OnlineProbeRunner
+from evaluation.online_probes import OnlineProbeRunner, validate_probe_data
 
 
 def parse_args():
@@ -167,7 +167,26 @@ def init_wandb(args):
         key: str(value) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
-    return init_wandb_run(args, config, "pretraining-continuation")
+    run = init_wandb_run(args, config, "pretraining-continuation")
+    if run is not None:
+        run.define_metric("train/online_probe_epoch")
+        run.define_metric("epoch")
+        run.define_metric("train/*", step_metric="epoch")
+        # Define the narrower rule last so probe curves use checkpoint epochs.
+        run.define_metric("train/online_*", step_metric="train/online_probe_epoch")
+    return run
+
+
+def log_online_probe_records(runner, output_dir, writer, wandb_run):
+    """Log each asynchronous result at its checkpoint epoch, without merging."""
+    for record in runner.collect_completed():
+        with (Path(output_dir) / "online_probes" / "metrics.jsonl").open("a") as handle:
+            handle.write(json.dumps(record) + "\n")
+        if writer is not None:
+            for key, value in record.items():
+                writer.add_scalar(key, value, record["online_probe_epoch"])
+        if wandb_run is not None:
+            wandb_run.log({f"train/{key}": value for key, value in record.items()})
 
 
 def train_ibot(args, wandb_run=None):
@@ -453,7 +472,7 @@ def train_ibot(args, wandb_run=None):
             args,
         )
         if probe_runner is not None:
-            train_stats.update(probe_runner.collect_completed())
+            log_online_probe_records(probe_runner, args.output_dir, writer, wandb_run)
         train_stats.update(prototype_geometry_metrics(
             student, teacher_without_ddp, args.diagnostic_prototype_chunk_size
         ))
@@ -525,11 +544,11 @@ def train_ibot(args, wandb_run=None):
                             for key, value in train_stats.items()
                         },
                     },
-                    step=epoch + 1,
                 )
 
     if probe_runner is not None:
         probe_runner.close(wait=args.online_probe_wait_at_exit)
+        log_online_probe_records(probe_runner, args.output_dir, writer, wandb_run)
 
     if writer is not None:
         writer.close()
@@ -837,6 +856,8 @@ def train_one_epoch(
 def main():
     cli_args = parse_args()
     args = load_config(cli_args.config)
+    if args.online_probes_enabled:
+        args.online_probe_datasets_root = str(validate_probe_data(args.online_probe_datasets_root))
     assign_run_output_directory(args)
     output_checkpoint = Path(args.output_dir) / "checkpoint.pth"
     if (

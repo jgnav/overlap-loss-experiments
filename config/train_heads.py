@@ -7,7 +7,7 @@ output_dir: output/train
 arch: vit_small
 # Prototype-head topology: true reuses one head for CLS and patch tokens;
 # false gives CLS and patch tokens separate heads with identical architecture.
-shared_head: true
+shared_head: false
 
 # Loss and teacher
 teacher_target_cls: centering       # CLS objective: centering or sinkhorn_knopp.

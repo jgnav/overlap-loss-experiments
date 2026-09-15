@@ -61,6 +61,12 @@ resumable: the script records completed phases in
 earlier run, and continues interrupted archive extraction from files already
 written. A final validation pass still checks the complete dataset before it
 reports success.
+When resuming, unchanged archives retain their completed integrity check.
+Existing ImageNet files with matching sizes are kept without opening their ZIP
+members; missing or truncated files are extracted again. The archive index and
+existing files still need scanning, which can take time for ImageNet. A missing
+train/validation directory or either classification manifest makes its phase
+eligible to run again. Only a successful final validation sets `validated: true`.
 Kaggle ImageNet is detected automatically, including ZIPs containing a nested
 ImageNet tar. Validation images are classified using `LOC_val_solution.csv`;
 test images are skipped. No separate ImageNet devkit is needed for this format.

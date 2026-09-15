@@ -60,11 +60,13 @@ def prepare_kaggle_imagenet(archive, output, expected=(1281167, 50000, 1000)):
     """Stream images from either a flat Kaggle ZIP or its nested ImageNet tar."""
     if output.exists() and not output.is_dir():
         raise FileExistsError(f'ImageNet output is not a directory: {output}')
+    print('Reading ImageNet archive index...', flush=True)
     with zipfile.ZipFile(archive) as source:
         labels = kaggle_labels(source)
         if len(labels) != expected[1]:
             raise ValueError(f'Expected {expected[1]} validation labels, got {len(labels)}')
         output.mkdir(parents=True, exist_ok=True)
+        print('Scanning existing ImageNet images for resume...', flush=True)
         seen, classes, counts, validation_ids = _scan_kaggle_output(output, labels)
         archive_seen = set()
         if sum(counts):
@@ -126,6 +128,11 @@ def prepare_kaggle_imagenet(archive, output, expected=(1281167, 50000, 1000)):
                 target, already_present = target_info
                 if (member.external_attr >> 16) & 0o170000 == 0o120000:
                     raise ValueError(f'Image symlink rejected: {member.filename}')
+                # Check before opening the ZIP member: on a resumed ImageNet
+                # run, this avoids reading over a million existing headers.
+                if (already_present and target.is_file()
+                        and target.stat().st_size == member.file_size):
+                    continue
                 with source.open(member) as raw:
                     copy_image(raw, target, already_present, member.file_size)
         else:
@@ -147,7 +154,8 @@ def prepare_kaggle_imagenet(archive, output, expected=(1281167, 50000, 1000)):
                     with tar.extractfile(member) as image:
                         copy_image(image, target, already_present, member.size)
         if (tuple(counts) != expected[:2] or len(classes) != expected[2]
-                or validation_ids != set(labels) or set(labels.values()) != classes):
+                or validation_ids != set(labels) or set(labels.values()) != classes
+                or seen != archive_seen):
             raise ValueError(f'Incomplete/inconsistent ImageNet: train={counts[0]}, val={counts[1]}, classes={len(classes)}')
     print('Kaggle ImageNet train/val prepared; test images skipped.', flush=True)
 
@@ -182,6 +190,8 @@ def _scan_kaggle_output(output, labels):
             raise ValueError(f'Duplicate ImageNet image: {target}')
         seen.add(target)
         counts[split] += 1
+        if sum(counts) % 100000 == 0:
+            print(f'ImageNet resume scan: {counts[0]} train / {counts[1]} val found', flush=True)
     for image_id in validation_ids:
         classes.add(labels[image_id])
     return seen, classes, counts, validation_ids
@@ -234,10 +244,10 @@ def extract_zip(archive, destination, prefixes=()):
                     raise ValueError(f'Archive symlink is not supported: {member.filename}')
                 target.mkdir(parents=True, exist_ok=True)
                 continue
+            if (target.is_file() and target.stat().st_size == member.file_size
+                    and not target.is_symlink()):
+                continue
             with source.open(member) as stream:
-                if (target.is_file() and target.stat().st_size == member.file_size
-                        and not target.is_symlink()):
-                    continue
                 _copy_stream(stream, target)
 
 
@@ -354,6 +364,11 @@ def _run_phase(name, state, state_path, output, paths, action):
         print(f'Skipping completed phase: {name}', flush=True)
         return
     print(f'Running phase: {name}', flush=True)
+    # Persist the incomplete state before work, including when a previously
+    # completed phase needs repair because an output disappeared.
+    completed[name] = False
+    state.pop('validated', None)
+    _save_state(state_path, state)
     action()
     completed[name] = True
     _save_state(state_path, state)
@@ -387,6 +402,7 @@ def prepare(archive_dir, output):
     completed = [name for name, done in state.get('completed', {}).items() if done]
     if completed:
         print(f'Completed phases from state: {", ".join(completed)}', flush=True)
+    state.pop('validated', None)
     _save_state(state_path, state)
 
     def verify_archives():
@@ -446,11 +462,13 @@ def prepare(archive_dir, output):
             for split in ('train', 'val'):
                 ImageNet(str(imagenet), split=split)
 
-    _run_phase('imagenet', state, state_path, output, ('imagenet',), prepare_imagenet)
+    _run_phase('imagenet', state, state_path, output,
+               ('imagenet/train', 'imagenet/val'), prepare_imagenet)
 
     print('Generating manifests and validating data...', flush=True)
     _run_phase(
-        'manifests', state, state_path, output, ('evaluation_manifests',),
+        'manifests', state, state_path, output,
+        ('evaluation_manifests/pascal_voc.json', 'evaluation_manifests/coco.json'),
         lambda: (prepare_voc2012_manifest(output), prepare_coco2017_manifest(output)))
     validate(output)
     state['validated'] = True

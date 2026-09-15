@@ -20,7 +20,8 @@ import torchvision
 print("torch:", torch.__version__)
 print("torchvision:", torchvision.__version__)
 print("CUDA runtime:", torch.version.cuda)
-arch_list = torch.cuda.get_arch_list()
+arch_flags = torch._C._cuda_getArchFlags() or ""
+arch_list = arch_flags.split()
 print("compiled CUDA architectures:", arch_list)
 
 if "sm_120" not in arch_list:

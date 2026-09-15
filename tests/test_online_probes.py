@@ -11,6 +11,9 @@ from evaluation.online_probes import (
     OnlineProbeRunner,
     _dense_pixel_metrics,
     _patch_labels,
+    _vote_rankings,
+    _extract_image_features,
+    validate_probe_data,
     immutable_checkpoint_copy,
     knn_classification_metrics,
     probe_due,
@@ -35,6 +38,18 @@ class SelectionTest(unittest.TestCase):
 
 
 class KNNTest(unittest.TestCase):
+    def test_batched_votes_match_reference_with_ties(self):
+        generator = torch.Generator().manual_seed(9)
+        labels = torch.randint(0, 7, (300, 20), generator=generator) * 2
+        values = torch.randint(-2, 3, labels.shape, generator=generator).float()
+        classes = torch.arange(7) * 2
+        expected = []
+        for row, similarities in zip(labels, values):
+            expected.append(sorted(classes.tolist(), key=lambda label: (
+                int((row == label).sum()), float(similarities[row == label].sum()), -label
+            ), reverse=True)[:5])
+        self.assertEqual(_vote_rankings(labels, values, classes).tolist(), expected)
+
     def test_cosine_knn_reports_top1_and_top5_without_pairwise_bank_matrix(self):
         train = torch.eye(6)
         labels = torch.arange(6)
@@ -105,10 +120,40 @@ class RunnerTest(unittest.TestCase):
             log = mock.Mock()
             runner.processes = [(process, log)]
             runner.submitted_results = [(10, result_path)]
-            values = runner.collect_completed()
+            values, = runner.collect_completed()
             self.assertEqual(values["online_imagenet_cls_knn_top1"], 1.0)
             self.assertEqual(values["online_voc_dense_knn_miou_percent"], 30.0)
             log.close.assert_called_once()
+            self.assertEqual(runner.collect_completed(), [])
+
+    def test_multiple_results_and_failures_are_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = OnlineProbeRunner(self._args(root), repository_root=root)
+            for epoch in (10, 20):
+                path = root / f"epoch{epoch}.json"
+                path.write_text(json.dumps({"status": "failed", "epoch": epoch,
+                                            "error": "missing validation data"}))
+                runner.submitted_results.append((epoch, path))
+            self.assertEqual(runner.collect_completed(), [
+                {"online_probe_epoch": 10, "online_probe_success": 0},
+                {"online_probe_epoch": 20, "online_probe_success": 0},
+            ])
+            self.assertEqual(runner.collect_completed(), [])
+
+    def test_dead_worker_without_json_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = OnlineProbeRunner(self._args(root), repository_root=root)
+            process = mock.Mock(pid=12, returncode=-9)
+            process.poll.return_value = -9
+            path = root / "epoch0010.json"
+            runner.processes = [(process, mock.Mock())]
+            runner.process_results[12] = (10, path)
+            runner.submitted_results = [(10, path)]
+            record, = runner.collect_completed()
+            self.assertEqual(record["online_probe_success"], 0)
+            self.assertIn("-9", json.loads(path.read_text())["error"])
 
     def test_submit_skips_non_due_epochs_and_launches_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -125,7 +170,45 @@ class RunnerTest(unittest.TestCase):
             self.assertTrue(submitted["checkpoint"].name == "teacher_epoch0010.pth")
             launch.assert_called_once()
             self.assertIn("evaluation.online_probes", launch.call_args.args[0])
+            command = launch.call_args.args[0]
+            for option in ("--checkpoint", "--datasets-root", "--output"):
+                self.assertTrue(Path(command[command.index(option) + 1]).is_absolute())
             runner.close()
+
+
+class FeatureAndPathTest(unittest.TestCase):
+    def test_final_cls_token_and_deterministic_extraction(self):
+        model = mock.Mock()
+        model.get_intermediate_layers.return_value = [torch.tensor([
+            [[1., 2.], [3., 4.]], [[5., 6.], [7., 8.]]
+        ])]
+        dataset = torch.utils.data.TensorDataset(torch.zeros(2, 3, 224, 224), torch.tensor([0, 1]))
+        features, labels = _extract_image_features(model, dataset, 2, 0, device=torch.device("cpu"))
+        self.assertEqual(features.tolist(), [[1., 2.], [5., 6.]])
+        self.assertEqual(labels.tolist(), [0, 1])
+        self.assertEqual(model.get_intermediate_layers.call_args.kwargs, {"n": 1})
+
+    def test_missing_validation_fails_before_model_loading(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "imagenet" / "train").mkdir(parents=True)
+            with self.assertRaisesRegex(FileNotFoundError, "train/ and val/"):
+                validate_probe_data(directory)
+
+    def test_logging_uses_checkpoint_epoch_and_keeps_all_records(self):
+        from train import log_online_probe_records
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "online_probes").mkdir()
+            runner, writer, wandb = mock.Mock(), mock.Mock(), mock.Mock()
+            runner.collect_completed.return_value = [
+                {"online_probe_epoch": 10, "online_probe_success": 1},
+                {"online_probe_epoch": 20, "online_probe_success": 0},
+            ]
+            log_online_probe_records(runner, directory, writer, wandb)
+            self.assertEqual(wandb.log.call_count, 2)
+            self.assertEqual(wandb.log.call_args.args[0]["train/online_probe_epoch"], 20)
+            writer.add_scalar.assert_any_call("online_probe_success", 1, 10)
+            records = (Path(directory) / "online_probes" / "metrics.jsonl").read_text().splitlines()
+            self.assertEqual(len(records), 2)
 
 
 if __name__ == "__main__":

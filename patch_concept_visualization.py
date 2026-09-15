@@ -40,22 +40,20 @@ from losses.sinkhorn import sinkhorn_knopp  # noqa: E402
 from model import iBOTHead  # noqa: E402
 
 
-IMAGENET_VAL = REPO_ROOT / "dataset" / "imagenet" / "val"
+IMAGENET_VAL = "/mnt/fast/nobackup/scratch4weeks/jg02228/datasets"
 OUTPUT_DIR = REPO_ROOT / "output" / "patch_concept_visualizations"
 
 CHECKPOINT_1 = REPO_ROOT / "checkpoints" / "ibot_vit_small.pth"
 CHECKPOINT_2 = (
     REPO_ROOT
-    / "output"
-    / "train"
-    / "20260909T184813Z-slurm-1312600"
-    / "checkpoint_1312600_epoch74.pth"
+    / "checkpoints"
+    / "checkpoint_source1000_continuation0200.pth"
 )
 CHECKPOINT_1_NAME = "Official iBOT"
 CHECKPOINT_2_NAME = "Overlap"
 
 CHECKPOINT_KEY = "teacher"
-NUM_IMAGES = 20
+NUM_IMAGES = 5
 SEED = 0
 TOP_K_CONCEPTS = 5
 KMEANS_CLUSTERS = 2
@@ -126,7 +124,7 @@ def _check_inputs() -> None:
         raise ValueError("TOP_K_CONCEPTS must be positive")
     if KMEANS_CLUSTERS != 2:
         raise ValueError("This visualization requires exactly two k-means clusters")
-    if not IMAGENET_VAL.is_dir():
+    if not Path(IMAGENET_VAL).is_dir():
         raise FileNotFoundError(
             f"ImageNet validation directory not found: {IMAGENET_VAL}"
         )
@@ -177,8 +175,8 @@ def _prepare_selected_images(
         manifest.append(
             f"{sample_number}\t{index}\t{class_index}\t{class_name}\t{path}"
         )
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUTPUT_DIR / "selected_images.tsv").write_text(
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    (Path(OUTPUT_DIR) / "selected_images.tsv").write_text(
         "\n".join(manifest) + "\n", encoding="utf-8"
     )
     return images, records
@@ -341,7 +339,7 @@ def _load_teacher(checkpoint_path: Path) -> TeacherModel:
                 "Centering teacher patch probabilities requires ibot_loss.center2"
             )
         center = ibot_loss["center2"].detach().float()
-        if center.shape[-1] != concepts:
+        if center.ndim == 0 or center.shape[-1] != concepts or center.numel() != concepts:
             raise ValueError(
                 "Checkpoint center2 dimension does not match patch head: "
                 f"center2={tuple(center.shape)}, concepts={concepts}"
@@ -426,8 +424,11 @@ def _extract_result(model: TeacherModel, image: Image.Image) -> ImageResult:
     object_cluster = _select_object_cluster(labels, grid_height, grid_width)
 
     if model.patch_target_mode == "centering":
+        # Training stores center2 as [1, 1, K], while visualization logits are
+        # [patches, K]. Drop singleton axes to avoid creating [1, patches, K].
+        center = model.patch_center.reshape(model.concepts)
         probabilities = F.softmax(
-            (patch_logits.to(DEVICE) - model.patch_center) / model.patch_temperature,
+            (patch_logits.to(DEVICE) - center) / model.patch_temperature,
             dim=-1,
         ).float().cpu()
     else:
@@ -568,7 +569,7 @@ def _save_comparison(
         character if character.isalnum() or character in "_-" else "_"
         for character in record["class_name"]
     )
-    path = OUTPUT_DIR / f"{sample_number:04d}_{safe_class}.png"
+    path = Path(OUTPUT_DIR) / f"{sample_number:04d}_{safe_class}.png"
     figure.savefig(path, dpi=IMAGE_DPI, facecolor="white")
     plt.close(figure)
     return path
@@ -577,7 +578,7 @@ def _save_comparison(
 def main() -> None:
     _check_inputs()
     _set_deterministic_seed()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
     dataset, indices = _sample_images()
     images, records = _prepare_selected_images(dataset, indices)
 

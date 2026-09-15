@@ -1,14 +1,13 @@
 #!/bin/bash
 
 #SBATCH --job-name=train
-#SBATCH --partition=rtx_pro6000_risk
+#SBATCH --partition=3090_risk,a100,rtx_pro6000_risk
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=6
 #SBATCH --ntasks=1
-#SBATCH --constraint=fs_weka
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=512G
-#SBATCH --time=72:00:00
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=128G
+#SBATCH --time=30:00:00
 #SBATCH --output=output/train_%j.out
 #SBATCH --error=output/train_%j.err
 
@@ -27,4 +26,4 @@ nvidia-smi
 ./.conda-env/bin/torchrun \
     --standalone \
     --nproc_per_node=6 \
-    train.py config/train.yaml
+    train.py config/train_reference.yaml
