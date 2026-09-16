@@ -3,7 +3,7 @@
 #SBATCH --job-name=train
 #SBATCH --partition=3090_risk,a100,rtx_pro6000_risk
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=6
+#SBATCH --gpus-per-node=8
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=128G
@@ -16,8 +16,8 @@ set -e
 
 cd "$SLURM_SUBMIT_DIR"
 
-export OMP_NUM_THREADS=6
-export MKL_NUM_THREADS=6
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
 
 echo "Node: $(hostname)"
 echo "GPUs:"
@@ -25,5 +25,5 @@ nvidia-smi
 
 ./.conda-env/bin/torchrun \
     --standalone \
-    --nproc_per_node=6 \
-    train.py config/train_heads.yaml
+    --nproc_per_node=8 \
+    train.py config/train.yaml

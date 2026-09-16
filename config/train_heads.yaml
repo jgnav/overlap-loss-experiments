@@ -2,6 +2,9 @@
 data_path: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets/imagenet/train
 initial_checkpoint: checkpoints/ibot_vit_small.pth
 output_dir: output/train
+# Start a new continuation for the region-composition objective.
+# Set this to a checkpoint from this objective only to resume an interrupted run.
+resume_checkpoint: null
 
 # Model
 arch: vit_small
@@ -12,7 +15,7 @@ shared_head: false
 # Loss and teacher
 lambda1: 1.0  # Global CLS loss
 lambda2: 1.0  # Masked patch loss
-lambda3: 0.1  # Region composition weight; set to 0.0 for pure iBOT.
+lambda3: 1.0  # Region composition weight; set to 0.0 for pure iBOT.
 
 # Minimum two-view intersection as a fraction of the original image area.
 region_min_area: 0.10
@@ -26,7 +29,7 @@ teacher_patch_temp: 0.07  # Centered teacher targets for ordinary iBOT.
 
 # Training
 additional_epochs: 200
-gpu_count: 6
+gpu_count: 8
 batch_size_per_gpu: 64
 seed: 0
 precision: bf16
@@ -58,7 +61,7 @@ diagnostic_prototype_chunk_size: 256
 # launch a bounded local worker. A null GPU shares the first visible training GPU.
 # A GPU ID selects an already allocated local GPU; it does not submit a Slurm job.
 online_probes_enabled: true
-online_probe_frequency: 10
+online_probe_frequency: 5
 online_probe_datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
 online_probe_imagenet_train_size: 10000
 online_probe_imagenet_val_size: 5000
@@ -76,5 +79,5 @@ wandb_mode: online  # online, offline, or disabled; online reads .wandb_key at r
 wandb_project: ibot-imagenet1k
 wandb_entity: null
 wandb_run_name: null
-wandb_run_id: null
-wandb_resume: null  # null, allow, must, never; requires wandb_run_id when set
+wandb_run_id: ijypap1p
+wandb_resume: must

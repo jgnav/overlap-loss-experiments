@@ -15,7 +15,7 @@ shared_head: true
 # Loss and teacher
 lambda1: 1.0  # Global CLS loss
 lambda2: 1.0  # Masked patch loss
-lambda3: 0.1  # Region composition weight; set to 0.0 for pure iBOT.
+lambda3: 1.0  # Region composition weight; set to 0.0 for pure iBOT.
 
 # Minimum two-view intersection as a fraction of the original image area.
 region_min_area: 0.10
@@ -29,7 +29,7 @@ teacher_patch_temp: 0.07  # Centered teacher targets for ordinary iBOT.
 
 # Training
 additional_epochs: 200
-gpu_count: 6
+gpu_count: 8
 batch_size_per_gpu: 64
 seed: 0
 precision: bf16
@@ -61,7 +61,7 @@ diagnostic_prototype_chunk_size: 256
 # launch a bounded local worker. A null GPU shares the first visible training GPU.
 # A GPU ID selects an already allocated local GPU; it does not submit a Slurm job.
 online_probes_enabled: true
-online_probe_frequency: 10
+online_probe_frequency: 5
 online_probe_datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
 online_probe_imagenet_train_size: 10000
 online_probe_imagenet_val_size: 5000
