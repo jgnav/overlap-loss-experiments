@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import torch
 import torch.nn as nn
 
@@ -144,7 +146,9 @@ class iBOTHead(DINOHead):
     def prototype_layers(self):
         """Final learned prototype layers, naming a shared layer only as patch."""
         patch = self.last_layer2 if self.last_layer2 is not None else self.mlp2
-        cls = self.last_layer if self.last_layer is not None else self.mlp[-1]
+        cls = self.last_layer if self.last_layer is not None else (
+            self.mlp[-1] if isinstance(self.mlp, nn.Sequential) else self.mlp
+        )
         layers = {"patch": patch}
         if cls is not patch:
             layers["cls"] = cls
@@ -166,7 +170,12 @@ class iBOTHead(DINOHead):
             **kwargs,
         )
 
+        self.shared_head = shared_head
         if not shared_head:
+            # Duplicate the complete projection path, not only its prototypes.
+            self.patch_mlp = deepcopy(self.mlp if bottleneck_dim > 0 else (
+                self.mlp[:-1] if isinstance(self.mlp, nn.Sequential) else nn.Identity()
+            ))
             if bottleneck_dim > 0:
                 self.last_layer2 = nn.utils.weight_norm(
                     nn.Linear(bottleneck_dim, patch_out_dim, bias=False)
@@ -175,7 +184,8 @@ class iBOTHead(DINOHead):
                 if norm_last_layer:
                     self.last_layer2.weight_g.requires_grad = False
             else:
-                self.mlp2 = nn.Linear(hidden_dim, patch_out_dim)
+                cls_projection = self.mlp[-1] if isinstance(self.mlp, nn.Sequential) else self.mlp
+                self.mlp2 = nn.Linear(cls_projection.in_features, patch_out_dim)
                 self.last_layer2 = None
             self.last_norm2 = self._build_norm(
                 last_norm, patch_out_dim, affine=False, **kwargs
@@ -184,7 +194,7 @@ class iBOTHead(DINOHead):
             if bottleneck_dim > 0:
                 self.last_layer2 = self.last_layer
             else:
-                self.mlp2 = self.mlp[-1]
+                self.mlp2 = self.mlp[-1] if isinstance(self.mlp, nn.Sequential) else self.mlp
                 self.last_layer2 = None
             self.last_norm2 = self.last_norm
 
@@ -193,14 +203,23 @@ class iBOTHead(DINOHead):
             return super(iBOTHead, self).forward(x)
 
         if self.last_layer is not None:
-            x = self.mlp(x)
-            x = nn.functional.normalize(x, dim=-1, p=2)
-            x1 = self.last_layer(x[:, 0])
-            x2 = self.last_layer2(x[:, 1:])
+            if self.shared_head:
+                x = nn.functional.normalize(self.mlp(x), dim=-1, p=2)
+                x1 = self.last_layer(x[:, 0])
+                x2 = self.last_layer2(x[:, 1:])
+            else:
+                x1 = self.last_layer(nn.functional.normalize(self.mlp(x[:, 0]), dim=-1, p=2))
+                x2 = self.last_layer2(nn.functional.normalize(self.patch_mlp(x[:, 1:]), dim=-1, p=2))
         else:
-            x = self.mlp[:-1](x)
-            x1 = self.mlp[-1](x[:, 0])
-            x2 = self.mlp2(x[:, 1:])
+            trunk = self.mlp[:-1] if isinstance(self.mlp, nn.Sequential) else nn.Identity()
+            projection = self.mlp[-1] if isinstance(self.mlp, nn.Sequential) else self.mlp
+            if self.shared_head:
+                x = trunk(x)
+                x1 = projection(x[:, 0])
+                x2 = self.mlp2(x[:, 1:])
+            else:
+                x1 = projection(trunk(x[:, 0]))
+                x2 = self.mlp2(self.patch_mlp(x[:, 1:]))
 
         if self.last_norm is not None:
             x1 = self.last_norm(x1)

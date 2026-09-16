@@ -2,6 +2,9 @@
 data_path: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets/imagenet/train
 initial_checkpoint: checkpoints/ibot_vit_small.pth
 output_dir: output/train
+# Resume the interrupted continuation in output/train/55493.  train.sh pins
+# IBOT_RUN_ID to 55493 so Slurm requeues reuse this directory.
+resume_checkpoint: output/train/55493/checkpoint.pth
 
 # Model
 arch: vit_small
@@ -75,5 +78,5 @@ wandb_mode: online  # online, offline, or disabled; online reads .wandb_key at r
 wandb_project: ibot-imagenet1k
 wandb_entity: null
 wandb_run_name: null
-wandb_run_id: null
-wandb_resume: null  # null, allow, must, never; requires wandb_run_id when set
+wandb_run_id: ijypap1p
+wandb_resume: must

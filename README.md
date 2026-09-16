@@ -94,5 +94,17 @@ wget -c -O checkpoints/ibot_vit_large.pth \
 
 In `train.yaml`, set `data_path` to `<prepared-data-path>/imagenet/train` and
 `initial_checkpoint: checkpoints/ibot_vit_small.pth`.
+
+`shared_head: true` uses one projection MLP and prototype layer for CLS and
+patch tokens. With `shared_head: false`, both paths are independent. Loading
+a shared-head iBOT checkpoint copies its complete head into both paths for
+the student and teacher, and duplicates Adam moments into independent state.
+The output dimensions must match the pretrained head to copy its weights.
+Existing separate-head checkpoints retain their distinct prototype weights;
+older checkpoints with a shared MLP initialize both MLPs from that saved MLP.
+Teacher logits then use the independently configured `teacher_target_cls`,
+`teacher_target_ibot`, and `teacher_target_overlap` normalization before their
+respective losses. Student logits use temperature-scaled log-softmax.
+
 In `evaluation.yaml`, set `datasets_root` to the prepared-data path, select your `checkpoint`,
 and keep `output_dir: null` for separate results per launch.

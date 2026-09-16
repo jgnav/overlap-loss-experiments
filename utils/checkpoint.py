@@ -1,4 +1,5 @@
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -221,6 +222,70 @@ def read_resume_checkpoint(args):
     return checkpoint
 
 
+def _source_parameter_name(name, source_state):
+    if name in source_state:
+        return name
+    parts = name.split(".")
+    replacements = {"patch_mlp": "mlp", "last_layer2": "last_layer", "last_norm2": "last_norm"}
+    candidate = ".".join(replacements.get(part, part) for part in parts)
+    return candidate if candidate in source_state else name
+
+
+def _load_optimizer_with_head_copies(checkpoint, student, optimizer):
+    """Expand iBOT's deduplicated shared-head Adam state by parameter name.
+
+    Legacy iBOT checkpoints omit optimizer parameter names. Their parameter
+    order is the model state order, filtered into decay/no-decay groups. Shared
+    modules appear twice in model state, but only once in optimizer groups.
+    """
+    saved = checkpoint["optimizer"]
+    current = optimizer.state_dict()
+    if [len(g["params"]) for g in saved["param_groups"]] == [
+        len(g["params"]) for g in current["param_groups"]
+    ]:
+        optimizer.load_state_dict(saved)
+        return
+
+    source = checkpoint["student"]
+    canonical = {}
+    storage_names = {}
+    for name, tensor in source.items():
+        identity = (tensor.untyped_storage().data_ptr(), tensor.storage_offset(),
+                    tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+        canonical[name] = storage_names.setdefault(identity, name)
+    parameter_names = {id(parameter): name for name, parameter in student.named_parameters()}
+    if len(saved["param_groups"]) != len(current["param_groups"]):
+        raise ValueError("Cannot expand shared-head optimizer: parameter group count differs")
+    expanded = {"state": {}, "param_groups": []}
+    for source_group, target_group, live_group in zip(
+        saved["param_groups"], current["param_groups"], optimizer.param_groups
+    ):
+        names = [parameter_names[id(p)] for p in live_group["params"]]
+        mapped = [canonical.get(_source_parameter_name(name, source)) for name in names]
+        if None in mapped:
+            raise ValueError("Cannot expand shared-head optimizer: missing source parameter")
+        mapped_names = set(mapped)
+        source_names = [name for name in source if name in mapped_names and canonical[name] == name]
+        if len(source_names) != len(source_group["params"]):
+            raise ValueError("Cannot expand shared-head optimizer: unrecognized parameter layout")
+        source_ids = dict(zip(source_names, source_group["params"]))
+        group = {**source_group, "params": target_group["params"]}
+        if "param_names" in group:
+            group["param_names"] = names
+        expanded["param_groups"].append(group)
+        for name, source_name, target_id, parameter in zip(names, mapped, target_group["params"], live_group["params"]):
+            if source[source_name].shape != parameter.shape:
+                raise ValueError(f"Cannot copy optimizer state for {name}: shape mismatch")
+            state = saved["state"].get(source_ids[source_name])
+            if state is not None:
+                for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                    if key in state and state[key].shape != parameter.shape:
+                        raise ValueError(f"Cannot copy optimizer {key} for {name}: shape mismatch")
+                # Copies must not share moment tensors, including on CPU.
+                expanded["state"][target_id] = deepcopy(state)
+    optimizer.load_state_dict(expanded)
+
+
 def load_pretrained_state(
     checkpoint,
     student,
@@ -234,7 +299,13 @@ def load_pretrained_state(
         "teacher": teacher,
     }
     for key, value in objects.items():
-        incompatible = value.load_state_dict(checkpoint[key], strict=False)
+        source = checkpoint[key]
+        state = dict(source)
+        for name in value.state_dict():
+            source_name = _source_parameter_name(name, source)
+            if name not in state and source_name in source:
+                state[name] = source[source_name].clone()
+        incompatible = value.load_state_dict(state, strict=False)
         if incompatible.missing_keys or incompatible.unexpected_keys:
             raise ValueError(
                 f"Checkpoint key '{key}' is incompatible: "
@@ -285,7 +356,7 @@ def load_resume_state(
         ibot_loss,
         restore_centers=restore_centers,
     )
-    optimizer.load_state_dict(checkpoint["optimizer"])
+    _load_optimizer_with_head_copies(checkpoint, student, optimizer)
     if fp16_scaler is not None:
         fp16_scaler.load_state_dict(checkpoint["fp16_scaler"])
     return checkpoint["epoch"]
@@ -317,7 +388,7 @@ def load_continuation_state(
     )
     optimizer_restored = "optimizer" in checkpoint
     if optimizer_restored:
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        _load_optimizer_with_head_copies(checkpoint, student, optimizer)
     if fp16_scaler is not None:
         if "fp16_scaler" not in checkpoint:
             raise ValueError(
