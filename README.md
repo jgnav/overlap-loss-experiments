@@ -102,9 +102,27 @@ the student and teacher, and duplicates Adam moments into independent state.
 The output dimensions must match the pretrained head to copy its weights.
 Existing separate-head checkpoints retain their distinct prototype weights;
 older checkpoints with a shared MLP initialize both MLPs from that saved MLP.
-Teacher logits then use the independently configured `teacher_target_cls`,
-`teacher_target_ibot`, and `teacher_target_overlap` normalization before their
-respective losses. Student logits use temperature-scaled log-softmax.
+The global DINO and masked iBOT objectives always use teacher center + softmax,
+with separate CLS and patch centers restored from checkpoints. Their student
+outputs use the original temperature-scaled log-softmax. There is no teacher
+normalization selector.
+
+The additional region-composition branch uses **raw, uncentered patch-head
+logits** from the same two global views (including the existing masked student
+forward). Crop geometry and horizontal flips map their shared region to each
+patch grid. Patches participate when their covered fraction is at least
+`region_patch_threshold` (default `0.5`); every selected patch has equal weight.
+Each patch receives softmax at the shared teacher/student `region_temp`
+(default `0.1`), then selected distributions are averaged. The region loss is
+symmetric cross-entropy: teacher A → student B and teacher B → student A,
+with the teacher detached. It uses neither centering nor Sinkhorn.
+
+`lambda3` weights this additional loss (default `0.1` in experiment YAMLs);
+`lambda3: 0.0` disables the branch for the unchanged iBOT baseline.
+`region_min_area` keeps the existing minimum intersection-area filter.
+Pairs with no selected patches in either view are skipped. Use a new
+continuation run for this changed objective: `resume_checkpoint: null`, with
+`initial_checkpoint` pointing to the desired full teacher/student checkpoint.
 
 In `evaluation.yaml`, set `datasets_root` to the prepared-data path, select your `checkpoint`,
 and keep `output_dir: null` for separate results per launch.

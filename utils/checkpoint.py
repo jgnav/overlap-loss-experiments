@@ -27,9 +27,6 @@ RESUME_COMPATIBILITY_KEYS = (
     "local_crop_size",
     "local_crops_scale",
     "student_temp",
-    "teacher_target_cls",
-    "teacher_target_ibot",
-    "teacher_target_overlap",
     "center_momentum",
     "center_momentum2",
     "warmup_teacher_temp",
@@ -41,6 +38,8 @@ RESUME_COMPATIBILITY_KEYS = (
     "lambda2",
     "lambda3",
     "region_min_area",
+    "region_patch_threshold",
+    "region_temp",
     "momentum_teacher",
     "epochs",
     "batch_size_per_gpu",
@@ -66,24 +65,6 @@ RESUME_TOPOLOGY_KEYS = {
     "world_size",
 }
 
-TARGET_MODE_KEYS = (
-    "teacher_target_cls",
-    "teacher_target_ibot",
-    "teacher_target_overlap",
-)
-
-
-def centers_required(args):
-    """Return whether the configured teacher targets use centering."""
-    modes = [getattr(args, key, None) for key in TARGET_MODE_KEYS[:2]]
-    if getattr(args, "lambda3", 1) != 0:
-        modes.append(getattr(args, TARGET_MODE_KEYS[2], None))
-    # Missing mode values are treated conservatively because their corresponding
-    # objective may use a center buffer.
-    return any(mode is None for mode in modes) or any(
-        mode == "centering" for mode in modes
-    )
-
 
 def _read_checkpoint(path):
     path = Path(path)
@@ -108,15 +89,14 @@ def read_pretrained_checkpoint(args):
         )
     if not isinstance(checkpoint["ibot_loss"], Mapping):
         raise ValueError("The checkpoint key 'ibot_loss' must be a mapping")
-    if centers_required(args):
-        missing_centers = sorted(
-            {"center", "center2"} - set(checkpoint["ibot_loss"])
+    missing_centers = sorted(
+        {"center", "center2"} - set(checkpoint["ibot_loss"])
+    )
+    if missing_centers:
+        raise ValueError(
+            "The iBOT loss state is missing pretrained centers: "
+            f"{missing_centers}"
         )
-        if missing_centers:
-            raise ValueError(
-                "The iBOT loss state is missing pretrained centers: "
-                f"{missing_centers}"
-            )
     if "epoch" in checkpoint and not isinstance(checkpoint["epoch"], int):
         raise ValueError("The checkpoint epoch must be an integer")
     if "optimizer" in checkpoint and not isinstance(checkpoint["optimizer"], Mapping):
@@ -161,6 +141,16 @@ def _validate_resume_compatibility(checkpoint, args):
         and configured_effective_batch_size is not None
         and saved_effective_batch_size == configured_effective_batch_size
     )
+
+    # A changed region objective must start a new continuation, not silently
+    # resume an old area-weighted/Sinkhorn run under different semantics.
+    if getattr(args, "lambda3", 0) != 0 and hasattr(args, "region_temp"):
+        for key in ("region_temp", "region_patch_threshold"):
+            if _checkpoint_argument(checkpoint, key) is None:
+                raise ValueError(
+                    "Resume checkpoint predates the region-composition objective; "
+                    "use it as initial_checkpoint with resume_checkpoint: null"
+                )
 
     mismatches = []
     for key in RESUME_COMPATIBILITY_KEYS:
@@ -291,8 +281,6 @@ def load_pretrained_state(
     student,
     teacher,
     ibot_loss,
-    *,
-    restore_centers=True,
 ):
     objects = {
         "student": student,
@@ -313,30 +301,29 @@ def load_pretrained_state(
                 f"unexpected={incompatible.unexpected_keys}"
             )
 
-    if restore_centers:
-        missing_centers = sorted(
-            {"center", "center2"} - set(checkpoint["ibot_loss"])
+    missing_centers = sorted(
+        {"center", "center2"} - set(checkpoint["ibot_loss"])
+    )
+    if missing_centers:
+        raise ValueError(
+            "Checkpoint iBOT centers are incompatible: "
+            f"missing={missing_centers}"
         )
-        if missing_centers:
-            raise ValueError(
-                "Checkpoint iBOT centers are incompatible: "
-                f"missing={missing_centers}"
-            )
-        center_state = {
-            key: checkpoint["ibot_loss"][key] for key in ("center", "center2")
-        }
-        incompatible = ibot_loss.load_state_dict(center_state, strict=False)
-        missing = [
-            key
-            for key in incompatible.missing_keys
-            if key in {"center", "center2"}
-        ]
-        if missing or incompatible.unexpected_keys:
-            raise ValueError(
-                "Checkpoint iBOT centers are incompatible: "
-                f"missing={missing}, "
-                f"unexpected={incompatible.unexpected_keys}"
-            )
+    center_state = {
+        key: checkpoint["ibot_loss"][key] for key in ("center", "center2")
+    }
+    incompatible = ibot_loss.load_state_dict(center_state, strict=False)
+    missing = [
+        key
+        for key in incompatible.missing_keys
+        if key in {"center", "center2"}
+    ]
+    if missing or incompatible.unexpected_keys:
+        raise ValueError(
+            "Checkpoint iBOT centers are incompatible: "
+            f"missing={missing}, "
+            f"unexpected={incompatible.unexpected_keys}"
+        )
 
 
 def load_resume_state(
@@ -346,15 +333,12 @@ def load_resume_state(
     ibot_loss,
     optimizer,
     fp16_scaler,
-    *,
-    restore_centers=True,
 ):
     load_pretrained_state(
         checkpoint,
         student,
         teacher,
         ibot_loss,
-        restore_centers=restore_centers,
     )
     _load_optimizer_with_head_copies(checkpoint, student, optimizer)
     if fp16_scaler is not None:
@@ -369,14 +353,12 @@ def load_continuation_state(
     ibot_loss,
     optimizer,
     fp16_scaler=None,
-    *,
-    restore_centers=True,
 ):
     """Load an external source checkpoint for additional training.
 
     Unlike an exact resume, continuation starts at continuation epoch zero.
     Model, teacher, and Adam moments are restored when available. Center
-    buffers are restored when a configured objective uses centering. A source
+    buffers are always restored for the DINO and iBOT objectives. A source
     FP16 scaler is deliberately irrelevant to BF16/FP32 continuation.
     """
     load_pretrained_state(
@@ -384,7 +366,6 @@ def load_continuation_state(
         student,
         teacher,
         ibot_loss,
-        restore_centers=restore_centers,
     )
     optimizer_restored = "optimizer" in checkpoint
     if optimizer_restored:

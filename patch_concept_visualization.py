@@ -36,7 +36,6 @@ REPO_ROOT = SCRIPT_PATH.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from evaluation.utils.common import load_backbone  # noqa: E402
-from losses.sinkhorn import sinkhorn_knopp  # noqa: E402
 from model import iBOTHead  # noqa: E402
 
 
@@ -90,9 +89,8 @@ class TeacherModel:
     backbone: torch.nn.Module
     head: iBOTHead
     metadata: dict
-    patch_target_mode: str
     patch_temperature: float
-    patch_center: torch.Tensor | None
+    patch_center: torch.Tensor
     concepts: int
 
 
@@ -325,25 +323,20 @@ def _load_teacher(checkpoint_path: Path) -> TeacherModel:
         backbone, checkpoint, _teacher_head_state(raw_state)
     )
 
-    mode = _checkpoint_argument(checkpoint, "teacher_target_ibot", "centering")
-    if mode not in ("centering", "sinkhorn_knopp"):
-        raise ValueError(f"Unsupported teacher_target_ibot mode: {mode!r}")
     temperature = float(
         _checkpoint_argument(checkpoint, "teacher_patch_temp", 0.07)
     )
-    center = None
     ibot_loss = checkpoint.get("ibot_loss") if isinstance(checkpoint, Mapping) else None
-    if mode == "centering":
-        if not isinstance(ibot_loss, Mapping) or "center2" not in ibot_loss:
-            raise ValueError(
-                "Centering teacher patch probabilities requires ibot_loss.center2"
-            )
-        center = ibot_loss["center2"].detach().float()
-        if center.ndim == 0 or center.shape[-1] != concepts or center.numel() != concepts:
-            raise ValueError(
-                "Checkpoint center2 dimension does not match patch head: "
-                f"center2={tuple(center.shape)}, concepts={concepts}"
-            )
+    if not isinstance(ibot_loss, Mapping) or "center2" not in ibot_loss:
+        raise ValueError(
+            "Centering teacher patch probabilities requires ibot_loss.center2"
+        )
+    center = ibot_loss["center2"].detach().float()
+    if center.ndim == 0 or center.shape[-1] != concepts or center.numel() != concepts:
+        raise ValueError(
+            "Checkpoint center2 dimension does not match patch head: "
+            f"center2={tuple(center.shape)}, concepts={concepts}"
+        )
 
     backbone = backbone.to(DEVICE).eval()
     head = head.to(DEVICE).eval()
@@ -351,9 +344,8 @@ def _load_teacher(checkpoint_path: Path) -> TeacherModel:
         backbone=backbone,
         head=head,
         metadata=metadata,
-        patch_target_mode=mode,
         patch_temperature=temperature,
-        patch_center=center.to(DEVICE) if center is not None else None,
+        patch_center=center.to(DEVICE),
         concepts=concepts,
     )
 
@@ -423,20 +415,11 @@ def _extract_result(model: TeacherModel, image: Image.Image) -> ImageResult:
     labels = kmeans.fit_predict(patch_features).astype(np.int64, copy=False)
     object_cluster = _select_object_cluster(labels, grid_height, grid_width)
 
-    if model.patch_target_mode == "centering":
-        # Training stores center2 as [1, 1, K], while visualization logits are
-        # [patches, K]. Drop singleton axes to avoid creating [1, patches, K].
-        center = model.patch_center.reshape(model.concepts)
-        probabilities = F.softmax(
-            (patch_logits.to(DEVICE) - center) / model.patch_temperature,
-            dim=-1,
-        ).float().cpu()
-    else:
-        # Visualization has one image, so SK is applied jointly to all of that
-        # image's patches, using the same raw-logit operation as training.
-        probabilities = sinkhorn_knopp(
-            patch_logits.to(DEVICE), model.patch_temperature
-        ).float().cpu()
+    # Centered teacher probabilities, matching the ordinary iBOT objective.
+    center = model.patch_center.reshape(model.concepts)
+    probabilities = F.softmax(
+        (patch_logits.to(DEVICE) - center) / model.patch_temperature, dim=-1,
+    ).float().cpu()
 
     # [num_pseudo_concepts]: average the teacher probabilities over the object cluster.
     object_mask = torch.from_numpy(labels == object_cluster)
@@ -597,7 +580,7 @@ def main() -> None:
         print(
             f"Loaded {name}: architecture={model.metadata['architecture']}, "
             f"patch_size={model.metadata['patch_size']}, "
-            f"target_mode={model.patch_target_mode}, K={model.concepts}, "
+            f"target_mode=centering, K={model.concepts}, "
             f"device={DEVICE}",
             flush=True,
         )

@@ -1,301 +1,174 @@
 import datetime
+import math
 import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from losses.region_loss import RegionLoss, intersection_patch_weights
+from losses.region_loss import RegionLoss, intersection_patch_fractions
 
 
-def reference_overlap_targets(logits, boxes, min_area, temperature):
-    """Dense NumPy-SK reference to verify the sparse gather/pool implementation."""
-    weights, valid, _ = intersection_patch_weights(boxes, logits.shape[1], min_area)
-    selected = weights.transpose(0, 1).reshape(logits.shape[:2]) > 0
-    probabilities = torch.zeros_like(logits, dtype=torch.float32)
-    if selected.any():
-        matrix = np.exp(logits[selected].detach().float().numpy() / temperature).T
-        prototypes, tokens = matrix.shape
-        matrix /= matrix.sum()
-        for _ in range(3):
-            matrix /= matrix.sum(axis=1, keepdims=True) * prototypes
-            matrix /= matrix.sum(axis=0, keepdims=True) * tokens
-        probabilities[selected] = torch.from_numpy((matrix * tokens).T.copy())
-    views = probabilities.chunk(2)
-    pooled = torch.stack([
-        (views[view] * weights[:, view, :, None]).sum(1)
-        / weights[:, view].sum(-1, keepdim=True).clamp_min(1e-12)
-        for view in range(2)
-    ], dim=1)
-    return pooled, weights, valid
+def boxes_full(batch=1):
+    return torch.tensor([[[0., 0., 1., 1., 0.], [0., 0., 1., 1., 0.]]] * batch).reshape(batch, 2, 5)
 
 
-def overlap_boxes():
-    return torch.tensor([
-        [[0., 0., 1., 1., 0.], [0.5, 0.25, 1., 1., 0.]],
-        [[0., 0., 0.4, 1., 0.], [0.6, 0., 1., 1., 0.]],
-    ])
+def boxes_disjoint(batch=1):
+    return torch.tensor([[[0., 0., .4, 1., 0.], [.6, 0., 1., 1., 0.]]] * batch)
 
 
-def distributed_overlap_worker(rank, rendezvous):
-    dist.init_process_group(
-        "gloo", init_method=rendezvous, rank=rank, world_size=2,
-        timeout=datetime.timedelta(seconds=30),
-    )
+def reference_ce(student, teacher, selected, temperature):
+    # Deliberately use direct softmax -> arithmetic mean, independently of the
+    # implementation's numerically stable log-space aggregation.
+    s = [x[0, selected[v]].softmax(-1).mean(0) for v, x in
+         enumerate([x / temperature for x in student])]
+    t = [x[0, selected[v]].detach().softmax(-1).mean(0) for v, x in
+         enumerate([x / temperature for x in teacher])]
+    return -.5 * ((t[0] * s[1].log()).sum() + (t[1] * s[0].log()).sum())
+
+
+def distributed_region_worker(rank, rendezvous):
+    torch.set_num_threads(1)
+    dist.init_process_group('gloo', init_method=rendezvous, rank=rank, world_size=2,
+                            timeout=datetime.timedelta(seconds=30))
     try:
-        generator = torch.Generator().manual_seed(31)
-        raw = torch.randn(2, 4, 4, 3, generator=generator) * 0.1
-        region_loss = RegionLoss(0.1)
-        # Test different valid counts, no local overlap, and no global overlap.
         for valid_samples in (3, 2, 0):
-            boxes = overlap_boxes()[1:].repeat(4, 1, 1)
-            boxes[:valid_samples] = overlap_boxes()[0]
-            # Give different valid overlaps different numbers of selected patches.
-            if valid_samples > 2:
-                boxes[2, 1] = boxes[2, 0]
-            expected, _, _ = reference_overlap_targets(
-                raw.flatten(0, 1), boxes, 0.1, 0.07
-            )
-            local_slice = slice(2 * rank, 2 * (rank + 1))
-            local_raw = raw[:, local_slice].flatten(0, 1)
-            local_boxes = boxes[local_slice]
-            targets = region_loss.sinkhorn_knopp_teacher(local_raw, local_boxes, 0.07)
-            torch.testing.assert_close(targets.probabilities, expected[local_slice])
-
-            # All ranks must finish region loss and backward, including empty ranks.
+            boxes = boxes_disjoint(4)
+            boxes[:valid_samples] = boxes_full(valid_samples)
+            local = slice(rank * 2, rank * 2 + 2)
             student = tuple(torch.zeros(2, 4, 3, requires_grad=True) for _ in range(2))
-            centered = tuple(torch.full((2, 4, 3), 1 / 3) for _ in range(2))
-            result = region_loss(
-                student, centered, local_boxes, teacher_overlap_targets=targets
-            )
-            result["loss"].backward()
-            if targets.valid.any():
-                expected_loss = np.log(3) * 2 * int(targets.valid.sum()) / valid_samples
-                torch.testing.assert_close(
-                    result["loss"], result["loss"].new_tensor(expected_loss)
-                )
-            else:
-                assert result["loss"].item() == 0
-                assert all(logits.grad.count_nonzero() == 0 for logits in student)
+            teacher = tuple(torch.randn(2, 4, 3, requires_grad=True) for _ in range(2))
+            result = RegionLoss()(student, teacher, boxes[local])
+            result['loss'].backward()
+            valid_local = max(0, min(2, valid_samples - rank * 2))
+            expected = math.log(3) * 2 * valid_local / max(valid_samples, 1)
+            torch.testing.assert_close(result['loss'], torch.tensor(expected))
+            assert all(x.grad is None for x in teacher)
+            for x in student:
+                assert torch.isfinite(x.grad).all()
+                assert x.grad[valid_local:].count_nonzero() == 0
+            # DDP averages these rank-scaled losses/gradients.
+            averaged = result['loss'].detach().clone()
+            dist.all_reduce(averaged)
+            torch.testing.assert_close(averaged / 2, torch.tensor(math.log(3) if valid_samples else 0.))
     finally:
         dist.destroy_process_group()
 
 
-class IntersectionPatchWeightsTest(unittest.TestCase):
-    def test_full_overlap_covers_every_patch_equally(self):
-        boxes = torch.tensor(
-            [[[0.0, 0.0, 1.0, 1.0, 0.0], [0.0, 0.0, 1.0, 1.0, 0.0]]]
-        )
-
-        weights, valid, area = intersection_patch_weights(boxes, 4, 0.05)
-
-        torch.testing.assert_close(weights, torch.full((1, 2, 4), 0.25))
+class IntersectionGeometryTest(unittest.TestCase):
+    def test_full_overlap(self):
+        fractions, valid, area = intersection_patch_fractions(boxes_full(), 4, .05)
+        torch.testing.assert_close(fractions, torch.ones(1, 2, 4))
         self.assertTrue(valid.item())
-        torch.testing.assert_close(area, torch.tensor([1.0]))
+        self.assertEqual(area.item(), 1.)
 
-    def test_intersection_is_projected_into_each_crop(self):
-        boxes = torch.tensor(
-            [[[0.0, 0.0, 1.0, 1.0, 0.0], [0.5, 0.0, 1.0, 1.0, 0.0]]]
-        )
+    def test_full_14_by_14_grid_at_strict_threshold(self):
+        logits = tuple(torch.zeros(1, 196, 3) for _ in range(2))
+        result = RegionLoss(patch_threshold=1.)(logits, logits, boxes_full())
+        self.assertTrue(result['patch_mask'].all())
 
-        weights, valid, area = intersection_patch_weights(boxes, 4, 0.05)
+    def test_partial_patch_fractions_and_flip(self):
+        boxes = boxes_full()
+        boxes[0, 1, 0] = .25
+        fractions, _, area = intersection_patch_fractions(boxes, 4, 0)
+        torch.testing.assert_close(fractions[0, 0], torch.tensor([.5, 1., .5, 1.]))
+        torch.testing.assert_close(fractions[0, 1], torch.ones(4))
+        self.assertEqual(area.item(), .75)
+        boxes[0, 0, 4] = 1
+        flipped, _, _ = intersection_patch_fractions(boxes, 4, 0)
+        torch.testing.assert_close(flipped[0, 0], torch.tensor([1., .5, 1., .5]))
 
-        torch.testing.assert_close(
-            weights[:, 0], torch.tensor([[0.0, 0.25, 0.0, 0.25]])
-        )
-        torch.testing.assert_close(weights[:, 1], torch.full((1, 4), 0.25))
-        self.assertTrue(valid.item())
-        torch.testing.assert_close(area, torch.tensor([0.5]))
-
-    def test_horizontal_flip_mirrors_patch_coverage(self):
-        boxes = torch.tensor(
-            [[[0.0, 0.0, 1.0, 1.0, 1.0], [0.5, 0.0, 1.0, 1.0, 0.0]]]
-        )
-
-        weights, _, _ = intersection_patch_weights(boxes, 4, 0.05)
-
-        torch.testing.assert_close(
-            weights[:, 0], torch.tensor([[0.25, 0.0, 0.25, 0.0]])
-        )
-
-    def test_boundary_patches_receive_fractional_coverage(self):
-        boxes = torch.tensor(
-            [[[0.0, 0.0, 1.0, 1.0, 0.0], [0.25, 0.0, 1.0, 1.0, 0.0]]]
-        )
-
-        weights, _, _ = intersection_patch_weights(boxes, 4, 0.05)
-
-        torch.testing.assert_close(
-            weights[:, 0], torch.tensor([[0.125, 0.25, 0.125, 0.25]])
-        )
-
-    def test_overlap_below_threshold_is_skipped(self):
-        boxes = torch.tensor(
-            [[[0.0, 0.0, 1.0, 1.0, 0.0], [0.5, 0.0, 1.0, 1.0, 0.0]]]
-        )
-
-        weights, valid, _ = intersection_patch_weights(boxes, 4, 0.51)
-
+    def test_area_filter_and_disjoint(self):
+        boxes = boxes_full()
+        boxes[0, 1, 0] = .5
+        self.assertTrue(intersection_patch_fractions(boxes, 4, .5)[1].item())
+        self.assertFalse(intersection_patch_fractions(boxes, 4, .51)[1].item())
+        fractions, valid, _ = intersection_patch_fractions(boxes_disjoint(), 4, 0)
         self.assertFalse(valid.item())
-        self.assertEqual(weights.count_nonzero().item(), 0)
-
-    def test_overlap_at_threshold_is_kept(self):
-        boxes = torch.tensor(
-            [[[0.0, 0.0, 1.0, 1.0, 0.0], [0.5, 0.0, 1.0, 1.0, 0.0]]]
-        )
-
-        _, valid, _ = intersection_patch_weights(boxes, 4, 0.5)
-
-        self.assertTrue(valid.item())
-
-    def test_zero_area_is_skipped_even_with_zero_threshold(self):
-        boxes = torch.tensor(
-            [[[0.0, 0.0, 0.4, 1.0, 0.0], [0.6, 0.0, 1.0, 1.0, 0.0]]]
-        )
-
-        weights, valid, _ = intersection_patch_weights(boxes, 4, 0.0)
-
-        self.assertFalse(valid.item())
-        self.assertEqual(weights.count_nonzero().item(), 0)
+        self.assertEqual(fractions.count_nonzero(), 0)
 
 
-class RegionLossTest(unittest.TestCase):
-    def test_loss_matches_region_across_opposite_views(self):
-        boxes = torch.tensor(
-            [[[0.0, 0.0, 1.0, 1.0, 0.0], [0.0, 0.0, 1.0, 1.0, 0.0]]]
-        )
-        teacher = (
-            torch.tensor([[[1.0, 0.0]]]).expand(1, 4, 2),
-            torch.tensor([[[0.0, 1.0]]]).expand(1, 4, 2),
-        )
-        matching_student = (
-            torch.tensor([[[-10.0, 10.0]]]).expand(1, 4, 2),
-            torch.tensor([[[10.0, -10.0]]]).expand(1, 4, 2),
-        )
-        nonmatching_student = tuple(-logits for logits in matching_student)
-        loss_function = RegionLoss(min_area=0.05)
+class RegionCompositionTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(7)
+        self.student = tuple((torch.randn(1, 4, 3) * .1).requires_grad_() for _ in range(2))
+        self.teacher = tuple((torch.randn(1, 4, 3) * .1).requires_grad_() for _ in range(2))
 
-        matching = loss_function(matching_student, teacher, boxes)["loss"]
-        nonmatching = loss_function(nonmatching_student, teacher, boxes)["loss"]
+    def test_equal_weight_mean_of_softmax_and_detached_teacher(self):
+        boxes = boxes_full()
+        boxes[0, 1, 0] = .25  # first view has 50% and 100% covered patches
+        loss = RegionLoss(patch_threshold=.5, temperature=.2)
+        result = loss(self.student, self.teacher, boxes)
+        selected = torch.ones(2, 4, dtype=torch.bool)
+        expected = reference_ce(self.student, self.teacher, selected, .2)
+        torch.testing.assert_close(result['loss'], expected)
+        reference_grad = torch.autograd.grad(expected, self.student)
+        result['loss'].backward()
+        for x, expected_grad in zip(self.student, reference_grad):
+            torch.testing.assert_close(x.grad, expected_grad)
+        self.assertTrue(all(x.grad is None for x in self.teacher))
+        # Half-covered patches are equally weighted, not half-weighted.
+        torch.testing.assert_close(result['patch_mask'], selected[None])
 
-        self.assertLess(matching.item(), 1e-6)
-        self.assertGreater(nonmatching.item(), 10.0)
+    def test_threshold_excludes_patches_and_their_gradients(self):
+        boxes = boxes_full()
+        boxes[0, 1, 0] = .25
+        loss = RegionLoss(patch_threshold=.51, temperature=.2)
+        selected = torch.tensor([[False, True, False, True], [True] * 4])
+        result = loss(self.student, self.teacher, boxes)
+        torch.testing.assert_close(result['patch_mask'], selected[None])
+        torch.testing.assert_close(result['loss'], reference_ce(self.student, self.teacher, selected, .2))
+        changed_s = tuple(x.detach().clone() for x in self.student)
+        changed_t = tuple(x.detach().clone() for x in self.teacher)
+        changed_s[0][:, ~selected[0]] = torch.tensor([1e6, -1e6, 0.])
+        changed_t[0][:, ~selected[0]] = torch.tensor([-1e6, 1e6, 0.])
+        torch.testing.assert_close(loss(changed_s, changed_t, boxes)['loss'], result['loss'])
+        result['loss'].backward()
+        self.assertEqual(self.student[0].grad[:, ~selected[0]].count_nonzero(), 0)
 
-    def test_invalid_batch_has_graph_connected_zero_loss(self):
-        boxes = torch.tensor(
-            [[[0.0, 0.0, 0.4, 1.0, 0.0], [0.6, 0.0, 1.0, 1.0, 0.0]]]
-        )
-        student = tuple(
-            torch.randn(1, 4, 3, requires_grad=True) for _ in range(2)
-        )
-        teacher = tuple(
-            torch.softmax(torch.randn(1, 4, 3), dim=-1)
-            for _ in range(2)
-        )
+    def test_empty_selection_in_one_view_and_disjoint_are_skipped(self):
+        narrow = boxes_full()
+        narrow[0, 1, :4] = torch.tensor([.45, 0., .55, 1.])
+        for boxes in (narrow, boxes_disjoint()):
+            student = tuple(x.detach().clone().requires_grad_() for x in self.student)
+            result = RegionLoss()(student, self.teacher, boxes)
+            self.assertEqual(result['valid_ratio'].item(), 0)
+            self.assertEqual(result['loss'].item(), 0)
+            result['loss'].backward()
+            self.assertTrue(all(x.grad.count_nonzero() == 0 for x in student))
 
-        result = RegionLoss(min_area=0.0)(student, teacher, boxes)
-        result["loss"].backward()
+    def test_repeating_patches_keeps_mean_and_swapping_views_keeps_loss(self):
+        loss = RegionLoss(temperature=.2)
+        original = loss(self.student, self.teacher, boxes_full())['loss']
+        repeated_s = tuple(x.repeat_interleave(4, dim=1) for x in self.student)
+        repeated_t = tuple(x.repeat_interleave(4, dim=1) for x in self.teacher)
+        torch.testing.assert_close(loss(repeated_s, repeated_t, boxes_full())['loss'], original)
+        torch.testing.assert_close(loss(self.student[::-1], self.teacher[::-1], boxes_full())['loss'], original)
 
-        self.assertEqual(result["loss"].item(), 0.0)
-        self.assertEqual(result["valid_ratio"].item(), 0.0)
-        for logits in student:
-            self.assertEqual(logits.grad.count_nonzero().item(), 0)
+    def test_extreme_logits_have_finite_loss_and_nonzero_gradients(self):
+        student = tuple(torch.tensor([[[10000., -10000.]]], requires_grad=True) for _ in range(2))
+        teacher = tuple(-x.detach() for x in student)
+        loss = RegionLoss()(student, teacher, boxes_full())['loss']
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        for x in student:
+            self.assertTrue(torch.isfinite(x.grad).all())
+            self.assertGreater(x.grad.abs().sum().item(), 0)
 
+    def test_invalid_hyperparameters(self):
+        for kwargs in ({'temperature': 0}, {'temperature': float('nan')},
+                       {'patch_threshold': 0}, {'patch_threshold': 1.1}):
+            with self.assertRaises(ValueError):
+                RegionLoss(**kwargs)
 
-class OverlapSinkhornTest(unittest.TestCase):
-    def test_joint_raw_patch_sk_then_geometric_pooling_matches_reference(self):
-        logits = torch.randn(4, 4, 3, generator=torch.Generator().manual_seed(19)) * 0.1
-        logits.requires_grad_()
-        before = logits.detach().clone()
-        boxes = overlap_boxes()
-
-        actual = RegionLoss(0.1).sinkhorn_knopp_teacher(logits, boxes, 0.07)
-        expected, weights, valid = reference_overlap_targets(logits, boxes, 0.1, 0.07)
-
-        torch.testing.assert_close(actual.probabilities, expected)
-        torch.testing.assert_close(actual.patch_weights, weights)
-        torch.testing.assert_close(actual.valid, valid)
-        torch.testing.assert_close(
-            actual.probabilities.sum(-1), valid[:, None].expand(-1, 2).float()
-        )
-        torch.testing.assert_close(logits, before)
-        self.assertFalse(actual.probabilities.requires_grad)
-
-    def test_nonoverlap_and_invalid_sample_logits_cannot_affect_sk(self):
-        logits = torch.randn(4, 4, 3) * 0.1
-        boxes = overlap_boxes()
-        region_loss = RegionLoss(0.1)
-        before = region_loss.sinkhorn_knopp_teacher(logits, boxes, 0.07)
-        excluded = before.patch_weights.transpose(0, 1).reshape(logits.shape[:2]) == 0
-        changed = logits.clone()
-        changed[excluded] = torch.tensor([10000., -10000., 5000.])
-
-        after = region_loss.sinkhorn_knopp_teacher(changed, boxes, 0.07)
-
-        torch.testing.assert_close(after.probabilities, before.probabilities)
-        self.assertTrue(torch.isfinite(after.probabilities).all())
-
-    def test_overlap_ce_uses_sk_targets_and_preserves_student_pooling(self):
-        generator = torch.Generator().manual_seed(5)
-        raw = torch.randn(4, 4, 3, generator=generator) * 0.1
-        student = tuple(
-            torch.randn(2, 4, 3, generator=generator, requires_grad=True)
-            for _ in range(2)
-        )
-        boxes = overlap_boxes()
-        region_loss = RegionLoss(0.1)
-        sk = region_loss.sinkhorn_knopp_teacher(raw, boxes, 0.07)
-        # Deliberately inconsistent centered probabilities must not enter SK CE.
-        centered = tuple(torch.full((2, 4, 3), 1 / 3) for _ in range(2))
-
-        result = region_loss(student, centered, boxes, teacher_overlap_targets=sk)
-
-        expected_teacher, weights, _ = reference_overlap_targets(raw, boxes, 0.1, 0.07)
-        expected_student = [
-            (logits[0].softmax(-1) * weights[0, view, :, None]).sum(0)
-            / weights[0, view].sum()
-            for view, logits in enumerate(student)
-        ]
-        expected = -0.5 * (
-            (expected_teacher[0, 0] * expected_student[1].log()).sum()
-            + (expected_teacher[0, 1] * expected_student[0].log()).sum()
-        )
-        torch.testing.assert_close(result["loss"], expected)
-        result["loss"].backward()
-        for logits in student:
-            self.assertTrue(torch.isfinite(logits.grad).all())
-            self.assertEqual(logits.grad[1].count_nonzero().item(), 0)
-
-    def test_no_valid_overlap_returns_zero_targets_and_graph_connected_zero(self):
-        boxes = overlap_boxes()[1:]
-        student = tuple(torch.randn(1, 4, 3, requires_grad=True) for _ in range(2))
-        raw = torch.randn(2, 4, 3)
-        centered = tuple(logits.softmax(-1) for logits in raw.chunk(2))
-        region_loss = RegionLoss(0.1)
-        targets = region_loss.sinkhorn_knopp_teacher(raw, boxes, 0.07)
-
-        result = region_loss(student, centered, boxes, teacher_overlap_targets=targets)
-        result["loss"].backward()
-
-        self.assertEqual(targets.probabilities.count_nonzero().item(), 0)
-        self.assertEqual(result["loss"].item(), 0)
-        for logits in student:
-            self.assertEqual(logits.grad.count_nonzero().item(), 0)
-
-    @unittest.skipUnless(
-        dist.is_available() and dist.is_gloo_available(), "Gloo required"
-    )
-    def test_distributed_overlap_matches_joint_batch_including_empty_ranks(self):
+    @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(), 'Gloo required')
+    def test_distributed_empty_ranks_and_global_normalization(self):
         with tempfile.TemporaryDirectory() as directory:
-            mp.spawn(
-                distributed_overlap_worker,
-                args=((Path(directory) / "rendezvous").as_uri(),),
-                nprocs=2, join=True,
-            )
+            mp.spawn(distributed_region_worker,
+                     args=((Path(directory) / 'rendezvous').as_uri(),), nprocs=2, join=True)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

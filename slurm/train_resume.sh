@@ -16,6 +16,16 @@ set -e
 
 cd "$SLURM_SUBMIT_DIR"
 
+# This launcher is for an exact resume. New objectives start via train.sh.
+# Fail before writing into the pinned run if the YAML starts a continuation.
+./.conda-env/bin/python - <<'PY'
+import yaml
+with open("config/train.yaml") as handle:
+    config = yaml.safe_load(handle)
+if not config.get("resume_checkpoint"):
+    raise SystemExit("train_resume.sh requires resume_checkpoint in config/train.yaml; use train.sh for a new run")
+PY
+
 export OMP_NUM_THREADS=6
 export MKL_NUM_THREADS=6
 # Reuse the existing run directory on every Slurm requeue, rather than making

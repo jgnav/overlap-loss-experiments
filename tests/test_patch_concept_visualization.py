@@ -20,7 +20,7 @@ class PatchProbabilityTest(unittest.TestCase):
         model = viz.TeacherModel(
             backbone=backbone,
             head=Mock(return_value=(None, logits.unsqueeze(0))),
-            metadata={}, patch_target_mode="centering",
+            metadata={},
             patch_temperature=0.7, patch_center=None, concepts=3,
         )
         labels = np.array([0, 1, 0, 1])

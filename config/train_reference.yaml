@@ -10,18 +10,19 @@ arch: vit_small
 shared_head: true
 
 # Loss and teacher
-teacher_target_cls: centering       # CLS objective: centering or sinkhorn_knopp.
-teacher_target_ibot: centering      # iBOT patch objective: centering or sinkhorn_knopp.
-teacher_target_overlap: sinkhorn_knopp  # Overlap objective: centering or sinkhorn_knopp.
 lambda1: 1.0  # Global CLS loss
 lambda2: 1.0  # Masked patch loss
 lambda3: 0.0  # Constant from the first epoch; set to 0.0 for pure iBOT.
 
 # Minimum two-view intersection as a fraction of the original image area.
 region_min_area: 0.10
+# Binary selection: minimum fraction of each patch inside the shared region.
+region_patch_threshold: 0.5
+# Same uncentered patch-softmax temperature for teacher and student regions.
+region_temp: 0.1
 momentum_teacher: 0.9995
 teacher_temp: 0.07
-teacher_patch_temp: 0.07  # Also the epsilon for the independent overlap SK branch.
+teacher_patch_temp: 0.07  # Centered teacher targets for ordinary iBOT.
 
 # Training
 additional_epochs: 200

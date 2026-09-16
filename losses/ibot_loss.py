@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .region_loss import RegionLoss
-from .sinkhorn import sinkhorn_knopp
 
 
 class iBOTLoss(nn.Module):
@@ -26,8 +25,10 @@ class iBOTLoss(nn.Module):
         center_momentum2=0.9,
         lambda1=1.0,
         lambda2=1.0,
-        lambda3=1.0,
+        lambda3=0.1,
         region_min_area=0.05,
+        region_patch_threshold=0.5,
+        region_temp=0.1,
         mim_start_epoch=0,
     ):
         super().__init__()
@@ -42,7 +43,7 @@ class iBOTLoss(nn.Module):
         self.lambda1 = lambda1
         self.lambda2 = lambda2
         self.lambda3 = lambda3
-        self.region_loss = RegionLoss(region_min_area)
+        self.region_loss = RegionLoss(region_min_area, region_patch_threshold, region_temp)
 
         self.teacher_temp_schedule = np.concatenate(
             (
@@ -107,56 +108,15 @@ class iBOTLoss(nn.Module):
             self.softmax_center_teacher_patch(teacher_patch, teacher_patch_temp),
         )
 
-    @torch.no_grad()
-    def sinkhorn_knopp_teacher(self, teacher_logits, teacher_temp):
-        """Apply DINOv2's joint Sinkhorn assignment to selected logits."""
-        return sinkhorn_knopp(teacher_logits, teacher_temp)
-
-    @torch.no_grad()
-    def sinkhorn_knopp_masked_teacher(
-        self, teacher_patch_logits, masks, teacher_patch_temp
-    ):
-        """Apply Sinkhorn only to masked global-crop patch logits.
-
-        The returned tensor is dense for compatibility with the existing
-        iBOT loss, but unmasked entries are zero and never participate in the
-        masked cross-entropy.
-        """
-        if masks is None or len(masks) != self.ngcrops:
-            raise ValueError(
-                "Masked iBOT Sinkhorn requires one mask per global crop"
-            )
-        mask = torch.cat(
-            [item.reshape(item.shape[0], -1).bool() for item in masks], dim=0
-        )
-        if teacher_patch_logits.ndim != 3 or teacher_patch_logits.shape[:2] != mask.shape:
-            raise ValueError(
-                "Teacher patch logits and masks have incompatible shapes: "
-                f"logits={tuple(teacher_patch_logits.shape)}, "
-                f"mask={tuple(mask.shape)}"
-            )
-        assignments = self.sinkhorn_knopp_teacher(
-            teacher_patch_logits[mask], teacher_patch_temp
-        )
-        targets = teacher_patch_logits.new_zeros(
-            teacher_patch_logits.shape, dtype=assignments.dtype
-        )
-        targets[mask] = assignments
-        return targets, mask
-
     @staticmethod
     @torch.no_grad()
-    def _distribution_diagnostics(
-        distributions, are_probabilities, token_masks=None
-    ):
+    def _distribution_diagnostics(distributions, are_probabilities):
         """Assignment sharpness only; this does not measure prototype geometry."""
         entropy_sum = None
         maximum_sum = None
         token_count = 0
-        for index, distribution in enumerate(distributions):
+        for distribution in distributions:
             rows = distribution.detach().flatten(0, 1)
-            if token_masks is not None:
-                rows = rows[token_masks[index].reshape(-1).bool()]
             for chunk in rows.split(1024):
                 if are_probabilities:
                     probabilities = chunk.float()
@@ -193,23 +153,21 @@ class iBOTLoss(nn.Module):
     def _masked_overlap_diagnostics(
         patch_cross_entropies,
         student_mask,
-        patch_weights,
+        patch_mask,
         valid,
     ):
         """Split masked-patch CE inside/outside valid shared regions.
 
-        Boundary patches contribute fractionally according to their covered
-        area. Samples below the overlap threshold are excluded from both
-        conditional diagnostics.
+        Use the same binary patch selection as the region objective.
+        Invalid pairs are excluded from both conditional diagnostics.
         """
-        patch_count = patch_cross_entropies[0].shape[-1]
         inside_sum = patch_cross_entropies[0].new_zeros((), dtype=torch.float32)
         outside_sum = inside_sum.clone()
         inside_count = inside_sum.clone()
         outside_count = inside_sum.clone()
         for view, cross_entropy in enumerate(patch_cross_entropies):
             mask = student_mask[view].flatten(-2, -1).float()
-            coverage = (patch_weights[:, view].float() * patch_count).clamp(0, 1)
+            coverage = patch_mask[:, view].float()
             eligible = valid[:, None].float()
             inside_weight = mask * coverage * eligible
             outside_weight = mask * (1.0 - coverage) * eligible
@@ -232,11 +190,9 @@ class iBOTLoss(nn.Module):
         student_mask,
         crop_boxes,
         *,
-        teacher_overlap_targets=None,
-        teacher_overlap_patch_targets=None,
-        teacher_ibot_mask=None,
+        teacher_patch_logits=None,
     ):
-        """Compute losses from independently normalized teacher targets."""
+        """Compute baseline centered DINO/iBOT plus raw-logit region composition."""
         student_cls, student_patch = student_output
         teacher_cls, teacher_patch = teacher_targets
 
@@ -245,6 +201,7 @@ class iBOTLoss(nn.Module):
 
         student_cls = student_cls / self.student_temp
         student_cls_c = student_cls.chunk(self.ncrops)
+        raw_student_patch_c = student_patch.chunk(self.ngcrops)
         student_patch = student_patch / self.student_temp
         student_patch_c = student_patch.chunk(self.ngcrops)
 
@@ -295,15 +252,12 @@ class iBOTLoss(nn.Module):
             region_active = zero
             objective = total_loss1 + total_loss2
         else:
+            if teacher_patch_logits is None:
+                raise ValueError("Active region loss requires raw teacher_patch_logits")
             region_stats = self.region_loss(
-                student_patch_c,
-                (
-                    teacher_patch_c
-                    if teacher_overlap_patch_targets is None
-                    else teacher_overlap_patch_targets.detach().chunk(self.ngcrops)
-                ),
+                raw_student_patch_c,
+                teacher_patch_logits.detach().chunk(self.ngcrops),
                 crop_boxes,
-                teacher_overlap_targets=teacher_overlap_targets,
             )
             region_raw = region_stats["loss"]
             total_loss3 = region_raw * region_weight
@@ -312,7 +266,7 @@ class iBOTLoss(nn.Module):
             overlap_diagnostics = self._masked_overlap_diagnostics(
                 patch_cross_entropies,
                 student_mask,
-                region_stats["patch_weights"],
+                region_stats["patch_mask"],
                 region_stats["valid"],
             )
             patch_inside_overlap = overlap_diagnostics["inside"]
@@ -327,7 +281,6 @@ class iBOTLoss(nn.Module):
         teacher_diagnostics = self._distribution_diagnostics(
             teacher_patch_c,
             are_probabilities=True,
-            token_masks=teacher_ibot_mask,
         )
         total_loss = {
             "cls": total_loss1,

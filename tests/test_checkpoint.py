@@ -75,40 +75,6 @@ class PretrainedCheckpointTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "official full checkpoint"):
                 read_pretrained_checkpoint(args)
 
-    def test_sinkhorn_only_checkpoint_does_not_require_center_state(self):
-        with tempfile.TemporaryDirectory() as directory:
-            checkpoint_path = Path(directory) / "checkpoint.pth"
-            source_student = nn.Linear(2, 2)
-            source_teacher = nn.Linear(2, 2)
-            source_loss = make_loss().state_dict()
-            source_loss.pop("center")
-            source_loss.pop("center2")
-            torch.save(
-                {
-                    "student": source_student.state_dict(),
-                    "teacher": source_teacher.state_dict(),
-                    "ibot_loss": source_loss,
-                },
-                checkpoint_path,
-            )
-            args = SimpleNamespace(
-                initial_checkpoint=checkpoint_path,
-                teacher_target_cls="sinkhorn_knopp",
-                teacher_target_ibot="sinkhorn_knopp",
-                teacher_target_overlap="sinkhorn_knopp",
-            )
-            checkpoint = read_pretrained_checkpoint(args)
-            student = nn.Linear(2, 2)
-            teacher = nn.Linear(2, 2)
-            loss = make_loss()
-            load_pretrained_state(
-                checkpoint,
-                student,
-                teacher,
-                loss,
-                restore_centers=False,
-            )
-
     def test_centering_checkpoint_requires_and_restores_center_state(self):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint_path = Path(directory) / "checkpoint.pth"
@@ -124,9 +90,6 @@ class PretrainedCheckpointTest(unittest.TestCase):
             )
             args = SimpleNamespace(
                 initial_checkpoint=checkpoint_path,
-                teacher_target_cls="centering",
-                teacher_target_ibot="sinkhorn_knopp",
-                teacher_target_overlap="sinkhorn_knopp",
             )
             with self.assertRaisesRegex(ValueError, "pretrained centers"):
                 read_pretrained_checkpoint(args)
@@ -263,9 +226,6 @@ class ResumeCheckpointTest(unittest.TestCase):
                 epochs=50,
                 lambda3=0.2,
                 use_fp16=True,
-                teacher_target_cls="centering",
-                teacher_target_ibot="centering",
-                teacher_target_overlap="sinkhorn_knopp",
                 source_checkpoint_epoch=800,
             ),
             "ibot_loss": loss.state_dict(),
@@ -319,22 +279,25 @@ class ResumeCheckpointTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "lambda3"):
                 read_resume_checkpoint(args)
 
-    def test_resume_checks_per_objective_teacher_modes(self):
+    def test_resume_checks_region_composition_parameters(self):
         with tempfile.TemporaryDirectory() as directory:
-            checkpoint_path = Path(directory) / "checkpoint.pth"
-            torch.save(self._make_checkpoint(), checkpoint_path)
-            args = SimpleNamespace(
-                resume_checkpoint=checkpoint_path,
-                epochs=50,
-                use_fp16=True,
-                teacher_target_cls="centering",
-                teacher_target_ibot="centering",
-                teacher_target_overlap="sinkhorn_knopp",
-            )
+            path = Path(directory) / "checkpoint.pth"
+            checkpoint = self._make_checkpoint()
+            checkpoint["args"].region_temp = .1
+            checkpoint["args"].region_patch_threshold = .5
+            torch.save(checkpoint, path)
+            args = SimpleNamespace(resume_checkpoint=path, epochs=50, use_fp16=True,
+                                   lambda3=.2, region_temp=.1, region_patch_threshold=.5)
             read_resume_checkpoint(args)
-
-            args.teacher_target_ibot = "sinkhorn_knopp"
-            with self.assertRaisesRegex(ValueError, "teacher_target_ibot"):
+            for key, value in (("region_temp", .2), ("region_patch_threshold", .7)):
+                original = getattr(args, key)
+                setattr(args, key, value)
+                with self.assertRaisesRegex(ValueError, key):
+                    read_resume_checkpoint(args)
+                setattr(args, key, original)
+            del checkpoint["args"].region_temp
+            torch.save(checkpoint, path)
+            with self.assertRaisesRegex(ValueError, "predates the region-composition"):
                 read_resume_checkpoint(args)
 
 

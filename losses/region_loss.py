@@ -1,24 +1,13 @@
 import math
-from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .sinkhorn import sinkhorn_knopp
 
-
-@dataclass
-class OverlapTeacherTargets:
-    probabilities: torch.Tensor  # [batch, 2 views, prototypes], pooled after SK
-    patch_weights: torch.Tensor
-    valid: torch.Tensor
-    intersection_area: torch.Tensor
-
-
-def intersection_patch_weights(crop_boxes, patch_count, min_area):
-    """Return per-patch coverage of the two-view intersection.
+def intersection_patch_fractions(crop_boxes, patch_count, min_area):
+    """Return the fraction of each patch covered by the two-view intersection.
 
     Crop boxes use normalized original-image coordinates in the form
     ``[left, top, right, bottom, horizontally_flipped]``.
@@ -30,7 +19,7 @@ def intersection_patch_weights(crop_boxes, patch_count, min_area):
         )
 
     grid_size = math.isqrt(patch_count)
-    if grid_size * grid_size != patch_count:
+    if patch_count <= 0 or grid_size * grid_size != patch_count:
         raise ValueError(
             f"The number of patch tokens must be square, got {patch_count}"
         )
@@ -66,9 +55,10 @@ def intersection_patch_weights(crop_boxes, patch_count, min_area):
         [local_left, local_top, local_right, local_bottom], dim=-1
     ).clamp(0.0, 1.0)
 
-    edges = torch.linspace(
-        0.0,
-        1.0,
+    # Patch coordinates keep fully covered cells exactly at fraction 1,
+    # including grids such as 14x14 where normalized edges round in float32.
+    local_boxes = local_boxes * grid_size
+    edges = torch.arange(
         grid_size + 1,
         device=crop_boxes.device,
         dtype=crop_boxes.dtype,
@@ -81,141 +71,82 @@ def intersection_patch_weights(crop_boxes, patch_count, min_area):
         torch.minimum(local_boxes[:, :, 3, None], edges[1:])
         - torch.maximum(local_boxes[:, :, 1, None], edges[:-1])
     ).clamp_min(0)
-    weights = (
+    fractions = (
         vertical_coverage.unsqueeze(-1) * horizontal_coverage.unsqueeze(-2)
     ).flatten(start_dim=2)
-    weights = weights * valid[:, None, None]
-    return weights, valid, intersection_area
+    fractions = fractions.clamp(0, 1) * valid[:, None, None]
+    return fractions, valid, intersection_area
 
 
 class RegionLoss(nn.Module):
-    def __init__(self, min_area):
+    """Symmetric CE between means of selected, uncentered patch softmaxes."""
+
+    def __init__(self, min_area=0.0, patch_threshold=0.5, temperature=0.1):
         super().__init__()
         if not 0.0 <= min_area <= 1.0:
             raise ValueError("region_min_area must be between 0 and 1")
+        if not 0.0 < patch_threshold <= 1.0:
+            raise ValueError("region_patch_threshold must be in (0, 1]")
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("region_temp must be finite and positive")
         self.min_area = min_area
+        self.patch_threshold = patch_threshold
+        self.temperature = temperature
 
-    @torch.no_grad()
-    def sinkhorn_knopp_teacher(self, teacher_patch_logits, crop_boxes, teacher_temp):
-        """Select raw overlapping patch logits, apply SK, then pool by area.
-
-        Both views and all ranks share one assignment problem. Invalid
-        intersections and patches with zero coverage never participate.
-        Every rank must call this, even if it has no valid local overlap.
-        """
-        weights, valid, intersection_area = intersection_patch_weights(
-            crop_boxes.float(), teacher_patch_logits.shape[1], self.min_area
-        )
-        batch_size = len(crop_boxes)
-        if teacher_patch_logits.shape[0] != 2 * batch_size:
-            raise ValueError("Overlap teacher logits must contain two global views")
-
-        # Model output is view-major: all samples of view 0, then view 1.
-        view_weights = weights.transpose(0, 1).reshape(teacher_patch_logits.shape[:2])
-        selected = view_weights > 0
-        assignments = sinkhorn_knopp(teacher_patch_logits[selected], teacher_temp)
-
-        normalized_weights = view_weights / view_weights.sum(
+    def _region_log_distribution(self, logits, selected):
+        # log(mean(softmax(z / T))) preserves the exact probability-mean
+        # objective without clamping away gradients for small probabilities.
+        # Excluded logits never enter softmax or the region representation.
+        logits = logits.float().masked_fill(~selected[..., None], 0)
+        log_probabilities = F.log_softmax(logits / self.temperature, dim=-1)
+        log_probabilities = log_probabilities.masked_fill(~selected[..., None], -torch.inf)
+        return torch.logsumexp(log_probabilities, dim=1) - selected.sum(
             dim=1, keepdim=True
-        ).clamp_min(1e-12)
-        # Reduce only selected patches instead of allocating another dense
-        # [2 * batch, patches, prototypes] probability tensor.
-        region_indices = selected.nonzero(as_tuple=True)[0]
-        assignments *= normalized_weights[selected].unsqueeze(-1)
-        pooled = assignments.new_zeros((2 * batch_size, teacher_patch_logits.shape[-1]))
-        pooled.index_add_(0, region_indices, assignments)
-        pooled = pooled.reshape(2, batch_size, -1).transpose(0, 1)
-        return OverlapTeacherTargets(pooled, weights, valid, intersection_area)
+        ).float().log()
 
-    def forward(
-        self,
-        student_patch_logits,
-        teacher_patch_probabilities,
-        crop_boxes,
-        *,
-        teacher_overlap_targets=None,
-    ):
-        if len(student_patch_logits) != 2 or len(teacher_patch_probabilities) != 2:
+    def forward(self, student_patch_logits, teacher_patch_logits, crop_boxes):
+        if len(student_patch_logits) != 2 or len(teacher_patch_logits) != 2:
             raise ValueError("Region loss requires exactly two global crops")
-
-        if teacher_overlap_targets is None:
-            weights, valid, intersection_area = intersection_patch_weights(
-                crop_boxes.float(),
-                student_patch_logits[0].shape[1],
-                self.min_area,
-            )
-        else:
-            weights = teacher_overlap_targets.patch_weights
-            valid = teacher_overlap_targets.valid
-            intersection_area = teacher_overlap_targets.intersection_area
-        all_patch_weights = weights
-
-        valid_count = valid.sum().float()
-        local_valid_samples = int(valid_count.item())
-        global_valid_count = valid_count.detach().clone()
+        shape = student_patch_logits[0].shape
+        if (len(shape) != 3 or shape[0] != len(crop_boxes)
+                or any(logits.shape != shape for logits in
+                       (*student_patch_logits, *teacher_patch_logits))):
+            raise ValueError("Region logits must have matching [batch, patches, prototypes] shapes")
+        fractions, valid, intersection_area = intersection_patch_fractions(
+            crop_boxes.float(), shape[1], self.min_area
+        )
+        selected = (fractions >= self.patch_threshold) & valid[:, None, None]
+        # Both cross-view directions require at least one patch in each view.
+        valid = valid & selected.any(dim=-1).all(dim=-1)
+        selected = selected & valid[:, None, None]
+        global_valid_count = valid.sum().float()
         world_size = 1
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(global_valid_count)
             world_size = dist.get_world_size()
 
-        if local_valid_samples:
-            selector = (
-                slice(None)
-                if local_valid_samples == valid.numel()
-                else valid
-            )
-            weights = weights[selector]
-            normalizer = weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            student_regions = []
-            teacher_regions = []
-            for view in range(2):
-                student_probabilities = F.softmax(
-                    student_patch_logits[view][selector].float(), dim=-1
-                )
-                student_regions.append(
-                    torch.bmm(
-                        weights[:, view].unsqueeze(1), student_probabilities
-                    ).squeeze(1)
-                    / normalizer[:, view]
-                )
-                if teacher_overlap_targets is None:
-                    teacher_regions.append(
-                        torch.bmm(
-                            weights[:, view].unsqueeze(1),
-                            teacher_patch_probabilities[view][selector].float(),
-                        ).squeeze(1)
-                        / normalizer[:, view]
-                    )
-                else:
-                    teacher_regions.append(
-                        teacher_overlap_targets.probabilities[selector, view].detach()
-                    )
-            student_region = torch.stack(student_regions, dim=1)
-            teacher_region = torch.stack(teacher_regions, dim=1)
-
-            loss_ab = -(
-                teacher_region[:, 0]
-                * student_region[:, 1].clamp_min(1e-12).log()
-            ).sum(dim=-1)
-            loss_ba = -(
-                teacher_region[:, 1]
-                * student_region[:, 0].clamp_min(1e-12).log()
-            ).sum(dim=-1)
+        if valid.any():
+            student_regions = [
+                self._region_log_distribution(logits[valid], selected[valid, view])
+                for view, logits in enumerate(student_patch_logits)
+            ]
+            with torch.no_grad():
+                teacher_regions = [
+                    self._region_log_distribution(logits.detach()[valid], selected[valid, view]).exp()
+                    for view, logits in enumerate(teacher_patch_logits)
+                ]
+            loss_ab = -(teacher_regions[0] * student_regions[1]).sum(dim=-1)
+            loss_ba = -(teacher_regions[1] * student_regions[0]).sum(dim=-1)
             local_loss_sum = (0.5 * (loss_ab + loss_ba)).sum()
         else:
-            local_loss_sum = sum(
-                logits.sum() * 0.0 for logits in student_patch_logits
-            )
+            # Empty ranks must still participate in DDP backward with zero grads.
+            local_loss_sum = sum(logits.float().sum() * 0.0 for logits in student_patch_logits)
 
         loss = local_loss_sum * world_size / global_valid_count.clamp_min(1.0)
-
         return {
             "loss": loss,
             "valid_ratio": valid.float().mean(),
             "intersection_area": intersection_area.mean(),
-            # Reuse the already-computed geometry for diagnostics in iBOTLoss.
-            # These tensors are removed before the scalar logging dictionary is
-            # returned to the training loop.
-            "patch_weights": all_patch_weights,
+            "patch_mask": selected,
             "valid": valid,
         }
