@@ -5,6 +5,8 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .sinkhorn import sinkhorn_log_probabilities
+
 
 def intersection_patch_fractions(crop_boxes, patch_count, min_area):
     """Return the fraction of each patch covered by the two-view intersection.
@@ -79,9 +81,10 @@ def intersection_patch_fractions(crop_boxes, patch_count, min_area):
 
 
 class RegionLoss(nn.Module):
-    """Symmetric CE between means of selected, uncentered patch softmaxes."""
+    """Symmetric consistency between means of selected uncentered patches."""
 
-    def __init__(self, min_area=0.0, patch_threshold=0.5, temperature=0.1):
+    def __init__(self, min_area=0.0, patch_threshold=0.5, temperature=0.1,
+                 normalization="softmax"):
         super().__init__()
         if not 0.0 <= min_area <= 1.0:
             raise ValueError("region_min_area must be between 0 and 1")
@@ -89,9 +92,32 @@ class RegionLoss(nn.Module):
             raise ValueError("region_patch_threshold must be in (0, 1]")
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("region_temp must be finite and positive")
+        if normalization not in ("softmax", "raw_logits", "sinkhorn"):
+            raise ValueError("region_normalization must be softmax, raw_logits, or sinkhorn")
         self.min_area = min_area
         self.patch_threshold = patch_threshold
         self.temperature = temperature
+        self.normalization = normalization
+
+    @staticmethod
+    def _region_raw_vector(logits, selected):
+        logits = logits.float().masked_fill(~selected[..., None], 0)
+        patches = F.normalize(logits, p=2, dim=-1)
+        return patches.sum(dim=1) / selected.sum(dim=1, keepdim=True)
+
+    def _sinkhorn_patches(self, logits, selected):
+        # One assignment problem over both views and all valid selected patches,
+        # independently for student and teacher. Keep the student graph intact.
+        logits = torch.stack(logits, dim=1)
+        assignments = sinkhorn_log_probabilities(logits[selected], self.temperature)
+        dense = logits.new_full(logits.shape, -torch.inf, dtype=torch.float32)
+        return dense.masked_scatter(selected[..., None], assignments), assignments
+
+    @staticmethod
+    def _pool_log_probabilities(log_probabilities, selected):
+        return torch.logsumexp(log_probabilities, dim=1) - selected.sum(
+            dim=1, keepdim=True
+        ).float().log()
 
     def _region_log_distribution(self, logits, selected):
         # log(mean(softmax(z / T))) preserves the exact probability-mean
@@ -100,9 +126,7 @@ class RegionLoss(nn.Module):
         logits = logits.float().masked_fill(~selected[..., None], 0)
         log_probabilities = F.log_softmax(logits / self.temperature, dim=-1)
         log_probabilities = log_probabilities.masked_fill(~selected[..., None], -torch.inf)
-        return torch.logsumexp(log_probabilities, dim=1) - selected.sum(
-            dim=1, keepdim=True
-        ).float().log()
+        return self._pool_log_probabilities(log_probabilities, selected)
 
     def forward(self, student_patch_logits, teacher_patch_logits, crop_boxes):
         if len(student_patch_logits) != 2 or len(teacher_patch_logits) != 2:
@@ -125,22 +149,49 @@ class RegionLoss(nn.Module):
             dist.all_reduce(global_valid_count)
             world_size = dist.get_world_size()
 
-        if valid.any():
-            student_regions = [
-                self._region_log_distribution(logits[valid], selected[valid, view])
-                for view, logits in enumerate(student_patch_logits)
-            ]
+        student_assignments = None
+        if self.normalization == "sinkhorn" and global_valid_count.item() > 0:
+            student_patches, student_assignments = self._sinkhorn_patches(
+                student_patch_logits, selected
+            )
             with torch.no_grad():
-                teacher_regions = [
-                    self._region_log_distribution(logits.detach()[valid], selected[valid, view]).exp()
-                    for view, logits in enumerate(teacher_patch_logits)
+                teacher_patches, _ = self._sinkhorn_patches(
+                    tuple(x.detach() for x in teacher_patch_logits), selected
+                )
+
+        if valid.any():
+            if self.normalization == "sinkhorn":
+                student_regions = [
+                    self._pool_log_probabilities(student_patches[valid, v], selected[valid, v])
+                    for v in range(2)
                 ]
-            loss_ab = -(teacher_regions[0] * student_regions[1]).sum(dim=-1)
-            loss_ba = -(teacher_regions[1] * student_regions[0]).sum(dim=-1)
+                teacher_regions = [
+                    self._pool_log_probabilities(teacher_patches[valid, v], selected[valid, v]).exp()
+                    for v in range(2)
+                ]
+            else:
+                transform = (self._region_raw_vector if self.normalization == "raw_logits"
+                             else self._region_log_distribution)
+                student_regions = [transform(x[valid], selected[valid, v])
+                                   for v, x in enumerate(student_patch_logits)]
+                with torch.no_grad():
+                    teacher_regions = [transform(x.detach()[valid], selected[valid, v])
+                                       for v, x in enumerate(teacher_patch_logits)]
+                    if self.normalization == "softmax":
+                        teacher_regions = [x.exp() for x in teacher_regions]
+            if self.normalization == "raw_logits":
+                loss_ab = 1 - F.cosine_similarity(teacher_regions[0], student_regions[1], dim=-1)
+                loss_ba = 1 - F.cosine_similarity(teacher_regions[1], student_regions[0], dim=-1)
+            else:
+                loss_ab = -(teacher_regions[0] * student_regions[1]).sum(dim=-1)
+                loss_ba = -(teacher_regions[1] * student_regions[0]).sum(dim=-1)
             local_loss_sum = (0.5 * (loss_ab + loss_ba)).sum()
         else:
             # Empty ranks must still participate in DDP backward with zero grads.
             local_loss_sum = sum(logits.float().sum() * 0.0 for logits in student_patch_logits)
+            if student_assignments is not None:
+                # Empty ranks still join the differentiable SK all-reduces.
+                local_loss_sum = local_loss_sum + student_assignments.sum() * 0.0
 
         loss = local_loss_sum * world_size / global_valid_count.clamp_min(1.0)
         return {

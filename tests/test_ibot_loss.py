@@ -214,6 +214,21 @@ class PureIBOTAndDiagnosticsTest(unittest.TestCase):
         torch.testing.assert_close(before["region_raw"], after["region_raw"])
         self.assertFalse(torch.allclose(before["patch"], after["patch"]))
 
+    def test_all_region_modes_preserve_baseline_and_disabled_branch(self):
+        student, teacher, masks, boxes = self._inputs()
+        control = make_loss(lambda3=0)
+        targets = control.softmax_center_teacher(teacher, .07, .07)
+        expected = control(student, targets, None, masks, None)
+        for mode in ("softmax", "raw_logits", "sinkhorn"):
+            loss = make_loss(region_normalization=mode)
+            result = loss(student, targets, None, masks, boxes, teacher_patch_logits=teacher[1])
+            torch.testing.assert_close(result["cls"], expected["cls"])
+            torch.testing.assert_close(result["patch"], expected["patch"])
+            loss.lambda3 = 0
+            with mock.patch.object(loss.region_loss, "forward", side_effect=AssertionError):
+                disabled = loss(student, targets, None, masks, None)
+            torch.testing.assert_close(disabled["loss"], expected["loss"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -79,6 +79,8 @@ def load_config(path):
         raise ValueError("region_patch_threshold must be in (0, 1]")
     if not math.isfinite(config["region_temp"]) or config["region_temp"] <= 0:
         raise ValueError("region_temp must be finite and positive")
+    if config["region_normalization"] not in ("softmax", "raw_logits", "sinkhorn"):
+        raise ValueError("region_normalization must be softmax, raw_logits, or sinkhorn")
     if "additional_epochs" in user_config and "epochs" in user_config:
         raise ValueError(
             "Configure training length with additional_epochs, not both keys"
@@ -316,6 +318,7 @@ def train_ibot(args, wandb_run=None):
         region_min_area=args.region_min_area,
         region_patch_threshold=args.region_patch_threshold,
         region_temp=args.region_temp,
+        region_normalization=args.region_normalization,
         mim_start_epoch=args.pred_start_epoch,
     ).cuda()
 

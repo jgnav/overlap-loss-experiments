@@ -29,6 +29,7 @@ class iBOTLoss(nn.Module):
         region_min_area=0.05,
         region_patch_threshold=0.5,
         region_temp=0.1,
+        region_normalization="softmax",
         mim_start_epoch=0,
     ):
         super().__init__()
@@ -43,7 +44,9 @@ class iBOTLoss(nn.Module):
         self.lambda1 = lambda1
         self.lambda2 = lambda2
         self.lambda3 = lambda3
-        self.region_loss = RegionLoss(region_min_area, region_patch_threshold, region_temp)
+        self.region_loss = RegionLoss(
+            region_min_area, region_patch_threshold, region_temp, region_normalization
+        )
 
         self.teacher_temp_schedule = np.concatenate(
             (

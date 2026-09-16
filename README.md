@@ -112,12 +112,24 @@ logits** from the same two global views (including the existing masked student
 forward). Crop geometry and horizontal flips map their shared region to each
 patch grid. Patches participate when their covered fraction is at least
 `region_patch_threshold` (default `0.5`); every selected patch has equal weight.
-Each patch receives softmax at the shared teacher/student `region_temp`
-(default `0.1`), then selected distributions are averaged. The region loss is
-symmetric cross-entropy: teacher A → student B and teacher B → student A,
-with the teacher detached. It uses neither centering nor Sinkhorn.
+One `region_normalization` setting applies to **both teacher and student**:
 
-`lambda3` weights this additional loss (default `0.1` in experiment YAMLs);
+- `softmax` (default): per-patch softmax at `region_temp`, then an equal-weight
+  mean and symmetric cross-entropy.
+- `raw_logits`: L2-normalize each raw patch vector, average selected vectors,
+  then use symmetric cosine distance between the means. These vectors can be
+  signed, so probability cross-entropy does not apply. `region_temp` is unused.
+- `sinkhorn`: independently balance teacher and student selected patch logits
+  using three Sinkhorn iterations at `region_temp`. Each side pools selected
+  patches from both views and all ranks into one assignment problem, then
+  averages assignments per region and uses symmetric cross-entropy. Gradients
+  flow through student Sinkhorn, including its distributed normalization.
+
+The teacher is detached in every mode. Only patches from valid pairs passing
+both geometry filters participate in Sinkhorn; no centering is used by any
+region mode. DINO and iBOT always retain their centered teacher softmax targets.
+
+`lambda3` weights this additional loss;
 `lambda3: 0.0` disables the branch for the unchanged iBOT baseline.
 `region_min_area` keeps the existing minimum intersection-area filter.
 Pairs with no selected patches in either view are skipped. Use a new

@@ -287,9 +287,11 @@ class ResumeCheckpointTest(unittest.TestCase):
             checkpoint["args"].region_patch_threshold = .5
             torch.save(checkpoint, path)
             args = SimpleNamespace(resume_checkpoint=path, epochs=50, use_fp16=True,
-                                   lambda3=.2, region_temp=.1, region_patch_threshold=.5)
+                                   lambda3=.2, region_temp=.1, region_patch_threshold=.5,
+                                   region_normalization="softmax")
             read_resume_checkpoint(args)
-            for key, value in (("region_temp", .2), ("region_patch_threshold", .7)):
+            for key, value in (("region_temp", .2), ("region_patch_threshold", .7),
+                               ("region_normalization", "sinkhorn")):
                 original = getattr(args, key)
                 setattr(args, key, value)
                 with self.assertRaisesRegex(ValueError, key):

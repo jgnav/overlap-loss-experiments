@@ -40,7 +40,8 @@ class ContinuationConfigTest(unittest.TestCase):
         self.assertFalse(hasattr(config, "teacher_target_overlap"))
         self.assertEqual(config.region_temp, .1)
         self.assertEqual(config.region_patch_threshold, .5)
-        self.assertEqual(config.lambda3, .1)
+        self.assertEqual(config.lambda3, 1.0)
+        self.assertEqual(config.region_normalization, "softmax")
         self.assertIsNone(config.resume_checkpoint)
 
     def test_region_settings_load_and_validate(self):
@@ -68,6 +69,18 @@ class ContinuationConfigTest(unittest.TestCase):
                 ):
                     config = load_config(path)
                 self.assertEqual(config.shared_head, shared)
+
+    def test_shared_region_normalization_selector(self):
+        path = Path(__file__).parents[1] / "config" / "train.yaml"
+        values = yaml.safe_load(path.read_text())
+        for mode in ("softmax", "raw_logits", "sinkhorn"):
+            values["region_normalization"] = mode
+            with mock.patch.object(Path, "open", mock.mock_open(read_data=yaml.safe_dump(values))):
+                self.assertEqual(load_config(path).region_normalization, mode)
+        values["region_normalization"] = "centering"
+        with mock.patch.object(Path, "open", mock.mock_open(read_data=yaml.safe_dump(values))):
+            with self.assertRaisesRegex(ValueError, "region_normalization"):
+                load_config(path)
 
     def test_head_topology_must_be_boolean(self):
         path = Path(__file__).parents[1] / "config" / "train.yaml"

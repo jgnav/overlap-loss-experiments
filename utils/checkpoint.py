@@ -40,6 +40,7 @@ RESUME_COMPATIBILITY_KEYS = (
     "region_min_area",
     "region_patch_threshold",
     "region_temp",
+    "region_normalization",
     "momentum_teacher",
     "epochs",
     "batch_size_per_gpu",
@@ -155,6 +156,9 @@ def _validate_resume_compatibility(checkpoint, args):
     mismatches = []
     for key in RESUME_COMPATIBILITY_KEYS:
         saved_value = _checkpoint_argument(checkpoint, key)
+        if key == "region_normalization" and saved_value is None:
+            # Region-composition checkpoints before this selector used softmax.
+            saved_value = "softmax"
         if saved_value is None or not hasattr(args, key):
             continue
         configured_value = getattr(args, key)

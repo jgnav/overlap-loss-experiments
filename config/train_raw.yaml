@@ -15,14 +15,14 @@ shared_head: true
 # Loss and teacher
 lambda1: 1.0  # Global CLS loss
 lambda2: 1.0  # Masked patch loss
-lambda3: 0.0  # Region composition weight; set to 0.0 for pure iBOT.
+lambda3: 1.0  # Region composition weight; set to 0.0 for pure iBOT.
 
 # Minimum two-view intersection as a fraction of the original image area.
 region_min_area: 0.10
 # Binary selection: minimum fraction of each patch inside the shared region.
 region_patch_threshold: 0.5
 # Shared teacher/student overlap normalization: softmax, raw_logits, or sinkhorn.
-region_normalization: softmax
+region_normalization: raw_logits
 # Temperature for softmax/Sinkhorn (unused by L2-normalized raw_logits).
 region_temp: 0.1
 momentum_teacher: 0.9995
