@@ -149,13 +149,16 @@ continuation run for this changed objective: `resume_checkpoint: null`, with
 In `evaluation.yaml`, set `datasets_root` to the prepared-data path, select your `checkpoint`,
 and keep `output_dir: null` for separate results per launch.
 
-For a paper-style A+B composition figure from a COCO image ID and datasets root, configure the checkpoint, image ID, datasets root, and independent reference regions
-in `composition_visualization.py`
-and run:
+For a paper-style A+B composition test from a COCO image ID and datasets root,
+configure the checkpoint, image ID, datasets root, and at least two independent
+pure reference regions per concept in `composition_visualization.py`. It forwards
+a real crop containing both objects and fits the full-dimensional representation
+with independently estimated A/B fingerprints. Then run:
 
 ```bash
 python composition_visualization.py
 ```
 
 See [the composition figure protocol](docs/composition_visualization.md) for
-mask colors, independent calibration, patch-count mixtures, and output details.
+mask colors, fingerprint concentration, full-dimensional decomposition, the
+separately forwarded mixed crop, and output details.

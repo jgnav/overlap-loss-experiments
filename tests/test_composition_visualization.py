@@ -18,7 +18,7 @@ class CompositionMathTest(unittest.TestCase):
         from pycocotools import mask as mask_utils
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            images = root / 'coco' / 'train2017'
+            images = root / 'coco' / 'images' / 'train2017'
             annotations = root / 'coco' / 'annotations'
             images.mkdir(parents=True)
             annotations.mkdir()
@@ -62,40 +62,82 @@ class CompositionMathTest(unittest.TestCase):
                 np.testing.assert_array_equal(np.asarray(Image.open(mask)), pixels)
                 with self.assertRaises(FileNotFoundError):
                     viz.find_coco_pair(99, root)
-                (annotations / 'instances_duplicate.json').write_text(json.dumps(data))
+                unrelated = root / 'imagenet' / 'annotations'
+                unrelated.mkdir(parents=True)
+                (unrelated / 'instances_train2017.json').write_text('not json')
+                Image.new('RGB', (16, 8), 'black').save(unrelated / '000000240684.jpg')
+                # Unrelated datasets are never traversed during COCO lookup.
+                image, _, _ = viz.find_coco_pair(240684, root)
+                self.assertEqual(image, images / '000000240684.jpg')
+                (annotations / 'instances_val2017.json').write_text(json.dumps(data))
                 with self.assertRaisesRegex(ValueError, 'multiple annotation'):
                     viz.find_coco_pair(240684, root)
 
-    def test_contrast_sets_are_disjoint_and_ties_are_other(self):
-        a, b = viz.associated_sets(np.array([.5, .1, .2, .2]), np.array([.1, .5, .2, .2]), 3)
-        np.testing.assert_array_equal(a, [0])
-        np.testing.assert_array_equal(b, [1])
-        with self.assertRaisesRegex(ValueError, 'contrasting'):
-            viz.associated_sets(np.ones(4) / 4, np.ones(4) / 4)
+    def test_discriminative_display_does_not_reduce_fit_dimensions(self):
+        mu_a = np.array([.5, .1, .2, .2])
+        mu_b = np.array([.1, .5, .25, .15])
+        indices, signs = viz.discriminative_prototypes(mu_a, mu_b, 2)
+        np.testing.assert_array_equal(indices, [0, 1])
+        np.testing.assert_array_equal(signs, [1, -1])
+        target = .4 * mu_a + .6 * mu_b
+        fit = viz.nonnegative_fingerprint_fit(target, mu_a, mu_b)
+        np.testing.assert_allclose(fit['coefficients'], [.4, .6], atol=1e-12)
+        np.testing.assert_allclose(fit['residual'], 0, atol=1e-12)
+        np.testing.assert_allclose(fit['shares'], [.4, .6, 0], atol=1e-12)
 
-    def test_component_masses_partition_full_distribution(self):
-        x = np.array([[.5, .1, .2, .2], [.1, .3, .1, .5]])
-        masses = viz.component_mass(x, np.array([0]), np.array([1]))
-        np.testing.assert_allclose(masses, [[.5, .1, .4], [.1, .3, .6]])
-        np.testing.assert_allclose(masses.sum(1), 1)
-        with self.assertRaisesRegex(ValueError, 'disjoint'):
-            viz.component_mass(x, [0], [0])
+    def test_concentration_reports_topk_mass_and_entropy_effective_support(self):
+        result = viz.concentration_diagnostics(np.array([.5, .25, .125, .125]), (1, 2, 8))
+        self.assertEqual(result['topk_mass'], {1: .5, 2: .75, 8: 1.})
+        expected = np.exp(-sum(x * np.log(x) for x in (.5, .25, .125, .125)))
+        self.assertAlmostEqual(result['effective_prototypes'], expected)
 
     def test_exact_mixture_counts_no_replacement_and_union_identity(self):
         rng = np.random.default_rng(17)
         x = rng.dirichlet(np.ones(5), 20)
         ia, ib = np.arange(12), np.arange(12, 20)
-        mu_a, mu_b = np.array([.5, .1, .1, .1, .2]), np.array([.1, .5, .1, .1, .2])
-        result = viz.build_composition(x, ia, ib, mu_a, mu_b, 24, max_mixture_patches=7)
+        refs_a = np.array([[.52, .08, .1, .1, .2], [.48, .12, .1, .1, .2]])
+        refs_b = np.array([[.08, .52, .1, .1, .2], [.12, .48, .1, .1, .2]])
+        mixed = .4 * refs_a.mean(0) + .6 * refs_b.mean(0)
+        result = viz.build_composition(
+            refs_a, refs_b, mixed, x, ia, ib, max_mixture_patches=7,
+            heatmap_prototypes=3,
+        )
         self.assertEqual(result.mixture_counts, [(4, 0), (3, 1), (2, 2), (1, 3), (0, 4)])
-        np.testing.assert_allclose(result.means[2], .6 * result.means[0] + .4 * result.means[1])
+        np.testing.assert_allclose(result.mu_a, refs_a.mean(0))
+        np.testing.assert_allclose(result.mu_b, refs_b.mean(0))
+        np.testing.assert_allclose(result.fit_coefficients[2], [.4, .6], atol=1e-12)
         for indices, counts, mean in zip(result.mixture_indices, result.mixture_counts, result.mixture_means):
             self.assertEqual(len(np.unique(indices)), 4)
             self.assertEqual(np.count_nonzero(indices < 12), counts[0])
             np.testing.assert_allclose(x[indices].mean(0), mean)
-        repeated = viz.build_composition(x, ia, ib, mu_a, mu_b, 24, max_mixture_patches=7)
+        repeated = viz.build_composition(
+            refs_a, refs_b, mixed, x, ia, ib, max_mixture_patches=7,
+            heatmap_prototypes=3,
+        )
         np.testing.assert_array_equal(result.mixture_means, repeated.mixture_means)
-        self.assertTrue(np.isnan(result.patch_masses[20:]).all())
+        np.testing.assert_allclose(result.mixture_fit_shares.sum(1), 1)
+
+    def test_observed_crop_is_a_real_union_crop_and_padding_is_excluded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = np.zeros((20, 30, 3), dtype=np.uint8)
+            mask = np.zeros_like(image)
+            mask[4:12, 3:9] = (255, 0, 0)
+            mask[7:17, 20:27] = (0, 255, 0)
+            Image.fromarray(image).save(root / 'image.png')
+            Image.fromarray(mask).save(root / 'mask.png')
+            crop, crop_mask, box = viz.observed_mixed_crop(
+                root / 'image.png', root / 'mask.png',
+                (255, 0, 0), (0, 255, 0), padding=0,
+            )
+            self.assertEqual(box, (3, 4, 27, 17))
+            self.assertEqual(crop.size, (24, 13))
+            self.assertEqual(crop_mask.size, crop.size)
+            _, _, geometry = viz._prepare_pair_images(crop, crop_mask, 8, 24)
+            np.testing.assert_array_equal(
+                viz.real_patch_mask(geometry, 8),
+                [True, True, True, False, False, False],
+            )
 
     def test_only_probability_modes_are_used(self):
         logits = torch.tensor([[.2, .1, -.1], [-.2, .4, .1]])
@@ -185,7 +227,7 @@ class CompositionIOTest(unittest.TestCase):
             Image.open(image).save(copy)
             checkpoint = root / 'checkpoint.pth'
             checkpoint.touch()
-            refs = [viz.ReferenceRegion(copy, image, (255, 0, 0))]
+            refs = [viz.ReferenceRegion(copy, image, (255, 0, 0))] * 2
             with mock.patch.object(viz, 'REFERENCE_A', refs), mock.patch.object(viz, 'REFERENCE_B', refs):
                 with self.assertRaisesRegex(ValueError, 'leakage'):
                     viz.validate_inputs(checkpoint, image, image)
@@ -222,9 +264,11 @@ class CompositionIOTest(unittest.TestCase):
             mask[:, 16:] = (0, 255, 0)
             target, target_mask = pair('mixed', pixels, mask)
             a, am = pair('ref_a', np.full((16, 16, 3), (200, 30, 20), dtype=np.uint8), np.full((16, 16, 3), (255, 0, 0), dtype=np.uint8))
+            a2, am2 = pair('ref_a2', np.full((16, 16, 3), (180, 40, 30), dtype=np.uint8), np.full((16, 16, 3), (255, 0, 0), dtype=np.uint8))
             b, bm = pair('ref_b', np.full((16, 16, 3), (20, 190, 30), dtype=np.uint8), np.full((16, 16, 3), (0, 255, 0), dtype=np.uint8))
-            with (mock.patch.object(viz, 'REFERENCE_A', [viz.ReferenceRegion(a, am, (255, 0, 0))]),
-                  mock.patch.object(viz, 'REFERENCE_B', [viz.ReferenceRegion(b, bm, (0, 255, 0))]),
+            b2, bm2 = pair('ref_b2', np.full((16, 16, 3), (30, 170, 40), dtype=np.uint8), np.full((16, 16, 3), (0, 255, 0), dtype=np.uint8))
+            with (mock.patch.object(viz, 'REFERENCE_A', [viz.ReferenceRegion(a, am, (255, 0, 0)), viz.ReferenceRegion(a2, am2, (255, 0, 0))]),
+                  mock.patch.object(viz, 'REFERENCE_B', [viz.ReferenceRegion(b, bm, (0, 255, 0)), viz.ReferenceRegion(b2, bm2, (0, 255, 0))]),
                   mock.patch.object(viz, 'OBJECT_A_COLOR', (255, 0, 0)),
                   mock.patch.object(viz, 'OBJECT_B_COLOR', (0, 255, 0)),
                   mock.patch.object(viz, 'DEVICE', 'cpu'),
@@ -242,12 +286,14 @@ class CompositionIOTest(unittest.TestCase):
             with Image.open(path) as image:
                 self.assertGreater(image.width, 1000)
             record = json.loads(path.with_suffix('.json').read_text())
-            self.assertEqual(record['reference_counts'], [1, 1])
+            self.assertEqual(record['reference_counts'], [2, 2])
             self.assertFalse(record['teacher_center_applied'])
+            self.assertTrue(record['full_dimensional_fingerprints'])
             with np.load(path.with_suffix('.npz')) as arrays:
-                self.assertEqual(arrays['region_means'].shape, (3, 3))
+                self.assertEqual(arrays['reference_means_a'].shape, (2, 3))
+                self.assertEqual(arrays['observed_mixed_representation'].shape, (3,))
                 self.assertEqual(arrays['mixture_means'].shape, (5, 3))
-                np.testing.assert_allclose(arrays['region_means'].sum(1), 1, atol=1e-6)
+                np.testing.assert_allclose(arrays['observed_mixed_representation'].sum(), 1, atol=1e-6)
 
 
 if __name__ == '__main__':
