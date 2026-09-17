@@ -85,6 +85,38 @@ class CompositionMathTest(unittest.TestCase):
         np.testing.assert_allclose(fit['residual'], 0, atol=1e-12)
         np.testing.assert_allclose(fit['shares'], [.4, .6, 0], atol=1e-12)
 
+    def test_automatic_references_use_coco_only_and_exclude_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            coco = root / 'coco'
+            images = coco / 'images' / 'train2017'
+            annotations = coco / 'annotations'
+            images.mkdir(parents=True)
+            annotations.mkdir()
+            records, instances = [], []
+            for image_id, category_id in ((1, 1), (2, 1), (3, 2), (4, 2), (99, 1)):
+                filename = f'{image_id:012d}.jpg'
+                Image.new('RGB', (12, 12), 'white').save(images / filename)
+                records.append({'id': image_id, 'file_name': filename, 'height': 12, 'width': 12})
+                instances.append({
+                    'id': 100 + image_id, 'image_id': image_id,
+                    'category_id': category_id, 'area': 100,
+                    'segmentation': [[1, 1, 11, 1, 11, 11, 1, 11]],
+                })
+            (annotations / 'instances_train2017.json').write_text(json.dumps({
+                'images': records, 'annotations': instances,
+                'categories': [{'id': 1, 'name': 'dog'}, {'id': 2, 'name': 'car'}],
+            }))
+            provenance = {
+                'coco_root': str(coco), 'image_id': 99,
+                'objects': [{'category_id': 1}, {'category_id': 2}],
+            }
+            with mock.patch.object(viz, 'OUTPUT_DIR', root / 'out'):
+                refs_a, refs_b = viz.find_coco_references(provenance, count=2)
+            self.assertEqual([Path(x.image).stem for x in refs_a], ['000000000001', '000000000002'])
+            self.assertEqual([Path(x.image).stem for x in refs_b], ['000000000003', '000000000004'])
+            self.assertTrue(all(Path(x.mask).is_file() for x in (*refs_a, *refs_b)))
+
     def test_concentration_reports_topk_mass_and_entropy_effective_support(self):
         result = viz.concentration_diagnostics(np.array([.5, .25, .125, .125]), (1, 2, 8))
         self.assertEqual(result['topk_mass'], {1: .5, 2: .75, 8: 1.})

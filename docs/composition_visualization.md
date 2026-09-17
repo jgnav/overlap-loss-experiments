@@ -31,7 +31,13 @@ REFERENCE_B = [
 ]
 ```
 
-Reference colors are specified separately for each region; they need not match
+The default empty `REFERENCE_A` and `REFERENCE_B` lists automatically select
+`AUTO_REFERENCE_COUNT` large instances of each target category from different
+COCO images, excluding the displayed image. This reads only the standard COCO
+train/validation annotation files and resolves image paths directly; it does not
+scan other datasets. Set both lists explicitly to override automatic selection.
+
+For explicit references, colors are specified separately for each region; they need not match
 the displayed image's colors. References must be independent of the displayed
 image. The script rejects identical decoded images, including lossless copies;
 you must also keep near-duplicates and alternate crops out of calibration.

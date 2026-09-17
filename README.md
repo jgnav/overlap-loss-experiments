@@ -150,8 +150,9 @@ In `evaluation.yaml`, set `datasets_root` to the prepared-data path, select your
 and keep `output_dir: null` for separate results per launch.
 
 For a paper-style A+B composition test from a COCO image ID and datasets root,
-configure the checkpoint, image ID, datasets root, and at least two independent
-pure reference regions per concept in `composition_visualization.py`. It forwards
+configure the checkpoint, image ID, and datasets root in `composition_visualization.py`.
+By default it selects independent pure reference regions from COCO; explicit
+`REFERENCE_A/B` lists remain available as an override. It forwards
 a real crop containing both objects and fits the full-dimensional representation
 with independently estimated A/B fingerprints. Then run:
 

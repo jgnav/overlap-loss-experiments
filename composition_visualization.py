@@ -2,7 +2,8 @@
 """Paper figure of A+B patch-distribution composition, without projection.
 
 Usage: python composition_visualization.py
-Edit the configuration below, especially independent REFERENCE_A/B regions.
+Edit the configuration below. Empty REFERENCE_A/B lists select independent
+reference instances automatically from COCO.
 """
 from __future__ import annotations
 
@@ -46,6 +47,7 @@ COCO_ANNOTATION_B = None  # Otherwise match CONCEPT_A/B category names, or auto-
 LONG_SIDE = 560
 PATCH_PURITY = 0.9  # Fraction of a patch occupied by one object; must exceed .5.
 MIXED_CROP_PADDING = 0.10  # Fractional padding around the union of both objects.
+AUTO_REFERENCE_COUNT = 4  # Per concept when REFERENCE_A/B are left empty.
 HEATMAP_PROTOTYPES = 32  # Illustration only; all dimensions are used in fits.
 CONCENTRATION_K = (8, 32, 128, 512)
 MIXTURE_PATCHES = 64  # Common count, reduced to available patches; multiple of 4.
@@ -63,7 +65,8 @@ class ReferenceRegion:
     color: tuple[int, int, int]
 
 
-# Independent images, not the displayed image or copies of it. Each entry
+# Leave both lists empty to select AUTO_REFERENCE_COUNT independent images per
+# concept from COCO. Explicit entries override automatic selection. Each entry
 # defines ONE pure object region; masks may contain additional unrelated colors.
 # Multiple regions are averaged equally, irrespective of their patch counts.
 # At least two regions per concept are required so pure controls can use
@@ -110,6 +113,20 @@ class Composition:
     selected_b: np.ndarray
     counts: tuple[int, int]
     identity_error: float
+
+
+def _decode_coco_segmentation(annotation, height, width, mask_utils):
+    segmentation = annotation["segmentation"]
+    if isinstance(segmentation, list):
+        rle = mask_utils.merge(mask_utils.frPyObjects(segmentation, height, width))
+    elif isinstance(segmentation["counts"], list):
+        rle = mask_utils.frPyObjects(segmentation, height, width)
+    else:
+        rle = segmentation
+    result = mask_utils.decode(rle).astype(bool)
+    if result.shape != (height, width):
+        raise ValueError("Decoded COCO mask has incorrect dimensions")
+    return result
 
 
 def find_coco_pair(image_id, datasets_root):
@@ -180,19 +197,8 @@ def find_coco_pair(image_id, datasets_root):
     with Image.open(images[0]) as image:
         if image.size != (width, height):
             raise ValueError("COCO annotation dimensions differ from the local image")
-    def decode(annotation):
-        segmentation = annotation["segmentation"]
-        if isinstance(segmentation, list):
-            rle = mask_utils.merge(mask_utils.frPyObjects(segmentation, height, width))
-        elif isinstance(segmentation["counts"], list):
-            rle = mask_utils.frPyObjects(segmentation, height, width)
-        else:
-            rle = segmentation
-        result = mask_utils.decode(rle).astype(bool)
-        if result.shape != (height, width):
-            raise ValueError("Decoded COCO mask has incorrect dimensions")
-        return result
-    ma, mb = decode(a), decode(b)
+    ma = _decode_coco_segmentation(a, height, width, mask_utils)
+    mb = _decode_coco_segmentation(b, height, width, mask_utils)
     ambiguous = ma & mb
     ma, mb = ma & ~ambiguous, mb & ~ambiguous
     if not ma.any() or not mb.any():
@@ -205,12 +211,84 @@ def find_coco_pair(image_id, datasets_root):
     path = Path(OUTPUT_DIR) / f"coco_{image_id:012d}_{a['id']}_{b['id']}_mask.png"
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(mask).save(path)
-    provenance = {"image_id": image_id, "datasets_root": str(root), "annotations": str(annotation_path),
+    provenance = {"image_id": image_id, "datasets_root": str(root),
+                  "coco_root": str(coco_root), "split": split,
+                  "annotations": str(annotation_path),
                   "objects": [{"annotation_id": obj["id"], "category_id": obj["category_id"],
                                "category": categories[obj["category_id"]]} for obj in (a, b)],
                   "ambiguous_pixels_excluded": int(ambiguous.sum())}
     print(f"COCO {image_id}: A={provenance['objects'][0]}, B={provenance['objects'][1]}", flush=True)
     return images[0], path, provenance
+
+
+def find_coco_references(coco, count=AUTO_REFERENCE_COUNT):
+    """Create deterministic independent object references from COCO only."""
+    if count < 2:
+        raise ValueError("AUTO_REFERENCE_COUNT must be at least two")
+    coco_root = Path(coco["coco_root"])
+    target_image_id = int(coco["image_id"])
+    category_ids = [int(obj["category_id"]) for obj in coco["objects"]]
+    colors = (OBJECT_A_COLOR, OBJECT_B_COLOR)
+    try:
+        from pycocotools import mask as mask_utils
+    except ImportError as exc:
+        raise ImportError("Automatic COCO references require pycocotools") from exc
+    candidates = {category_id: [] for category_id in category_ids}
+    for split in ("train2017", "val2017"):
+        annotation_path = coco_root / "annotations" / f"instances_{split}.json"
+        if not annotation_path.is_file():
+            continue
+        with annotation_path.open() as stream:
+            data = json.load(stream)
+        images = {int(item["id"]): item for item in data.get("images", [])}
+        for annotation in data.get("annotations", []):
+            category_id = int(annotation["category_id"])
+            image_id = int(annotation["image_id"])
+            if (category_id in candidates and image_id != target_image_id
+                    and not annotation.get("iscrowd", 0)
+                    and annotation.get("segmentation") and image_id in images):
+                candidates[category_id].append((
+                    -float(annotation.get("area", 0)), int(annotation["id"]),
+                    split, annotation, images[image_id], annotation_path,
+                ))
+    output = []
+    reference_dir = Path(OUTPUT_DIR) / "coco_references"
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    for category_id, color in zip(category_ids, colors):
+        references, used_images = [], set()
+        for _, _, split, annotation, record, annotation_path in sorted(candidates[category_id]):
+            image_id = int(record["id"])
+            if image_id in used_images:
+                continue
+            filename = Path(record["file_name"]).name
+            paths = (coco_root / "images" / split / filename,
+                     coco_root / split / filename)
+            image_paths = [path for path in paths if path.is_file()]
+            if len(image_paths) != 1:
+                continue
+            height, width = int(record["height"]), int(record["width"])
+            selected = _decode_coco_segmentation(
+                annotation, height, width, mask_utils
+            )
+            if not selected.any():
+                continue
+            mask = np.full((height, width, 3), BACKGROUND_COLOR, dtype=np.uint8)
+            mask[selected] = color
+            mask_path = reference_dir / (
+                f"coco_{image_id:012d}_{annotation['id']}_mask.png"
+            )
+            Image.fromarray(mask).save(mask_path)
+            references.append(ReferenceRegion(image_paths[0], mask_path, color))
+            used_images.add(image_id)
+            if len(references) == count:
+                break
+        if len(references) < count:
+            raise ValueError(
+                f"COCO contains only {len(references)} usable independent images "
+                f"for category ID {category_id}; need {count}"
+            )
+        output.append(references)
+    return tuple(output)
 
 
 def image_digest(path):
@@ -220,8 +298,10 @@ def image_digest(path):
         return hashlib.sha256(str(image.size).encode() + image.tobytes()).hexdigest()
 
 
-def validate_inputs(checkpoint, image, mask):
-    if len(REFERENCE_A) < 2 or len(REFERENCE_B) < 2:
+def validate_inputs(checkpoint, image, mask, references_a=None, references_b=None):
+    references_a = REFERENCE_A if references_a is None else references_a
+    references_b = REFERENCE_B if references_b is None else references_b
+    if len(references_a) < 2 or len(references_b) < 2:
         raise ValueError(
             "Configure at least two independent REFERENCE_A and REFERENCE_B "
             "regions for fingerprints and leave-one-out controls"
@@ -236,7 +316,7 @@ def validate_inputs(checkpoint, image, mask):
     if not CONCENTRATION_K or any(type(k) is not int or k <= 0 for k in CONCENTRATION_K):
         raise ValueError("CONCENTRATION_K must contain positive integers")
     paths = [checkpoint, image, mask]
-    for reference in (*REFERENCE_A, *REFERENCE_B):
+    for reference in (*references_a, *references_b):
         paths.extend((reference.image, reference.mask))
         if len(reference.color) != 3 or any(not 0 <= value <= 255 for value in reference.color):
             raise ValueError("Reference colors must be RGB triples in [0, 255]")
@@ -244,7 +324,7 @@ def validate_inputs(checkpoint, image, mask):
         if not Path(path).expanduser().is_file():
             raise FileNotFoundError(path)
     target_digest = image_digest(image)
-    for reference in (*REFERENCE_A, *REFERENCE_B):
+    for reference in (*references_a, *references_b):
         if image_digest(Path(reference.image).expanduser()) == target_digest:
             raise ValueError("Calibration leakage: a reference image matches the displayed image")
 
@@ -755,7 +835,20 @@ def main():
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Configure CHECKPOINT at the top of the script: {checkpoint}")
     image, mask, coco = find_coco_pair(COCO_IMAGE_ID, DATASETS_ROOT)
-    validate_inputs(checkpoint, image, mask)
+    if bool(REFERENCE_A) != bool(REFERENCE_B):
+        raise ValueError("Configure both REFERENCE_A and REFERENCE_B, or leave both empty for automatic COCO references")
+    if REFERENCE_A:
+        references_a, references_b = REFERENCE_A, REFERENCE_B
+        reference_source = "configured"
+    else:
+        references_a, references_b = find_coco_references(coco)
+        reference_source = "automatic_coco"
+        print(
+            f"Selected {len(references_a)} A and {len(references_b)} B "
+            "independent references from COCO",
+            flush=True,
+        )
+    validate_inputs(checkpoint, image, mask, references_a, references_b)
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     backbone, head, metadata, prototypes, mode, temperature, center = load_teacher(checkpoint)
@@ -780,7 +873,7 @@ def main():
         raise ValueError("The observed A+B crop has no complete real-image patches")
 
     reference_banks, reference_records = [], []
-    for concept, references in (("A", REFERENCE_A), ("B", REFERENCE_B)):
+    for concept, references in (("A", references_a), ("B", references_b)):
         for reference in references:
             ref_sample = extract_sample(backbone, head, reference.image, reference.mask, patch_size)
             selected, _ = select_patches(ref_sample.mask, reference.color, patch_size)
@@ -801,8 +894,8 @@ def main():
     for bank in reference_banks:
         region_reference_means.append(reference_probabilities[offset:offset + len(bank)].mean(0))
         offset += len(bank)
-    reference_means_a = np.stack(region_reference_means[:len(REFERENCE_A)])
-    reference_means_b = np.stack(region_reference_means[len(REFERENCE_A):])
+    reference_means_a = np.stack(region_reference_means[:len(references_a)])
+    reference_means_b = np.stack(region_reference_means[len(references_a):])
 
     # The primary A+B representation comes from its own real crop and model
     # forward. It is never assembled from A/B segmentation-selected patches.
@@ -824,7 +917,9 @@ def main():
                 "coco": coco, "mode": mode, "temperature": temperature, "normalization_override": NORMALIZATION_OVERRIDE,
                 "temperature_override": TEMPERATURE_OVERRIDE,
                 "teacher_center_applied": mode == "centering",
-                "reference_counts": [len(REFERENCE_A), len(REFERENCE_B)], "references": reference_records,
+                "reference_counts": [len(references_a), len(references_b)],
+                "reference_source": reference_source,
+                "references": reference_records,
                 "mask_colors": {"A": color_a, "B": color_b, "background": BACKGROUND_COLOR},
                 "concept_names": [CONCEPT_A, CONCEPT_B], "metadata": metadata,
                 "source_geometry": source_sample.geometry, "source_grid": source_sample.grid,
