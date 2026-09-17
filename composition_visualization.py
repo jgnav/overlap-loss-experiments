@@ -28,13 +28,14 @@ from patch_concept_visualization import (
     _teacher_head_state, _teacher_state, _torch_load,
 )
 
+
 # ---- Hard-coded experiment configuration -----------------------------------
 # All configuration lives here; no command-line arguments are required.
-CHECKPOINT = Path("/path/to/checkpoint.pth")
+CHECKPOINT = Path("checkpoints/checkpoint_source1000_continuation0200.pth")
 COCO_IMAGE_ID = 240684
-DATASETS_ROOT = Path("/path/to/datasets")
+DATASETS_ROOT = Path("/mnt/fast/nobackup/scratch4weeks/jg02228/datasets")
 OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "composition"
-DEVICE = "cpu"  # Set to "cuda" on your GPU machine if desired.
+DEVICE = "cuda"  # Set to "cuda" on your GPU machine if desired.
 CONCEPT_A = "A"  # For example, "Dog"
 CONCEPT_B = "B"  # For example, "Car"
 BACKGROUND_COLOR = (0, 0, 0)
