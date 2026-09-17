@@ -8,6 +8,7 @@ import torch
 RESUME_COMPATIBILITY_KEYS = (
     "arch",
     "patch_size",
+    "register",
     "out_dim",
     "patch_out_dim",
     "shared_head",
@@ -256,9 +257,10 @@ def _load_optimizer_with_head_copies(checkpoint, student, optimizer):
     ):
         names = [parameter_names[id(p)] for p in live_group["params"]]
         mapped = [canonical.get(_source_parameter_name(name, source)) for name in names]
-        if None in mapped:
-            raise ValueError("Cannot expand shared-head optimizer: missing source parameter")
-        mapped_names = set(mapped)
+        missing_names = [name for name, source_name in zip(names, mapped) if source_name is None]
+        if any(not name.endswith("backbone.register_tokens") for name in missing_names):
+            raise ValueError("Cannot expand optimizer: missing source parameter")
+        mapped_names = {name for name in mapped if name is not None}
         source_names = [name for name in source if name in mapped_names and canonical[name] == name]
         if len(source_names) != len(source_group["params"]):
             raise ValueError("Cannot expand shared-head optimizer: unrecognized parameter layout")
@@ -268,6 +270,10 @@ def _load_optimizer_with_head_copies(checkpoint, student, optimizer):
             group["param_names"] = names
         expanded["param_groups"].append(group)
         for name, source_name, target_id, parameter in zip(names, mapped, target_group["params"], live_group["params"]):
+            if source_name is None:
+                # Newly introduced registers intentionally begin without Adam
+                # moments; AdamW creates their state at the first update.
+                continue
             if source[source_name].shape != parameter.shape:
                 raise ValueError(f"Cannot copy optimizer state for {name}: shape mismatch")
             state = saved["state"].get(source_ids[source_name])
@@ -285,6 +291,7 @@ def load_pretrained_state(
     student,
     teacher,
     ibot_loss,
+    allow_new_register_tokens=False,
 ):
     objects = {
         "student": student,
@@ -298,12 +305,38 @@ def load_pretrained_state(
             if name not in state and source_name in source:
                 state[name] = source[source_name].clone()
         incompatible = value.load_state_dict(state, strict=False)
-        if incompatible.missing_keys or incompatible.unexpected_keys:
+        missing = list(incompatible.missing_keys)
+        if allow_new_register_tokens:
+            missing = [
+                name for name in missing
+                if not name.endswith("backbone.register_tokens")
+            ]
+        if missing or incompatible.unexpected_keys:
             raise ValueError(
                 f"Checkpoint key '{key}' is incompatible: "
-                f"missing={incompatible.missing_keys}, "
+                f"missing={missing}, "
                 f"unexpected={incompatible.unexpected_keys}"
             )
+
+    if allow_new_register_tokens and not any(
+        name.endswith("backbone.register_tokens")
+        for name in checkpoint["student"]
+    ):
+        student_registers = [
+            parameter for name, parameter in student.named_parameters()
+            if name.endswith("backbone.register_tokens")
+        ]
+        teacher_registers = [
+            parameter for name, parameter in teacher.named_parameters()
+            if name.endswith("backbone.register_tokens")
+        ]
+        if len(student_registers) != len(teacher_registers):
+            raise ValueError("Student and teacher register topology differs")
+        with torch.no_grad():
+            for source_register, target_register in zip(
+                student_registers, teacher_registers
+            ):
+                target_register.copy_(source_register)
 
     missing_centers = sorted(
         {"center", "center2"} - set(checkpoint["ibot_loss"])
@@ -370,6 +403,7 @@ def load_continuation_state(
         student,
         teacher,
         ibot_loss,
+        allow_new_register_tokens=True,
     )
     optimizer_restored = "optimizer" in checkpoint
     if optimizer_restored:

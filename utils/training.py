@@ -368,7 +368,11 @@ class MultiCropWrapper(nn.Module):
                 else torch.cat((output, current_output))
             )
             start_index = end_index
-        projected_output = self.head(output)
+        register_count = getattr(self.backbone, "num_register_tokens", 0)
+        head_input = torch.cat(
+            (output[:, :1], output[:, 1 + register_count:]), dim=1
+        )
+        projected_output = self.head(head_input)
         if return_backbone_feat:
             return output, projected_output
         return projected_output

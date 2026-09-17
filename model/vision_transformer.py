@@ -130,10 +130,14 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=[224], patch_size=16, in_chans=3, num_classes=0, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=partial(nn.LayerNorm, eps=1e-6), return_all_tokens=False, 
-                 init_values=0, use_mean_pooling=False, masked_im_modeling=False):
+                 init_values=0, use_mean_pooling=False, masked_im_modeling=False,
+                 num_register_tokens=0):
         super().__init__()
+        if type(num_register_tokens) is not int or num_register_tokens < 0:
+            raise ValueError("num_register_tokens must be an integer >= 0")
         self.num_features = self.embed_dim = embed_dim
         self.return_all_tokens = return_all_tokens
+        self.num_register_tokens = num_register_tokens
 
         self.patch_embed = PatchEmbed(
             img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
@@ -141,6 +145,10 @@ class VisionTransformer(nn.Module):
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.register_tokens = (
+            nn.Parameter(torch.zeros(1, num_register_tokens, embed_dim))
+            if num_register_tokens else None
+        )
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
@@ -158,6 +166,10 @@ class VisionTransformer(nn.Module):
 
         trunc_normal_(self.pos_embed, std=.02)
         trunc_normal_(self.cls_token, std=.02)
+        if self.register_tokens is not None:
+            # Match DINOv2: registers have no positional embedding and use a
+            # very small normal initialization.
+            nn.init.normal_(self.register_tokens, std=1e-6)
         self.apply(self._init_weights)
 
         # masked image modeling
@@ -213,6 +225,15 @@ class VisionTransformer(nn.Module):
         # add positional encoding to each token
         x = x + self.interpolate_pos_encoding(x, w, h)
 
+        # DINOv2 inserts registers only after adding CLS/patch positional
+        # embeddings, so registers themselves have no positional embedding.
+        if self.register_tokens is not None:
+            x = torch.cat((
+                x[:, :1],
+                self.register_tokens.expand(B, -1, -1),
+                x[:, 1:],
+            ), dim=1)
+
         return self.pos_drop(x)
 
     def forward(self, x, return_all_tokens=None, mask=None):
@@ -228,7 +249,9 @@ class VisionTransformer(nn.Module):
 
         x = self.norm(x)
         if self.fc_norm is not None:
-            x[:, 0] = self.fc_norm(x[:, 1:, :].mean(1))
+            x[:, 0] = self.fc_norm(
+                x[:, 1 + self.num_register_tokens:, :].mean(1)
+            )
         
         return_all_tokens = self.return_all_tokens if \
             return_all_tokens is None else return_all_tokens
@@ -252,7 +275,13 @@ class VisionTransformer(nn.Module):
         for i, blk in enumerate(self.blocks):
             x = blk(x)
             if len(self.blocks) - i <= n:
-                output.append(self.norm(x))
+                normalized = self.norm(x)
+                # Keep this repository's established intermediate-layer API:
+                # [CLS, patches]. Registers remain internal memory tokens.
+                output.append(torch.cat((
+                    normalized[:, :1],
+                    normalized[:, 1 + self.num_register_tokens:],
+                ), dim=1))
         return output
         
     def get_num_layers(self):

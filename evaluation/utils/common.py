@@ -245,12 +245,23 @@ def load_backbone(checkpoint_path, checkpoint_key="teacher", arch="auto"):
     position_grid = math.isqrt(position.shape[1] - 1)
     if position_grid ** 2 != position.shape[1] - 1:
         raise ValueError("Expected a square positional grid plus one CLS token")
+    register_tokens = state.get("register_tokens")
+    if register_tokens is not None and (
+        register_tokens.ndim != 3
+        or register_tokens.shape[0] != 1
+        or register_tokens.shape[2] != state["cls_token"].shape[2]
+    ):
+        raise ValueError("Checkpoint register_tokens must have shape [1, count, hidden_dim]")
+    num_register_tokens = (
+        0 if register_tokens is None else int(register_tokens.shape[1])
+    )
     model = create_model(
         architecture,
         img_size=[position_grid * patch_size],
         patch_size=patch_size,
         num_classes=0,
         return_all_tokens=True,
+        num_register_tokens=num_register_tokens,
     )
     model_keys = set(model.state_dict())
     unsupported = sorted(
@@ -279,6 +290,7 @@ def load_backbone(checkpoint_path, checkpoint_key="teacher", arch="auto"):
         "architecture": architecture,
         "patch_size": patch_size,
         "pretraining_position_grid": position_grid,
+        "num_register_tokens": num_register_tokens,
         "checkpoint_key": checkpoint_key,
         "checkpoint": str(Path(checkpoint_path).resolve()),
         "checkpoint_fingerprint": checkpoint_fingerprint(checkpoint_path),

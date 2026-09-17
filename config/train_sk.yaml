@@ -8,6 +8,7 @@ resume_checkpoint: null
 
 # Model
 arch: vit_small
+register: 0
 # Prototype-head topology: true reuses one head for CLS and patch tokens;
 # false gives CLS and patch tokens separate heads with identical architecture.
 shared_head: true

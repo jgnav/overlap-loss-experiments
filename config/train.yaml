@@ -8,6 +8,9 @@ resume_checkpoint: null
 
 # Model
 arch: vit_small
+# DINOv2-style learned memory tokens between CLS and patch tokens. Use 0 to
+# retain the original iBOT backbone exactly; 4 is the standard register setup.
+register: 4
 # Prototype-head topology: true reuses one head for CLS and patch tokens;
 # false gives CLS and patch tokens separate heads with identical architecture.
 shared_head: true

@@ -75,6 +75,8 @@ def load_config(path):
         raise ValueError("online_probe_wait_at_exit must be a boolean")
     if type(config["shared_head"]) is not bool:
         raise ValueError("shared_head must be a boolean")
+    if type(config["register"]) is not int or config["register"] < 0:
+        raise ValueError("register must be an integer >= 0")
     if not 0 < config["region_patch_threshold"] <= 1:
         raise ValueError("region_patch_threshold must be in (0, 1]")
     if not math.isfinite(config["region_temp"]) or config["region_temp"] <= 0:
@@ -250,11 +252,13 @@ def train_ibot(args, wandb_run=None):
         drop_path_rate=args.drop_path,
         return_all_tokens=True,
         masked_im_modeling=args.use_masked_im_modeling,
+        num_register_tokens=args.register,
     )
     teacher = create_model(
         args.arch,
         patch_size=args.patch_size,
         return_all_tokens=True,
+        num_register_tokens=args.register,
     )
     embed_dim = student.embed_dim
 
@@ -650,7 +654,10 @@ def train_one_epoch(
                     backbone_features, teacher_output = teacher(
                         images[: args.global_crops_number], return_backbone_feat=True
                     )
-                    feature_diagnostics.update(backbone_features[:, 1:])
+                    register_count = teacher_without_ddp.backbone.num_register_tokens
+                    feature_diagnostics.update(
+                        backbone_features[:, 1 + register_count:]
+                    )
                     del backbone_features
                 else:
                     teacher_output = teacher(images[: args.global_crops_number])

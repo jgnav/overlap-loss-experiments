@@ -42,6 +42,7 @@ class ContinuationConfigTest(unittest.TestCase):
         self.assertEqual(config.region_patch_threshold, .5)
         self.assertEqual(config.lambda3, 1.0)
         self.assertEqual(config.region_normalization, "softmax")
+        self.assertEqual(config.register, 0)
         self.assertIsNone(config.resume_checkpoint)
 
     def test_region_settings_load_and_validate(self):

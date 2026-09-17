@@ -129,6 +129,11 @@ The teacher is detached in every mode. Only patches from valid pairs passing
 both geometry filters participate in Sinkhorn; no centering is used by any
 region mode. DINO and iBOT always retain their centered teacher softmax targets.
 
+Set `register: 4` in the training YAML to insert four DINOv2-style learnable
+memory tokens between CLS and the spatial patches. Registers participate in
+self-attention but are excluded from the CLS/patch heads and every spatial
+loss. `register: 0` preserves the original iBOT token sequence.
+
 `lambda3` weights this additional loss;
 `lambda3: 0.0` disables the branch for the unchanged iBOT baseline.
 `region_min_area` keeps the existing minimum intersection-area filter.
