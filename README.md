@@ -138,3 +138,14 @@ continuation run for this changed objective: `resume_checkpoint: null`, with
 
 In `evaluation.yaml`, set `datasets_root` to the prepared-data path, select your `checkpoint`,
 and keep `output_dir: null` for separate results per launch.
+
+For a paper-style A+B composition figure from a COCO image ID and datasets root, configure the checkpoint, image ID, datasets root, and independent reference regions
+in `composition_visualization.py`
+and run:
+
+```bash
+python composition_visualization.py
+```
+
+See [the composition figure protocol](docs/composition_visualization.md) for
+mask colors, independent calibration, patch-count mixtures, and output details.

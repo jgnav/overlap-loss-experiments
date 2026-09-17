@@ -12,3 +12,6 @@ scipy==1.14.1
 matplotlib>=3.7
 tqdm==4.67.1
 cuml-cu12==24.6.1
+
+# COCO instance masks for composition_visualization.py
+pycocotools>=2.0.7
