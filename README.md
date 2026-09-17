@@ -112,8 +112,13 @@ logits** from the same two global views (including the existing masked student
 forward). Crop geometry and horizontal flips map their shared region to each
 patch grid. Patches participate when their covered fraction is at least
 `region_patch_threshold` (default `0.5`); every selected patch has equal weight.
-One `region_normalization` setting applies to **both teacher and student**:
+`region_normalization` selects the overlap representation:
 
+- `centering`: reuse the ordinary iBOT teacher patch targets after subtracting
+  `center2` and applying softmax at `teacher_patch_temp`. Student patches use
+  the ordinary `student_temp` softmax. The branch averages selected patch
+  distributions and applies symmetric cross-entropy. No centered targets are
+  recomputed, and `region_temp` is unused.
 - `softmax` (default): per-patch softmax at `region_temp`, then an equal-weight
   mean and symmetric cross-entropy.
 - `raw_logits`: L2-normalize each raw patch vector, average selected vectors,
@@ -126,8 +131,8 @@ One `region_normalization` setting applies to **both teacher and student**:
   flow through student Sinkhorn, including its distributed normalization.
 
 The teacher is detached in every mode. Only patches from valid pairs passing
-both geometry filters participate in Sinkhorn; no centering is used by any
-region mode. DINO and iBOT always retain their centered teacher softmax targets.
+both geometry filters participate in Sinkhorn. DINO and iBOT always retain
+their centered teacher softmax targets.
 
 Set `register: 4` in the training YAML to insert four DINOv2-style learnable
 memory tokens between CLS and the spatial patches. Registers participate in

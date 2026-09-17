@@ -78,6 +78,9 @@ arguments, defaulting to uncentered softmax for original iBOT checkpoints.
 `TEMPERATURE_OVERRIDE = None` reads `region_temp`, defaulting to `0.1`.
 
 - Softmax operates independently on each patch.
+- Centering restores the saved iBOT patch center (`center2`) and applies the
+  checkpoint's `teacher_patch_temp` to the raw teacher patch logits. This is
+  the same teacher target representation used by ordinary iBOT.
 - Sinkhorn uses the training implementation with three iterations. All accepted
   calibration patches from both concepts share one calibration assignment bank.
   The displayed image's accepted A+B patches form a separate bank. Assignments

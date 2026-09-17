@@ -151,6 +151,23 @@ class PureIBOTAndDiagnosticsTest(unittest.TestCase):
         ):
             self.assertTrue(torch.isfinite(result[key]).item(), key)
 
+    def test_centering_region_reuses_the_existing_teacher_patch_targets(self):
+        loss = make_loss(lambda3=.2, region_normalization="centering")
+        student, teacher, masks, crop_boxes = self._inputs()
+        targets = loss.softmax_center_teacher(teacher, .07, .07)
+        with mock.patch.object(
+            loss.region_loss, "forward", wraps=loss.region_loss.forward
+        ) as region_forward:
+            result = loss(
+                student, targets, None, masks, crop_boxes,
+                teacher_patch_logits=teacher[1],
+            )
+        passed = region_forward.call_args.kwargs["teacher_patch_targets"]
+        for actual, expected in zip(passed, targets[1].chunk(2)):
+            torch.testing.assert_close(actual, expected)
+            self.assertEqual(actual.untyped_storage().data_ptr(), expected.untyped_storage().data_ptr())
+        self.assertTrue(torch.isfinite(result["region_raw"]))
+
     def test_region_preserves_baseline_cls_and_patch_objectives(self):
         loss = make_loss(nlcrops=1)
         student, teacher, masks, crop_boxes = self._inputs()

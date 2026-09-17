@@ -261,8 +261,13 @@ def load_teacher(path):
         backbone, checkpoint, _teacher_head_state(_teacher_state(checkpoint))
     )
     mode = NORMALIZATION_OVERRIDE or _checkpoint_argument(checkpoint, "region_normalization", "softmax")
-    temp = TEMPERATURE_OVERRIDE if TEMPERATURE_OVERRIDE is not None else _checkpoint_argument(checkpoint, "region_temp", .1)
-    if mode not in ("softmax", "sinkhorn"):
+    default_temperature = (
+        _checkpoint_argument(checkpoint, "teacher_patch_temp", .07)
+        if mode == "centering"
+        else _checkpoint_argument(checkpoint, "region_temp", .1)
+    )
+    temp = TEMPERATURE_OVERRIDE if TEMPERATURE_OVERRIDE is not None else default_temperature
+    if mode not in ("centering", "softmax", "sinkhorn"):
         raise ValueError(
             f"{mode!r} is not a probability representation: 100% mass bars are undefined for signed raw_logits. "
             "Use a probability-mode checkpoint or explicitly set NORMALIZATION_OVERRIDE='softmax' "
@@ -270,9 +275,18 @@ def load_teacher(path):
         )
     if not math.isfinite(float(temp)) or float(temp) <= 0:
         raise ValueError("Temperature must be finite and positive")
+    center = None
+    if mode == "centering":
+        loss_state = checkpoint.get("ibot_loss", {})
+        center = loss_state.get("center2") if isinstance(loss_state, dict) else None
+        if center is None or center.shape != (1, 1, prototypes):
+            raise ValueError(
+                "Centering visualization requires checkpoint ibot_loss.center2"
+            )
+        center = center.detach().float().reshape(1, prototypes).cpu()
     backbone = backbone.to(DEVICE).eval().requires_grad_(False)
     head = head.to(DEVICE).eval().requires_grad_(False)
-    return backbone, head, metadata, prototypes, mode, float(temp)
+    return backbone, head, metadata, prototypes, mode, float(temp), center
 
 
 @torch.inference_mode()
@@ -290,15 +304,19 @@ def extract_sample(backbone, head, image, mask, patch_size):
 
 
 @torch.inference_mode()
-def normalize_bank(logits, mode, temperature):
+def normalize_bank(logits, mode, temperature, center=None):
     if logits.ndim != 2 or not len(logits) or not torch.isfinite(logits).all():
         raise ValueError("Expected nonempty finite [patches, prototypes] logits")
-    if mode == "softmax":
+    if mode == "centering":
+        if center is None or tuple(center.shape) != (1, logits.shape[1]):
+            raise ValueError("Centering requires one center vector per prototype")
+        result = ((logits.float() - center.float()) / temperature).softmax(-1)
+    elif mode == "softmax":
         result = (logits.float() / temperature).softmax(-1)
     elif mode == "sinkhorn":
         result = sinkhorn_log_probabilities(logits, temperature).exp()
     else:
-        raise ValueError("Mass visualizations require softmax or sinkhorn probabilities")
+        raise ValueError("Mass visualizations require centering, softmax, or sinkhorn probabilities")
     return result.double().numpy()
 
 
@@ -498,7 +516,7 @@ def main():
     validate_inputs(checkpoint, image, mask)
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    backbone, head, metadata, prototypes, mode, temperature = load_teacher(checkpoint)
+    backbone, head, metadata, prototypes, mode, temperature, center = load_teacher(checkpoint)
     patch_size = int(metadata["patch_size"])
     sample = extract_sample(backbone, head, image, mask, patch_size)
     color_a, color_b = resolve_colors(sample.mask)
@@ -523,7 +541,9 @@ def main():
             print(f"Calibration {concept}: {reference.image}: {int(selected.sum())} pure patches", flush=True)
     # One calibration assignment bank across independent A/B references. SK is
     # not recalculated per pure region (that would balance each region itself).
-    reference_probabilities = normalize_bank(torch.cat(reference_banks), mode, temperature)
+    reference_probabilities = normalize_bank(
+        torch.cat(reference_banks), mode, temperature, center
+    )
     region_reference_means = []
     offset = 0
     for bank in reference_banks:
@@ -532,11 +552,14 @@ def main():
     mu_a = np.mean(region_reference_means[:len(REFERENCE_A)], axis=0)
     mu_b = np.mean(region_reference_means[len(REFERENCE_A):], axis=0)
     # Normalize the displayed union once, then freeze assignments for mixtures.
-    probabilities = normalize_bank(sample.logits[np.concatenate((ia, ib))], mode, temperature)
+    probabilities = normalize_bank(
+        sample.logits[np.concatenate((ia, ib))], mode, temperature, center
+    )
     result = build_composition(probabilities, ia, ib, mu_a, mu_b, len(sample.logits))
     protocol = {"checkpoint": str(checkpoint), "image": str(image), "mask": str(mask),
                 "coco": coco, "mode": mode, "temperature": temperature, "normalization_override": NORMALIZATION_OVERRIDE,
-                "temperature_override": TEMPERATURE_OVERRIDE, "teacher_center_applied": False,
+                "temperature_override": TEMPERATURE_OVERRIDE,
+                "teacher_center_applied": mode == "centering",
                 "reference_counts": [len(REFERENCE_A), len(REFERENCE_B)], "references": reference_records,
                 "mask_colors": {"A": color_a, "B": color_b, "background": BACKGROUND_COLOR},
                 "concept_names": [CONCEPT_A, CONCEPT_B], "metadata": metadata,

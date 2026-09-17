@@ -101,6 +101,69 @@ class RegionNormalizationTest(unittest.TestCase):
                 self.assertIsNone(self.teacher.grad)
                 self.assertGreater(student.grad.abs().sum().item(), 0)
 
+    def test_centering_reuses_teacher_targets_and_student_temperature(self):
+        student = self.student.detach().clone().requires_grad_()
+        center = torch.tensor([[[.03, -.02, .01]]])
+        teacher_targets = tuple(
+            ((view.detach() - center) / .07).softmax(-1)
+            for view in self.teacher.unbind(1)
+        )
+        loss = RegionLoss(
+            patch_threshold=.51,
+            temperature=999.,
+            normalization="centering",
+            student_temperature=.3,
+        )
+        result = loss(
+            tuple(student.unbind(1)),
+            tuple(self.teacher.unbind(1)),
+            self.boxes,
+            teacher_patch_targets=teacher_targets,
+        )
+        fractions, valid, _ = intersection_patch_fractions(self.boxes, 4, 0.)
+        selected = (fractions >= .51) & valid[:, None, None]
+        valid = valid & selected.any(-1).all(-1)
+        selected = selected & valid[:, None, None]
+        student_probabilities = (student / .3).softmax(-1)
+        student_regions = [
+            (
+                student_probabilities[:, view][valid]
+                * selected[valid, view, :, None]
+            ).sum(1) / selected[valid, view].sum(1, keepdim=True)
+            for view in range(2)
+        ]
+        teacher_regions = [
+            (
+                teacher_targets[view][valid]
+                * selected[valid, view, :, None]
+            ).sum(1) / selected[valid, view].sum(1, keepdim=True)
+            for view in range(2)
+        ]
+        expected = -.5 * (
+            (teacher_regions[0] * student_regions[1].log()).sum(-1)
+            + (teacher_regions[1] * student_regions[0].log()).sum(-1)
+        ).mean()
+        expected_grad = torch.autograd.grad(expected, student)[0]
+        result["loss"].backward()
+        torch.testing.assert_close(result["loss"], expected)
+        torch.testing.assert_close(student.grad, expected_grad)
+        self.assertIsNone(self.teacher.grad)
+
+        changed_raw_teacher = tuple(x.detach() * 1000 for x in self.teacher.unbind(1))
+        unchanged = loss(
+            tuple(student.detach().unbind(1)), changed_raw_teacher, self.boxes,
+            teacher_patch_targets=teacher_targets,
+        )["loss"]
+        torch.testing.assert_close(unchanged, result["loss"])
+
+    def test_centering_requires_precomputed_teacher_targets(self):
+        with self.assertRaisesRegex(ValueError, "teacher_patch_targets"):
+            RegionLoss(normalization="centering")(
+                tuple(self.student.unbind(1)),
+                tuple(self.teacher.unbind(1)),
+                self.boxes,
+            )
+
     def test_raw_vectors_invariant_to_positive_patch_scaling_and_temperature(self):
         loss = RegionLoss(normalization='raw_logits')
         original = loss(tuple(self.student.unbind(1)), tuple(self.teacher.unbind(1)), self.boxes)['loss']
@@ -132,18 +195,25 @@ class RegionNormalizationTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(logits.grad).all())
 
     def test_empty_pairs_skip_sinkhorn_and_keep_zero_student_gradients(self):
-        for mode in ('softmax', 'raw_logits', 'sinkhorn'):
+        for mode in ('centering', 'softmax', 'raw_logits', 'sinkhorn'):
             student = self.student.detach().clone().requires_grad_()
             loss = RegionLoss(normalization=mode)
             with mock.patch('losses.region_loss.sinkhorn_log_probabilities', side_effect=AssertionError):
-                result = loss(tuple(student.unbind(1)), tuple(self.teacher.unbind(1)), boxes_disjoint(2))
+                kwargs = (
+                    {"teacher_patch_targets": tuple(self.teacher.detach().softmax(-1).unbind(1))}
+                    if mode == "centering" else {}
+                )
+                result = loss(
+                    tuple(student.unbind(1)), tuple(self.teacher.unbind(1)),
+                    boxes_disjoint(2), **kwargs
+                )
             result['loss'].backward()
             self.assertEqual(result['loss'].item(), 0)
             self.assertEqual(student.grad.count_nonzero(), 0)
 
     def test_invalid_mode_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'region_normalization'):
-            RegionLoss(normalization='centering')
+            RegionLoss(normalization='invalid')
 
     @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(), 'Gloo required')
     def test_distributed_sinkhorn_gradients_match_global_reference(self):

@@ -101,6 +101,11 @@ class CompositionMathTest(unittest.TestCase):
         logits = torch.tensor([[.2, .1, -.1], [-.2, .4, .1]])
         np.testing.assert_allclose(viz.normalize_bank(logits, 'softmax', .2), (logits / .2).softmax(-1).numpy())
         np.testing.assert_allclose(viz.normalize_bank(logits, 'sinkhorn', .2).sum(1), 1, atol=1e-6)
+        center = torch.tensor([[.1, -.2, .3]])
+        np.testing.assert_allclose(
+            viz.normalize_bank(logits, 'centering', .2, center),
+            ((logits - center) / .2).softmax(-1).numpy(),
+        )
         with self.assertRaisesRegex(ValueError, 'probabilities'):
             viz.normalize_bank(logits, 'raw_logits', .2)
 
@@ -121,12 +126,37 @@ class CompositionIOTest(unittest.TestCase):
                 torch.save(checkpoint, path)
                 backbone = torch.nn.Identity()
                 backbone.embed_dim = 12
-                with mock.patch.object(viz, 'load_backbone', return_value=(backbone, {'patch_size': 16})):
-                    _, loaded, _, dimensions, mode, temperature = viz.load_teacher(path)
+                with mock.patch.object(viz, 'DEVICE', 'cpu'), mock.patch.object(
+                    viz, 'load_backbone', return_value=(backbone, {'patch_size': 16})
+                ):
+                    _, loaded, _, dimensions, mode, temperature, center = viz.load_teacher(path)
                 self.assertEqual((dimensions, mode, temperature), (5, 'sinkhorn', .23))
+                self.assertIsNone(center)
                 inputs = torch.randn(1, 5, 12)
                 torch.testing.assert_close(loaded(inputs)[1], head(inputs)[1])
                 self.assertTrue(all(not p.requires_grad for p in loaded.parameters()))
+
+    def test_teacher_loading_restores_patch_center_for_centering_mode(self):
+        from model import iBOTHead
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'checkpoint.pth'
+            head = iBOTHead(12, 5, patch_out_dim=5, shared_head=True).eval()
+            expected_center = torch.linspace(-.2, .2, 5).reshape(1, 1, 5)
+            torch.save({
+                'teacher': {'head.' + k: v for k, v in head.state_dict().items()},
+                'ibot_loss': {'center2': expected_center},
+                'args': {'shared_head': True, 'out_dim': 5, 'patch_out_dim': 5,
+                         'region_normalization': 'centering',
+                         'teacher_patch_temp': .07},
+            }, path)
+            backbone = torch.nn.Identity()
+            backbone.embed_dim = 12
+            with mock.patch.object(viz, 'DEVICE', 'cpu'), mock.patch.object(
+                viz, 'load_backbone', return_value=(backbone, {'patch_size': 16})
+            ):
+                *_, mode, temperature, center = viz.load_teacher(path)
+            self.assertEqual((mode, temperature), ('centering', .07))
+            torch.testing.assert_close(center, expected_center.reshape(1, 5))
 
     def test_palette_masks_resize_together_and_patch_purity_is_area_fraction(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -197,9 +227,10 @@ class CompositionIOTest(unittest.TestCase):
                   mock.patch.object(viz, 'REFERENCE_B', [viz.ReferenceRegion(b, bm, (0, 255, 0))]),
                   mock.patch.object(viz, 'OBJECT_A_COLOR', (255, 0, 0)),
                   mock.patch.object(viz, 'OBJECT_B_COLOR', (0, 255, 0)),
+                  mock.patch.object(viz, 'DEVICE', 'cpu'),
                   mock.patch.object(viz, 'LONG_SIDE', 32), mock.patch.object(viz, 'DPI', 65),
                   mock.patch.object(viz, 'OUTPUT_DIR', root),
-                  mock.patch.object(viz, 'load_teacher', return_value=(Backbone(), Head(), {'patch_size': 4}, 3, 'softmax', .5)),
+                  mock.patch.object(viz, 'load_teacher', return_value=(Backbone(), Head(), {'patch_size': 4}, 3, 'softmax', .5, None)),
                   mock.patch.object(viz, 'find_coco_pair', return_value=(target, target_mask, {'image_id': 240684})),
                   mock.patch.object(viz, 'CHECKPOINT', checkpoint),
                   mock.patch.object(viz, 'COCO_IMAGE_ID', 240684),

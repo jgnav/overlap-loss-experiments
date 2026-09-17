@@ -22,9 +22,10 @@ lambda3: 1.0  # Region composition weight; set to 0.0 for pure iBOT.
 region_min_area: 0.10
 # Binary selection: minimum fraction of each patch inside the shared region.
 region_patch_threshold: 0.5
-# Shared teacher/student overlap normalization: softmax, raw_logits, or sinkhorn.
+# Overlap normalization: centering, softmax, raw_logits, or sinkhorn.
+# centering reuses the ordinary iBOT centered teacher patch targets.
 region_normalization: softmax
-# Temperature for softmax/Sinkhorn (unused by L2-normalized raw_logits).
+# Temperature for softmax/Sinkhorn (unused by centering and raw_logits).
 region_temp: 0.1
 momentum_teacher: 0.9995
 teacher_temp: 0.07

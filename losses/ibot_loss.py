@@ -45,7 +45,11 @@ class iBOTLoss(nn.Module):
         self.lambda2 = lambda2
         self.lambda3 = lambda3
         self.region_loss = RegionLoss(
-            region_min_area, region_patch_threshold, region_temp, region_normalization
+            region_min_area,
+            region_patch_threshold,
+            region_temp,
+            region_normalization,
+            student_temperature=student_temp,
         )
 
         self.teacher_temp_schedule = np.concatenate(
@@ -195,7 +199,7 @@ class iBOTLoss(nn.Module):
         *,
         teacher_patch_logits=None,
     ):
-        """Compute baseline centered DINO/iBOT plus raw-logit region composition."""
+        """Compute baseline centered DINO/iBOT plus region composition."""
         student_cls, student_patch = student_output
         teacher_cls, teacher_patch = teacher_targets
 
@@ -261,6 +265,7 @@ class iBOTLoss(nn.Module):
                 raw_student_patch_c,
                 teacher_patch_logits.detach().chunk(self.ngcrops),
                 crop_boxes,
+                teacher_patch_targets=teacher_patch_c,
             )
             region_raw = region_stats["loss"]
             total_loss3 = region_raw * region_weight

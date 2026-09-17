@@ -81,10 +81,10 @@ def intersection_patch_fractions(crop_boxes, patch_count, min_area):
 
 
 class RegionLoss(nn.Module):
-    """Symmetric consistency between means of selected uncentered patches."""
+    """Symmetric consistency between means of selected patch representations."""
 
     def __init__(self, min_area=0.0, patch_threshold=0.5, temperature=0.1,
-                 normalization="softmax"):
+                 normalization="softmax", student_temperature=0.1):
         super().__init__()
         if not 0.0 <= min_area <= 1.0:
             raise ValueError("region_min_area must be between 0 and 1")
@@ -92,11 +92,16 @@ class RegionLoss(nn.Module):
             raise ValueError("region_patch_threshold must be in (0, 1]")
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("region_temp must be finite and positive")
-        if normalization not in ("softmax", "raw_logits", "sinkhorn"):
-            raise ValueError("region_normalization must be softmax, raw_logits, or sinkhorn")
+        if not math.isfinite(student_temperature) or student_temperature <= 0:
+            raise ValueError("student_temperature must be finite and positive")
+        if normalization not in ("centering", "softmax", "raw_logits", "sinkhorn"):
+            raise ValueError(
+                "region_normalization must be centering, softmax, raw_logits, or sinkhorn"
+            )
         self.min_area = min_area
         self.patch_threshold = patch_threshold
         self.temperature = temperature
+        self.student_temperature = student_temperature
         self.normalization = normalization
 
     @staticmethod
@@ -119,16 +124,31 @@ class RegionLoss(nn.Module):
             dim=1, keepdim=True
         ).float().log()
 
-    def _region_log_distribution(self, logits, selected):
+    def _region_log_distribution(self, logits, selected, temperature=None):
         # log(mean(softmax(z / T))) preserves the exact probability-mean
         # objective without clamping away gradients for small probabilities.
         # Excluded logits never enter softmax or the region representation.
         logits = logits.float().masked_fill(~selected[..., None], 0)
-        log_probabilities = F.log_softmax(logits / self.temperature, dim=-1)
+        temperature = self.temperature if temperature is None else temperature
+        log_probabilities = F.log_softmax(logits / temperature, dim=-1)
         log_probabilities = log_probabilities.masked_fill(~selected[..., None], -torch.inf)
         return self._pool_log_probabilities(log_probabilities, selected)
 
-    def forward(self, student_patch_logits, teacher_patch_logits, crop_boxes):
+    @staticmethod
+    def _region_probability_mean(probabilities, selected):
+        probabilities = probabilities.float().masked_fill(
+            ~selected[..., None], 0
+        )
+        return probabilities.sum(dim=1) / selected.sum(dim=1, keepdim=True)
+
+    def forward(
+        self,
+        student_patch_logits,
+        teacher_patch_logits,
+        crop_boxes,
+        *,
+        teacher_patch_targets=None,
+    ):
         if len(student_patch_logits) != 2 or len(teacher_patch_logits) != 2:
             raise ValueError("Region loss requires exactly two global crops")
         shape = student_patch_logits[0].shape
@@ -136,6 +156,17 @@ class RegionLoss(nn.Module):
                 or any(logits.shape != shape for logits in
                        (*student_patch_logits, *teacher_patch_logits))):
             raise ValueError("Region logits must have matching [batch, patches, prototypes] shapes")
+        if self.normalization == "centering":
+            if teacher_patch_targets is None:
+                raise ValueError(
+                    "centering region normalization requires teacher_patch_targets"
+                )
+            if len(teacher_patch_targets) != 2 or any(
+                target.shape != shape for target in teacher_patch_targets
+            ):
+                raise ValueError(
+                    "Centered teacher patch targets must match region-logit shapes"
+                )
         fractions, valid, intersection_area = intersection_patch_fractions(
             crop_boxes.float(), shape[1], self.min_area
         )
@@ -169,6 +200,20 @@ class RegionLoss(nn.Module):
                     self._pool_log_probabilities(teacher_patches[valid, v], selected[valid, v]).exp()
                     for v in range(2)
                 ]
+            elif self.normalization == "centering":
+                student_regions = [
+                    self._region_log_distribution(
+                        x[valid], selected[valid, view], self.student_temperature
+                    )
+                    for view, x in enumerate(student_patch_logits)
+                ]
+                with torch.no_grad():
+                    teacher_regions = [
+                        self._region_probability_mean(
+                            target.detach()[valid], selected[valid, view]
+                        )
+                        for view, target in enumerate(teacher_patch_targets)
+                    ]
             else:
                 transform = (self._region_raw_vector if self.normalization == "raw_logits"
                              else self._region_log_distribution)

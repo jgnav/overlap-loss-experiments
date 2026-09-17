@@ -81,8 +81,12 @@ def load_config(path):
         raise ValueError("region_patch_threshold must be in (0, 1]")
     if not math.isfinite(config["region_temp"]) or config["region_temp"] <= 0:
         raise ValueError("region_temp must be finite and positive")
-    if config["region_normalization"] not in ("softmax", "raw_logits", "sinkhorn"):
-        raise ValueError("region_normalization must be softmax, raw_logits, or sinkhorn")
+    if config["region_normalization"] not in (
+        "centering", "softmax", "raw_logits", "sinkhorn"
+    ):
+        raise ValueError(
+            "region_normalization must be centering, softmax, raw_logits, or sinkhorn"
+        )
     if "additional_epochs" in user_config and "epochs" in user_config:
         raise ValueError(
             "Configure training length with additional_epochs, not both keys"
