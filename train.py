@@ -75,6 +75,8 @@ def load_config(path):
         raise ValueError("online_probe_wait_at_exit must be a boolean")
     if type(config["shared_head"]) is not bool:
         raise ValueError("shared_head must be a boolean")
+    if type(config["ibot_plus_plus"]) is not bool:
+        raise ValueError("ibot_plus_plus must be a boolean")
     if type(config["register"]) is not int or config["register"] < 0:
         raise ValueError("register must be an integer >= 0")
     if not 0 < config["region_patch_threshold"] <= 1:
@@ -327,6 +329,7 @@ def train_ibot(args, wandb_run=None):
         region_patch_threshold=args.region_patch_threshold,
         region_temp=args.region_temp,
         region_normalization=args.region_normalization,
+        ibot_plus_plus=args.ibot_plus_plus,
         mim_start_epoch=args.pred_start_epoch,
     ).cuda()
 

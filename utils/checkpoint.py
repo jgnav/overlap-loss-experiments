@@ -42,6 +42,7 @@ RESUME_COMPATIBILITY_KEYS = (
     "region_patch_threshold",
     "region_temp",
     "region_normalization",
+    "ibot_plus_plus",
     "momentum_teacher",
     "epochs",
     "batch_size_per_gpu",

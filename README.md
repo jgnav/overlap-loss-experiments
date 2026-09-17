@@ -107,6 +107,14 @@ with separate CLS and patch centers restored from checkpoints. Their student
 outputs use the original temperature-scaled log-softmax. There is no teacher
 normalization selector.
 
+`ibot_plus_plus: false` keeps the original iBOT patch objective exactly: only
+masked patches are distilled. Set it to `true` to add the same-view visible
+patches to that objective, as in TIPSv2 iBOT++; the teacher remains detached and
+centered, and the student uses the existing temperature-scaled log-softmax.
+The masked and visible terms are normalized separately and summed, preserving
+the original masked-patch signal. The result also reports `patch_masked`,
+`patch_visible`, and `patch_all` metrics.
+
 The additional region-composition branch uses **raw, uncentered patch-head
 logits** from the same two global views (including the existing masked student
 forward). Crop geometry and horizontal flips map their shared region to each

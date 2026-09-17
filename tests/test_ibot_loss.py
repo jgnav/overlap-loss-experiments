@@ -246,6 +246,32 @@ class PureIBOTAndDiagnosticsTest(unittest.TestCase):
                 disabled = loss(student, targets, None, masks, None)
             torch.testing.assert_close(disabled["loss"], expected["loss"])
 
+    def test_ibot_plus_plus_adds_visible_patch_distillation(self):
+        student, teacher, masks, _ = self._inputs()
+        masks[0][0, 0, 0] = False
+        masks[1][1, 1, 1] = False
+        targets = make_loss(lambda3=0).softmax_center_teacher(teacher, .07, .07)
+        plus = make_loss(lambda3=0, ibot_plus_plus=True)
+        result = plus(student, targets, None, masks, None)
+        teacher_patch = targets[1].chunk(2)
+        student_patch = student[1].chunk(2)
+        expected_all = []
+        for q in range(2):
+            ce = -(teacher_patch[q] * F.log_softmax(
+                student_patch[q] / .1, dim=-1
+            )).sum(dim=-1)
+            mask = masks[q].flatten(1)
+            masked = (ce * mask).sum(-1) / mask.sum(-1).clamp_min(1)
+            visible = (ce * (~mask)).sum(-1) / (~mask).sum(-1).clamp_min(1)
+            expected_all.append(masked.mean() + visible.mean())
+        torch.testing.assert_close(result["patch"], torch.stack(expected_all).mean())
+        self.assertGreater(result["patch_visible"].item(), 0.0)
+        self.assertEqual(result["ibot_plus_plus"].item(), 1.0)
+
+        baseline = make_loss(lambda3=0)
+        baseline_result = baseline(student, targets, None, masks, None)
+        self.assertFalse(torch.allclose(result["patch"], baseline_result["patch"]))
+
 
 if __name__ == "__main__":
     unittest.main()

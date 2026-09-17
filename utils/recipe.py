@@ -20,6 +20,7 @@ COMMON_IBOT_RECIPE = {
     "region_patch_threshold": 0.5,
     "region_temp": 0.1,
     "region_normalization": "softmax",
+    "ibot_plus_plus": False,
     "center_momentum": 0.9,
     "center_momentum2": 0.9,
     # A pretrained iBOT checkpoint has already completed temperature warmup.

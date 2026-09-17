@@ -17,6 +17,7 @@ shared_head: true
 lambda1: 1.0  # Global CLS loss
 lambda2: 1.0  # Masked patch loss
 lambda3: 1.0  # Region composition weight; set to 0.0 for pure iBOT.
+ibot_plus_plus: false  # Also distill visible patch tokens when enabled.
 
 # Minimum two-view intersection as a fraction of the original image area.
 region_min_area: 0.10

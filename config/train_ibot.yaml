@@ -8,16 +8,18 @@ resume_checkpoint: null
 
 # Model
 arch: vit_small
+# DINOv2-style learned memory tokens between CLS and patch tokens. Use 0 to
+# retain the original iBOT backbone exactly; 4 is the standard register setup.
 register: 0
 # Prototype-head topology: true reuses one head for CLS and patch tokens;
 # false gives CLS and patch tokens separate heads with identical architecture.
-shared_head: false
+shared_head: true
 
 # Loss and teacher
 lambda1: 1.0  # Global CLS loss
 lambda2: 1.0  # Masked patch loss
 lambda3: 1.0  # Region composition weight; set to 0.0 for pure iBOT.
-ibot_plus_plus: false  # Also distill visible patch tokens when enabled.
+ibot_plus_plus: true  # Also distill visible patch tokens when enabled.
 
 # Minimum two-view intersection as a fraction of the original image area.
 region_min_area: 0.10

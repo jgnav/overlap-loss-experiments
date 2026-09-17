@@ -30,6 +30,7 @@ class iBOTLoss(nn.Module):
         region_patch_threshold=0.5,
         region_temp=0.1,
         region_normalization="softmax",
+        ibot_plus_plus=False,
         mim_start_epoch=0,
     ):
         super().__init__()
@@ -44,6 +45,9 @@ class iBOTLoss(nn.Module):
         self.lambda1 = lambda1
         self.lambda2 = lambda2
         self.lambda3 = lambda3
+        if type(ibot_plus_plus) is not bool:
+            raise ValueError("ibot_plus_plus must be a boolean")
+        self.ibot_plus_plus = ibot_plus_plus
         self.region_loss = RegionLoss(
             region_min_area,
             region_patch_threshold,
@@ -217,6 +221,8 @@ class iBOTLoss(nn.Module):
 
         total_loss1, n_loss_terms1 = 0, 0
         total_loss2, n_loss_terms2 = 0, 0
+        total_masked_patch_loss = 0
+        total_visible_patch_loss = 0
         patch_cross_entropies = []
         for q in range(len(teacher_cls_c)):
             for v in range(len(student_cls_c)):
@@ -227,11 +233,24 @@ class iBOTLoss(nn.Module):
                         dim=-1,
                     )
                     patch_cross_entropies.append(loss2)
-                    mask = student_mask[v].flatten(-2, -1)
-                    loss2 = torch.sum(loss2 * mask.float(), dim=-1) / mask.sum(
+                    mask = student_mask[v].flatten(-2, -1).bool()
+                    masked_loss2 = torch.sum(loss2 * mask.float(), dim=-1) / mask.sum(
                         dim=-1
                     ).clamp(min=1.0)
-                    total_loss2 += loss2.mean()
+                    total_masked_patch_loss += masked_loss2.mean()
+                    if self.ibot_plus_plus:
+                        visible = ~mask
+                        visible_loss2 = torch.sum(
+                            loss2 * visible.float(), dim=-1
+                        ) / visible.sum(dim=-1).clamp(min=1.0)
+                        total_visible_patch_loss += visible_loss2.mean()
+                        # iBOT++ extends the same-view patch distillation to
+                        # every patch, while retaining the original masked
+                        # signal. The two terms are normalized independently
+                        # so adding visible tokens does not dilute masking.
+                        total_loss2 += masked_loss2.mean() + visible_loss2.mean()
+                    else:
+                        total_loss2 += masked_loss2.mean()
                     n_loss_terms2 += 1
                 else:
                     loss1 = torch.sum(
@@ -244,9 +263,15 @@ class iBOTLoss(nn.Module):
 
         total_loss1 = total_loss1 / n_loss_terms1 * self.lambda1
         raw_patch_loss = total_loss2 / n_loss_terms2
+        masked_patch_loss = total_masked_patch_loss / n_loss_terms2
+        zero = total_loss2.detach().float().new_zeros(())
+        visible_patch_loss = (
+            total_visible_patch_loss / n_loss_terms2
+            if self.ibot_plus_plus
+            else zero
+        )
         total_loss2 = raw_patch_loss * self.lambda2
         region_weight = float(self.lambda3)
-        zero = total_loss2.detach().float().new_zeros(())
         if self.lambda3 == 0:
             # Pure iBOT control: do not compute intersections, patch coverage,
             # aggregated distributions, or region cross-entropy.
@@ -293,7 +318,10 @@ class iBOTLoss(nn.Module):
         total_loss = {
             "cls": total_loss1,
             "patch": total_loss2,
-            "patch_masked": raw_patch_loss.detach().float(),
+            "patch_masked": masked_patch_loss.detach().float(),
+            "patch_visible": visible_patch_loss.detach().float(),
+            "patch_all": raw_patch_loss.detach().float(),
+            "ibot_plus_plus": total_loss2.new_tensor(float(self.ibot_plus_plus)),
             "patch_masked_inside_overlap": patch_inside_overlap,
             "patch_masked_outside_overlap": patch_outside_overlap,
             "student_patch_entropy": student_diagnostics["entropy"],

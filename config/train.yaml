@@ -19,6 +19,7 @@ shared_head: true
 lambda1: 1.0  # Global CLS loss
 lambda2: 1.0  # Masked patch loss
 lambda3: 1.0  # Region composition weight; set to 0.0 for pure iBOT.
+ibot_plus_plus: false  # Also distill visible patch tokens when enabled.
 
 # Minimum two-view intersection as a fraction of the original image area.
 region_min_area: 0.10
@@ -26,7 +27,7 @@ region_min_area: 0.10
 region_patch_threshold: 0.5
 # Overlap normalization: centering, softmax, raw_logits, or sinkhorn.
 # centering reuses the ordinary iBOT centered teacher patch targets.
-region_normalization: centering
+region_normalization: softmax
 # Temperature for softmax/Sinkhorn (unused by centering and raw_logits).
 region_temp: 0.1
 momentum_teacher: 0.9995

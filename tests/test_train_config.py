@@ -42,6 +42,7 @@ class ContinuationConfigTest(unittest.TestCase):
         self.assertEqual(config.region_patch_threshold, .5)
         self.assertEqual(config.lambda3, 1.0)
         self.assertEqual(config.region_normalization, "centering")
+        self.assertFalse(config.ibot_plus_plus)
         self.assertEqual(config.register, 0)
         self.assertIsNone(config.resume_checkpoint)
 
@@ -91,6 +92,16 @@ class ContinuationConfigTest(unittest.TestCase):
             Path, "open", mock.mock_open(read_data=yaml.safe_dump(values))
         ):
             with self.assertRaisesRegex(ValueError, "shared_head must be a boolean"):
+                load_config(path)
+
+    def test_ibot_plus_plus_must_be_boolean(self):
+        path = Path(__file__).parents[1] / "config" / "train.yaml"
+        values = yaml.safe_load(path.read_text())
+        values["ibot_plus_plus"] = "true"
+        with mock.patch.object(
+            Path, "open", mock.mock_open(read_data=yaml.safe_dump(values))
+        ):
+            with self.assertRaisesRegex(ValueError, "ibot_plus_plus must be a boolean"):
                 load_config(path)
 
     def test_continuation_cosine_schedule_starts_at_configured_lr(self):
