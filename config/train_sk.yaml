@@ -81,5 +81,5 @@ wandb_mode: online  # online, offline, or disabled; online reads .wandb_key at r
 wandb_project: ibot-imagenet1k
 wandb_entity: null
 wandb_run_name: null
-wandb_run_id: ijypap1p
-wandb_resume: must
+wandb_run_id: null
+wandb_resume: null
