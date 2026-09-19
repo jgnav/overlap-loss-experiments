@@ -391,13 +391,15 @@ def load_continuation_state(
     ibot_loss,
     optimizer,
     fp16_scaler=None,
+    reset_optimizer=False,
 ):
     """Load an external source checkpoint for additional training.
 
     Unlike an exact resume, continuation starts at continuation epoch zero.
-    Model, teacher, and Adam moments are restored when available. Center
-    buffers are always restored for the DINO and iBOT objectives. A source
-    FP16 scaler is deliberately irrelevant to BF16/FP32 continuation.
+    Model, teacher, and center buffers are always restored. Adam moments and
+    the FP16 scaler are restored when available unless ``reset_optimizer`` is
+    true; that option starts a fresh optimizer while preserving the learned
+    model and target state.
     """
     load_pretrained_state(
         checkpoint,
@@ -406,10 +408,10 @@ def load_continuation_state(
         ibot_loss,
         allow_new_register_tokens=True,
     )
-    optimizer_restored = "optimizer" in checkpoint
+    optimizer_restored = "optimizer" in checkpoint and not reset_optimizer
     if optimizer_restored:
         _load_optimizer_with_head_copies(checkpoint, student, optimizer)
-    if fp16_scaler is not None:
+    if fp16_scaler is not None and not reset_optimizer:
         if "fp16_scaler" not in checkpoint:
             raise ValueError(
                 "FP16 continuation requires the source FP16 scaler state"

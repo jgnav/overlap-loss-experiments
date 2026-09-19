@@ -1,8 +1,8 @@
 # Paths are relative to this YAML file; absolute paths and ~ also work.
-checkpoint: output/train/20260909T184813Z-slurm-1312600/checkpoint.pth
+checkpoint: ../output/train/59347/checkpoint_source0850_continuation0050.pth
 checkpoint_key: teacher  # teacher or student
 arch: auto              # auto, vit_small, vit_base, vit_large
-datasets_root: dataset
+datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
 classification_manifests: null  # null = datasets_root/evaluation_manifests
 
 # null creates output/evaluation/<checkpoint-name>-<timestamp>/ for each launch.
@@ -36,9 +36,9 @@ evaluations:
   cityscapes_linear: true
   imagenet_knn: true
 
-  imagenet_knn_1pct: true
+  imagenet_knn_1pct: false
   imagenet_knn_100pct: true
-  imagenet_linear: true
+  imagenet_linear: false
   pascal_voc_1shot: true
   pascal_voc_2shot: true
   pascal_voc_5shot: true

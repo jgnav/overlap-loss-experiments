@@ -27,7 +27,7 @@ region_min_area: 0.10
 region_patch_threshold: 0.5
 # Overlap normalization: centering, softmax, raw_logits, or sinkhorn.
 # centering reuses the ordinary iBOT centered teacher patch targets.
-region_normalization: softmax
+region_normalization: centering
 # Temperature for softmax/Sinkhorn (unused by centering and raw_logits).
 region_temp: 0.1
 momentum_teacher: 0.9995

@@ -167,6 +167,42 @@ class PretrainedCheckpointTest(unittest.TestCase):
 
         self.assertTrue(restored)
 
+    def test_continuation_can_reset_optimizer_and_scaler(self):
+        source_student = nn.Linear(2, 2)
+        source_teacher = nn.Linear(2, 2)
+        source_loss = make_loss()
+        source_optimizer = torch.optim.AdamW(source_student.parameters(), lr=0.0123)
+        source_student(torch.ones(1, 2)).sum().backward()
+        source_optimizer.step()
+        checkpoint = {
+            "student": source_student.state_dict(),
+            "teacher": source_teacher.state_dict(),
+            "optimizer": source_optimizer.state_dict(),
+            "epoch": 800,
+            "ibot_loss": source_loss.state_dict(),
+            "fp16_scaler": {"scale": 16384.0},
+        }
+        student = nn.Linear(2, 2)
+        teacher = nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(student.parameters(), lr=1.0)
+        scaler = RecordingScaler()
+
+        restored = load_continuation_state(
+            checkpoint,
+            student,
+            teacher,
+            make_loss(),
+            optimizer,
+            scaler,
+            reset_optimizer=True,
+        )
+
+        self.assertFalse(restored)
+        self.assertFalse(optimizer.state)
+        self.assertIsNone(scaler.loaded_state)
+        for expected, actual in zip(source_student.parameters(), student.parameters()):
+            torch.testing.assert_close(actual, expected)
+
 
 class ContinuationProvenanceTest(unittest.TestCase):
     def test_source_epoch_800_can_run_200_additional_epochs(self):

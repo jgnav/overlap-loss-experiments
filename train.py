@@ -105,6 +105,14 @@ def load_config(path):
             "set warmup_epochs to 0"
         )
     config.setdefault("resume_checkpoint", None)
+    config.setdefault("reset_optimizer", False)
+    if type(config["reset_optimizer"]) is not bool:
+        raise ValueError("reset_optimizer must be a boolean")
+    if config["resume_checkpoint"] is not None and config["reset_optimizer"]:
+        raise ValueError(
+            "reset_optimizer applies to initial-checkpoint continuation only; "
+            "set resume_checkpoint to null"
+        )
     config.setdefault("resume_allow_precision_change", False)
     requested_precision = config.get("precision")
     if requested_precision is None:
@@ -351,6 +359,7 @@ def train_ibot(args, wandb_run=None):
             ibot_loss,
             optimizer,
             fp16_scaler,
+            reset_optimizer=args.reset_optimizer,
         )
     else:
         optimizer_restored = True
@@ -364,6 +373,23 @@ def train_ibot(args, wandb_run=None):
         )
 
     source_has_scaler = "fp16_scaler" in checkpoint
+    scaler_restored = (
+        fp16_scaler is not None and source_has_scaler and not args.reset_optimizer
+    )
+    optimizer_status = (
+        "fresh/reset"
+        if args.resume_checkpoint is None and args.reset_optimizer
+        else "restored"
+        if optimizer_restored
+        else "absent/reconstructed"
+    )
+    scaler_status = (
+        "restored"
+        if scaler_restored
+        else "fresh"
+        if fp16_scaler is not None
+        else "unused"
+    )
     source_has_args = "args" in checkpoint
     del checkpoint
 
@@ -381,8 +407,8 @@ def train_ibot(args, wandb_run=None):
     )
     print(
         "Source checkpoint state: "
-        f"optimizer={'restored' if optimizer_restored else 'absent/reconstructed'}; "
-        f"FP16 scaler={'present' if source_has_scaler else 'absent'}; "
+        f"optimizer={optimizer_status}; "
+        f"FP16 scaler={scaler_status}; "
         f"original args={'present' if source_has_args else 'absent'}."
     )
     print(
@@ -396,6 +422,12 @@ def train_ibot(args, wandb_run=None):
             print(
                 f"Loaded {restored_state}, and AdamW first/second moments "
                 "from the continuation source."
+            )
+        elif args.reset_optimizer:
+            print(
+                "Loaded student, teacher, projection heads, and iBOT centers; "
+                "initialized a fresh AdamW optimizer with zero first/second "
+                "moments and a fresh continuation schedule."
             )
         else:
             print(
