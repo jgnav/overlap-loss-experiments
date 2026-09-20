@@ -1,3 +1,4 @@
+# Ablation: region_patch_threshold = weighted; all other experimental settings match the base.
 # Controlled post-pretraining continuation from the full iBOT checkpoint.
 # The source student, teacher, projection/prototype heads, and iBOT centers are
 # restored, while AdamW moments and any FP16 scaler state are deliberately reset.
@@ -5,7 +6,7 @@
 # Paths
 data_path: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets/imagenet/train
 initial_checkpoint: checkpoints/ibot_vit_small.pth
-output_dir: output/train
+output_dir: output/ablation
 resume_checkpoint: null
 reset_optimizer: true
 
@@ -20,7 +21,7 @@ lambda2: 1.0
 lambda3: 1.0
 ibot_plus_plus: false
 region_min_area: 0.10
-region_patch_threshold: 0.5
+region_patch_threshold: weighted
 region_normalization: centering
 region_temp: 0.07
 momentum_teacher: 0.9995
@@ -28,7 +29,7 @@ teacher_temp: 0.07
 teacher_patch_temp: 0.07
 
 # Fresh post-pretraining stage
-additional_epochs: 200
+additional_epochs: 50
 gpu_count: 4
 batch_size_per_gpu: 64
 seed: 0

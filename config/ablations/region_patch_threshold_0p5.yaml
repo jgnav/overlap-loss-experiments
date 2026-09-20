@@ -1,3 +1,4 @@
+# Ablation: region_patch_threshold = 0.5; all other experimental settings match the base.
 # Controlled post-pretraining continuation from the full iBOT checkpoint.
 # The source student, teacher, projection/prototype heads, and iBOT centers are
 # restored, while AdamW moments and any FP16 scaler state are deliberately reset.
@@ -5,7 +6,7 @@
 # Paths
 data_path: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets/imagenet/train
 initial_checkpoint: checkpoints/ibot_vit_small.pth
-output_dir: output/train
+output_dir: output/ablation
 resume_checkpoint: null
 reset_optimizer: true
 
@@ -17,18 +18,18 @@ shared_head: true
 # Loss and teacher
 lambda1: 1.0
 lambda2: 1.0
-lambda3: 0.0
+lambda3: 1.0
 ibot_plus_plus: false
 region_min_area: 0.10
 region_patch_threshold: 0.5
 region_normalization: centering
-region_temp: 0.1
+region_temp: 0.07
 momentum_teacher: 0.9995
 teacher_temp: 0.07
 teacher_patch_temp: 0.07
 
 # Fresh post-pretraining stage
-additional_epochs: 200
+additional_epochs: 50
 gpu_count: 4
 batch_size_per_gpu: 64
 seed: 0
@@ -53,19 +54,15 @@ diagnostic_feature_batches: 1
 diagnostic_max_patch_features_per_batch: 4096
 diagnostic_prototype_chunk_size: 256
 
-# Fixed online representation probes
+# Online: VOC k-NN + linear segmentation and ImageNet 10% CLS k-NN.
+# Uses offline protocols; false disables all, frequency is completed epochs.
 online_probes_enabled: true
 online_probe_frequency: 5
 online_probe_datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
-online_probe_imagenet_train_size: 10000
-online_probe_imagenet_val_size: 5000
-online_probe_voc_train_size: 400
-online_probe_voc_val_size: 200
-online_probe_k: 20
-online_probe_batch_size: 256
+online_probe_batch_size: 128
 online_probe_num_workers: 0
 online_probe_max_concurrent_jobs: 1
-online_probe_wait_at_exit: false
+online_probe_wait_at_exit: true
 online_probe_gpu: null
 
 # Weights & Biases

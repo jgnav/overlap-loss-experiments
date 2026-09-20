@@ -4,9 +4,10 @@ Each evaluation has one implementation and one fixed recipe. There are no
 CG-SSL/CAPI/CRISP mode switches. The main references are CG-SSL and CRISP;
 CAPI supplies the segmentation implementation they cite.
 
-Training-time monitoring is separate from these full evaluations. See
-[`docs/online_probes.md`](../docs/online_probes.md) for the opt-in fixed ImageNet
-CLS and VOC dense k-NN probes (k=20, deterministic subsets, no sweeps).
+Training-time monitoring uses these same evaluators for PASCAL VOC k-NN and
+linear segmentation and ImageNet 10% CLS k-NN classification, including their
+full parameter searches. See [`docs/online_probes.md`](../docs/online_probes.md)
+for the enable switch and epoch interval.
 
 ## Selected segmentation protocol
 

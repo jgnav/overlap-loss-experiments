@@ -120,6 +120,14 @@ logits** from the same two global views (including the existing masked student
 forward). Crop geometry and horizontal flips map their shared region to each
 patch grid. Patches participate when their covered fraction is at least
 `region_patch_threshold` (default `0.5`); every selected patch has equal weight.
+Alternatively, set `region_patch_threshold: weighted` to include every patch
+with positive overlap and weight its representation by the fraction of its
+area inside the overlap. The region mean is `sum(weight * representation) /
+sum(weight)`: full coverage has weight 1, half coverage has weight 0.5, and
+zero coverage contributes nothing. This applies to both student and teacher
+pooling in all normalization modes; Sinkhorn assignments still balance the
+included patches before their weighted region pooling. The `region_min_area`
+filter remains active. Numeric thresholds preserve the existing binary rule.
 `region_normalization` selects the overlap representation:
 
 - `centering`: reuse the ordinary iBOT teacher patch targets after subtracting
@@ -127,8 +135,8 @@ patch grid. Patches participate when their covered fraction is at least
   the ordinary `student_temp` softmax. The branch averages selected patch
   distributions and applies symmetric cross-entropy. No centered targets are
   recomputed, and `region_temp` is unused.
-- `softmax` (default): per-patch softmax at `region_temp`, then an equal-weight
-  mean and symmetric cross-entropy.
+- `softmax` (default): per-patch softmax at `region_temp`, then region pooling
+  with the configured patch weights and symmetric cross-entropy.
 - `raw_logits`: L2-normalize each raw patch vector, average selected vectors,
   then use symmetric cosine distance between the means. These vectors can be
   signed, so probability cross-entropy does not apply. `region_temp` is unused.
@@ -149,6 +157,8 @@ loss. `register: 0` preserves the original iBOT token sequence.
 
 `lambda3` weights this additional loss;
 `lambda3: 0.0` disables the branch for the unchanged iBOT baseline.
+For the twelve 50-epoch, one-factor continuation runs, see
+[`docs/ablations.md`](docs/ablations.md).
 `region_min_area` keeps the existing minimum intersection-area filter.
 Pairs with no selected patches in either view are skipped. Use a new
 continuation run for this changed objective: `resume_checkpoint: null`, with

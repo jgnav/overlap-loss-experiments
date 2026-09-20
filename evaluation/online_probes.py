@@ -1,21 +1,9 @@
-"""Fixed, lightweight representation probes for the training loop.
-
-The online probes intentionally use one protocol (k=20, cosine similarity)
-instead of the full evaluation sweeps.  They are also usable as a standalone
-module by pointing them at an immutable training checkpoint::
-
-    python -m evaluation.online_probes --checkpoint teacher_epoch0010.pth \
-        --datasets-root dataset --output probes/epoch0010.json
-
-Training launches this module asynchronously through ``OnlineProbeRunner``.
-"""
+"""Evaluate immutable teacher snapshots using the unchanged offline protocols."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import math
 import os
 import shutil
 import subprocess
@@ -23,36 +11,21 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
-import numpy as np
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Subset
-from torchvision import datasets, transforms as T
-
-from evaluation.utils.common import load_backbone, utc_now
+from evaluation.utils.common import REPO_ROOT, utc_now, write_json
 from evaluation.utils.datasets import make_pascal_voc
 from evaluation.utils.imagenet import _resolve_imagenet_root
+from evaluation.utils.orchestrator import EVALUATIONS, _load_completed_result, evaluation_command
+from evaluation.utils.runtime import worker_environment
 
 
-ONLINE_K = 20
 ONLINE_FREQUENCY = 10
-IMAGENET_TRAIN_SIZE = 10_000
-IMAGENET_VAL_SIZE = 5_000
-VOC_TRAIN_SIZE = 400
-VOC_VAL_SIZE = 200
-VOC_RESOLUTION = 256
-VOC_PATCH_GRID = 16
-VOC_IGNORE_LABEL = 255
-
-IMAGENET_NORMALIZE = T.Normalize(
-    mean=(0.485, 0.456, 0.406),
-    std=(0.229, 0.224, 0.225),
-)
+ONLINE_EVALUATIONS = ("pascal_voc_knn", "pascal_voc_linear", "imagenet_knn")
 
 
 def probe_due(epoch, frequency=ONLINE_FREQUENCY):
-    """Return whether one-based completed ``epoch`` should be evaluated."""
+    """Use one-based completed training epochs for the probe interval."""
     if type(epoch) is not int or epoch < 1:
         raise ValueError("epoch must be a positive integer")
     if type(frequency) is not int or frequency <= 0:
@@ -60,65 +33,8 @@ def probe_due(epoch, frequency=ONLINE_FREQUENCY):
     return epoch % frequency == 0
 
 
-def select_stratified_indices(targets, size, seed):
-    """Select a fixed-size proportional class-stratified subset.
-
-    Class quotas use largest remainders, then each class is sampled with a
-    private deterministic generator.  The final order is shuffled with that
-    same generator, so the result is independent of DataLoader workers.
-    """
-    targets = torch.as_tensor(targets, dtype=torch.long).flatten()
-    if targets.numel() == 0:
-        raise ValueError("Cannot select from an empty dataset")
-    if type(size) is not int or not 1 <= size <= len(targets):
-        raise ValueError(f"subset size must be an integer in [1, {len(targets)}]")
-    if type(seed) is not int:
-        raise ValueError("seed must be an integer")
-    classes = torch.unique(targets, sorted=True)
-    class_indices = [torch.where(targets == label)[0] for label in classes]
-    quotas_float = [size * len(indices) / len(targets) for indices in class_indices]
-    quotas = [math.floor(quota) for quota in quotas_float]
-    remainder = size - sum(quotas)
-    order = sorted(
-        range(len(classes)),
-        key=lambda i: (quotas_float[i] - quotas[i], -i),
-        reverse=True,
-    )
-    for i in order[:remainder]:
-        quotas[i] += 1
-    generator = torch.Generator().manual_seed(seed)
-    selected = []
-    for indices, quota in zip(class_indices, quotas, strict=True):
-        permutation = torch.randperm(len(indices), generator=generator)[:quota]
-        selected.extend(indices[permutation].tolist())
-    permutation = torch.randperm(len(selected), generator=generator)
-    return [selected[i] for i in permutation.tolist()]
-
-
-def select_fixed_indices(length, size, seed):
-    """Select a reproducible uniform subset when no image-level labels exist."""
-    if type(length) is not int or length < 1:
-        raise ValueError("dataset length must be a positive integer")
-    if type(size) is not int or not 1 <= size <= length:
-        raise ValueError(f"subset size must be an integer in [1, {length}]")
-    if type(seed) is not int:
-        raise ValueError("seed must be an integer")
-    generator = torch.Generator().manual_seed(seed)
-    return torch.randperm(length, generator=generator)[:size].tolist()
-
-
-def _indices_hash(indices):
-    values = torch.as_tensor(indices, dtype=torch.int64).numpy()
-    return hashlib.sha256(values.tobytes()).hexdigest()
-
-
-def _validate_k(k):
-    if type(k) is not int or k <= 0:
-        raise ValueError("k must be a positive integer")
-
-
 def validate_probe_data(datasets_root):
-    """Check both datasets before allocating a model or starting training."""
+    """Validate the same ImageNet and original VOC splits used offline."""
     root = Path(os.path.expandvars(str(datasets_root))).expanduser().resolve()
     imagenet = _resolve_imagenet_root(root)
     classes = [{p.name for p in (imagenet / split).iterdir() if p.is_dir()}
@@ -133,415 +49,94 @@ def validate_probe_data(datasets_root):
     return root
 
 
-def _cosine_neighbor_rows(train_features, train_labels, query_features, k, chunk_size=256):
-    """Return top-k labels/similarities without materializing all pairwise scores."""
-    _validate_k(k)
-    if train_features.ndim != 2 or query_features.ndim != 2:
-        raise ValueError("Features must be two-dimensional")
-    if train_features.shape[1] != query_features.shape[1]:
-        raise ValueError("Train and query feature dimensions differ")
-    if len(train_features) == 0 or len(query_features) == 0:
-        raise ValueError("k-NN requires nonempty train and query features")
-    if k > len(train_features):
-        raise ValueError(f"k={k} exceeds the {len(train_features)} training features")
-    train_labels = torch.as_tensor(train_labels, dtype=torch.long, device=train_features.device)
-    if len(train_labels) != len(train_features):
-        raise ValueError("Training labels and features have different lengths")
-    train_features = F.normalize(train_features.float(), dim=1)
-    query_features = F.normalize(query_features.float(), dim=1)
-    if type(chunk_size) is not int or chunk_size <= 0:
-        raise ValueError("chunk_size must be a positive integer")
-    values, neighbors = [], []
-    for start in range(0, len(query_features), chunk_size):
-        similarity = query_features[start:start + chunk_size] @ train_features.T
-        chunk_values, chunk_neighbors = similarity.topk(k, dim=1, largest=True, sorted=True)
-        values.append(chunk_values)
-        neighbors.append(chunk_neighbors)
-    values = torch.cat(values)
-    labels = train_labels[torch.cat(neighbors)]
-    return labels.cpu(), values.cpu()
+def probe_environment(gpu=None):
+    """Isolate evaluators from torchrun and limit them to one allocated GPU."""
+    environment = worker_environment()
+    for key in list(environment):
+        if key.startswith("TORCHELASTIC_") or key in {
+            "RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE",
+            "GROUP_RANK", "ROLE_RANK", "ROLE_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT",
+        }:
+            environment.pop(key, None)
+    visible = environment.get("CUDA_VISIBLE_DEVICES")
+    allocated = [item.strip() for item in visible.split(",") if item.strip()] if visible else []
+    if gpu not in (None, "", "none", "None"):
+        selected = str(gpu)
+        if "," in selected or (visible is not None and selected not in allocated):
+            raise ValueError("online_probe_gpu must select one GPU from CUDA_VISIBLE_DEVICES")
+    else:
+        selected = allocated[0] if allocated else ("" if visible == "" else "0")
+    environment["CUDA_VISIBLE_DEVICES"] = selected
+    environment["OMP_NUM_THREADS"] = "1"
+    environment["MKL_NUM_THREADS"] = "1"
+    return environment
 
 
-def _cosine_neighbors(train_features, train_labels, query_features, k):
-    """Predict labels by deterministic cosine k-NN majority vote."""
-    labels, values = _cosine_neighbor_rows(train_features, train_labels, query_features, k)
-    return _vote_predictions(labels, values, train_labels)
+def run_probe_checkpoint(checkpoint, datasets_root, output, arch="auto", seed=0,
+                         batch_size=128, num_workers=0, epoch=None,
+                         frequency=ONLINE_FREQUENCY):
+    """Run all three offline entrypoints; preserve their complete result JSONs.
 
-
-def _vote_predictions(labels, values, train_labels):
-    return _vote_rankings(labels, values, train_labels, top=1)[:, 0]
-
-
-def _vote_rankings(labels, values, train_labels, top=5):
-    """Batch voting with stable count, similarity, then class-ID tie breaks."""
-    classes = torch.unique(torch.as_tensor(train_labels).cpu(), sorted=True)
-    rankings = []
-    for start in range(0, len(labels), 256):
-        row_labels, row_values = labels[start:start + 256], values[start:start + 256]
-        indices = torch.searchsorted(classes, row_labels)
-        counts = torch.zeros(len(indices), len(classes), dtype=torch.long)
-        similarities = torch.zeros(len(indices), len(classes), dtype=row_values.dtype)
-        counts.scatter_add_(1, indices, torch.ones_like(indices))
-        similarities.scatter_add_(1, indices, row_values)
-        order = similarities.argsort(dim=1, descending=True, stable=True)
-        count_order = counts.gather(1, order).argsort(dim=1, descending=True, stable=True)
-        rankings.append(classes[order.gather(1, count_order)[:, :top]])
-    return torch.cat(rankings)
-
-
-def knn_classification_metrics(
-    train_features, train_labels, query_features, query_labels, k=ONLINE_K
-):
-    """Return top-1/top-5 percentages for a fixed cosine k-NN bank."""
-    neighbor_labels, neighbor_similarities = _cosine_neighbor_rows(
-        train_features, train_labels, query_features, k
-    )
-    rankings = _vote_rankings(neighbor_labels, neighbor_similarities, train_labels)
-    predictions = rankings[:, 0]
-    query_labels = torch.as_tensor(query_labels, dtype=torch.long).cpu()
-    if len(predictions) != len(query_labels):
-        raise ValueError("Query labels and features have different lengths")
-    return {
-        "top1": 100.0 * (predictions == query_labels).float().mean().item(),
-        "top5": 100.0 * rankings.eq(query_labels[:, None]).any(dim=1).float().mean().item(),
-    }
-
-
-def _center_crop_transform(size=224):
-    return T.Compose([
-        T.Resize(256, interpolation=T.InterpolationMode.BICUBIC),
-        T.CenterCrop(size),
-        T.ToTensor(),
-        IMAGENET_NORMALIZE,
-    ])
-
-
-class _IndexedSubset(Dataset):
-    def __init__(self, dataset, indices):
-        self.dataset = dataset
-        self.indices = tuple(indices)
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, index):
-        image, label = self.dataset[self.indices[index]]
-        return image, label
-
-
-@torch.inference_mode()
-def _extract_image_features(model, dataset, batch_size, num_workers, dense=False, device=None):
-    if len(dataset) == 0:
-        raise ValueError("Probe dataset is empty")
-    device = device or next(model.parameters()).device
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        persistent_workers=num_workers > 0,
-    )
-    features, labels = [], []
-    for images, targets in loader:
-        tokens = model.get_intermediate_layers(images.to(device, non_blocking=True), n=1)[0]
-        tokens = tokens[:, 1:] if dense else tokens[:, 0]
-        features.append(tokens.float().cpu())
-        labels.append(targets.cpu())
-    return torch.cat(features), torch.cat(labels)
-
-
-def _imagenet_datasets(datasets_root, train_size, val_size, seed):
-    root = _resolve_imagenet_root(Path(datasets_root))
-    transform = _center_crop_transform(224)
-    full_train = datasets.ImageFolder(root / "train", transform=transform)
-    full_val = datasets.ImageFolder(root / "val", transform=transform)
-    if full_train.class_to_idx != full_val.class_to_idx or len(full_train.classes) != 1000:
-        raise ValueError("ImageNet train/val must share exactly the same 1,000 classes")
-    train_indices = select_stratified_indices(full_train.targets, train_size, seed)
-    val_indices = select_stratified_indices(full_val.targets, val_size, seed + 1)
-    return (
-        _IndexedSubset(full_train, train_indices),
-        _IndexedSubset(full_val, val_indices),
-        {
-            "train": len(train_indices),
-            "validation": len(val_indices),
-            "classes": 1000,
-            "train_indices_sha256": _indices_hash(train_indices),
-            "validation_indices_sha256": _indices_hash(val_indices),
-        },
-    )
-
-
-def run_imagenet_probe(
-    model,
-    datasets_root,
-    train_size=IMAGENET_TRAIN_SIZE,
-    val_size=IMAGENET_VAL_SIZE,
-    seed=0,
-    k=ONLINE_K,
-    batch_size=256,
-    num_workers=0,
-    device=None,
-):
-    """Run the fixed ImageNet CLS probe on an already loaded teacher model."""
-    train, validation, metadata = _imagenet_datasets(
-        datasets_root, train_size, val_size, seed
-    )
-    train_features, train_labels = _extract_image_features(
-        model, train, batch_size, num_workers, device=device
-    )
-    val_features, val_labels = _extract_image_features(
-        model, validation, batch_size, num_workers, device=device
-    )
-    return {
-        **knn_classification_metrics(train_features.to(device), train_labels,
-                                     val_features.to(device), val_labels, k),
-        "dataset": "ImageNet-1K",
-        "feature": "teacher final normalized CLS token",
-        "input_resolution": 224,
-        "k": k,
-        "distance": "cosine",
-        "subset": metadata,
-    }
-
-
-def _dense_transforms(resolution=VOC_RESOLUTION):
-    image = T.Compose([
-        T.Resize((resolution, resolution), interpolation=T.InterpolationMode.BICUBIC),
-        T.ToTensor(),
-        IMAGENET_NORMALIZE,
-    ])
-
-    def target(mask):
-        resized = T.functional.resize(
-            mask.convert("P"), (resolution, resolution), interpolation=T.InterpolationMode.NEAREST
-        )
-        return torch.from_numpy(np.array(resized, copy=True)).long()
-
-    return image, target
-
-
-def _patch_labels(labels, grid=VOC_PATCH_GRID):
-    if labels.ndim != 3 or labels.shape[1] % grid or labels.shape[2] % grid:
-        raise ValueError("VOC masks must be divisible by the patch grid")
-    height, width = labels.shape[1] // grid, labels.shape[2] // grid
-    patches = labels.reshape(labels.shape[0], grid, height, grid, width).permute(0, 1, 3, 2, 4)
-    patches = patches.reshape(-1, height * width)
-    result = torch.full((len(patches),), VOC_IGNORE_LABEL, dtype=torch.long)
-    for index, row in enumerate(patches):
-        row = row[row != VOC_IGNORE_LABEL]
-        if len(row):
-            result[index] = torch.bincount(row, minlength=21).argmax()
-    return result
-
-
-@torch.inference_mode()
-def _extract_dense_features(
-    model, dataset, batch_size, num_workers, device=None, include_patch_labels=True
-):
-    if len(dataset) == 0:
-        raise ValueError("VOC probe dataset is empty")
-    device = device or next(model.parameters()).device
-    loader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-        pin_memory=device.type == "cuda", drop_last=False,
-        persistent_workers=num_workers > 0,
-    )
-    features, labels = [], []
-    for images, targets in loader:
-        tokens = model.get_intermediate_layers(images.to(device, non_blocking=True), n=1)[0][:, 1:]
-        grid = math.isqrt(tokens.shape[1])
-        if grid != VOC_PATCH_GRID or grid * grid != tokens.shape[1]:
-            raise ValueError(f"Expected 16 x 16 final patch tokens, got {tokens.shape[1]}")
-        features.append(tokens.float().cpu().reshape(-1, tokens.shape[-1]))
-        if include_patch_labels:
-            labels.append(_patch_labels(targets))
-    return torch.cat(features), torch.cat(labels) if labels else None
-
-
-def _dense_pixel_metrics(predicted_patches, targets, resolution=VOC_RESOLUTION):
-    grid = VOC_PATCH_GRID
-    if type(resolution) is not int or resolution <= 0 or resolution % grid:
-        raise ValueError("resolution must be a positive multiple of the 16 x 16 patch grid")
-    targets = targets.long()
-    if targets.ndim != 3 or targets.shape[1:] != (resolution, resolution):
-        raise ValueError("VOC targets must have shape [images, resolution, resolution]")
-    if len(predicted_patches) != len(targets) * grid * grid:
-        raise ValueError("Predicted patch count does not match VOC target images")
-    patch_size = resolution // grid
-    prediction = predicted_patches.reshape(-1, grid, grid).repeat_interleave(patch_size, 1).repeat_interleave(patch_size, 2)
-    target = targets
-    valid = target != VOC_IGNORE_LABEL
-    if not valid.any():
-        raise ValueError("VOC validation subset has no valid pixels")
-    correct = (prediction == target) & valid
-    intersection, union = [], []
-    for class_id in range(21):
-        predicted = prediction == class_id
-        actual = target == class_id
-        intersection.append((predicted & actual & valid).sum())
-        union.append((predicted | actual) & valid)
-    union = torch.stack([item.sum() for item in union])
-    intersection = torch.stack(intersection)
-    present = union > 0
-    miou = (intersection[present].float() / union[present].float()).mean().item()
-    return {
-        "miou": miou,
-        "miou_percent": 100.0 * miou,
-        "pixel_accuracy": correct.sum().float().div(valid.sum()).item(),
-        "pixel_accuracy_percent": 100.0 * correct.sum().float().div(valid.sum()).item(),
-    }
-
-
-def _voc_datasets(datasets_root, train_size, val_size, seed):
-    image_transform, target_transform = _dense_transforms()
-    full_train = make_pascal_voc(
-        Path(datasets_root), "train", image_transform, target_transform
-    )
-    full_val = make_pascal_voc(
-        Path(datasets_root), "val", image_transform, target_transform
-    )
-    train_indices = select_fixed_indices(len(full_train), train_size, seed)
-    val_indices = select_fixed_indices(len(full_val), val_size, seed + 1)
-    return (
-        Subset(full_train, train_indices),
-        Subset(full_val, val_indices),
-        {
-            "train": len(train_indices),
-            "validation": len(val_indices),
-            "train_indices_sha256": _indices_hash(train_indices),
-            "validation_indices_sha256": _indices_hash(val_indices),
-            "patch_grid": "16x16",
-            "classes": 21,
-        },
-    )
-
-
-def run_voc_dense_probe(
-    model,
-    datasets_root,
-    train_size=VOC_TRAIN_SIZE,
-    val_size=VOC_VAL_SIZE,
-    seed=0,
-    k=ONLINE_K,
-    batch_size=32,
-    num_workers=0,
-    device=None,
-):
-    """Run fixed VOC dense patch k-NN and score tiled patch predictions."""
-    metadata = {"input_resolution": VOC_RESOLUTION, "feature": "teacher final normalized patch tokens"}
-    train, validation, sizes = _voc_datasets(datasets_root, train_size, val_size, seed)
-    train_features, train_labels = _extract_dense_features(
-        model, train, batch_size, num_workers, device=device
-    )
-    valid_train = train_labels != VOC_IGNORE_LABEL
-    if not valid_train.any():
-        raise ValueError("VOC training subset has no valid patch labels")
-    validation_features, _ = _extract_dense_features(
-        model, validation, batch_size, num_workers, device=device, include_patch_labels=False
-    )
-    predicted = _cosine_neighbors(
-        train_features[valid_train].to(device), train_labels[valid_train],
-        validation_features.to(device), k
-    )
-    # Re-load validation masks only through the already transformed subset; the
-    # feature extractor intentionally keeps only patch labels, so reconstruct
-    # the pixel labels in one bounded pass for scoring.
-    pixel_targets = []
-    for _, targets in DataLoader(validation, batch_size=batch_size, shuffle=False, num_workers=num_workers):
-        pixel_targets.append(targets)
-    pixel_targets = torch.cat(pixel_targets)
-    return {
-        **_dense_pixel_metrics(predicted, pixel_targets),
-        "dataset": "PASCAL VOC 2012",
-        "feature": "teacher final normalized patch tokens",
-        "input_resolution": VOC_RESOLUTION,
-        "k": k,
-        "distance": "cosine",
-        "subset": {**sizes, **metadata},
-    }
-
-
-def run_probe_checkpoint(
-    checkpoint,
-    datasets_root,
-    output,
-    arch="auto",
-    seed=0,
-    imagenet_train_size=IMAGENET_TRAIN_SIZE,
-    imagenet_val_size=IMAGENET_VAL_SIZE,
-    voc_train_size=VOC_TRAIN_SIZE,
-    voc_val_size=VOC_VAL_SIZE,
-    k=ONLINE_K,
-    batch_size=256,
-    num_workers=0,
-    epoch=None,
-    frequency=ONLINE_FREQUENCY,
-):
-    """Load one immutable teacher checkpoint and run both fixed probes."""
-    _validate_k(k)
+    Only feature-extraction resources are configurable here. Dataset fractions,
+    transforms, classifiers, sweeps and scoring belong to the offline modules.
+    A failed task does not prevent the other two tasks from being attempted.
+    """
     if type(frequency) is not int or frequency <= 0:
         raise ValueError("frequency must be a positive integer")
-    datasets_root = validate_probe_data(datasets_root)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    started = utc_now()
-    timer = time.monotonic()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, model_metadata = load_backbone(checkpoint, "teacher", arch)
-    model.to(device).eval()
-    if model_metadata["patch_size"] != 16:
-        raise ValueError(
-            "The online VOC dense probe requires a ViT-S/16-compatible patch size of 16"
-        )
-    imagenet = run_imagenet_probe(
-        model, datasets_root, imagenet_train_size, imagenet_val_size,
-        seed, k, batch_size, num_workers, device,
+    checkpoint = Path(checkpoint).expanduser().resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    datasets_root = Path(os.path.expandvars(str(datasets_root))).expanduser().resolve()
+    output = Path(output).expanduser().resolve()
+    task_root = output.parent / output.stem
+    task_root.mkdir(parents=True, exist_ok=True)
+    args = SimpleNamespace(
+        checkpoint=checkpoint, checkpoint_key="teacher", arch=arch,
+        datasets_root=datasets_root, output_dir=task_root, seed=seed,
+        classification_manifests=datasets_root / "evaluation_manifests",
+        segmentation_batch_size=batch_size, num_workers=num_workers,
     )
-    voc = run_voc_dense_probe(
-        model, datasets_root, voc_train_size, voc_val_size,
-        seed, k, min(batch_size, 32), num_workers, device,
-    )
+    modules = {name: module for name, module, _ in EVALUATIONS}
+    environment = probe_environment()
+    started, timer = utc_now(), time.monotonic()
+    results, errors = {}, {}
+    for name in ONLINE_EVALUATIONS:
+        path = task_root / f"{name}.json"
+        try:
+            result = _load_completed_result(path, args, name)
+            if result is None:
+                print(f"Online epoch {epoch}: starting offline protocol {name}", flush=True)
+                completed = subprocess.run(
+                    evaluation_command(args, name, modules[name], path),
+                    cwd=REPO_ROOT, env=environment, check=False,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(f"{name} exited with status {completed.returncode}")
+                result = _load_completed_result(path, args, name)
+                if result is None:
+                    raise RuntimeError(f"{name} did not produce a compatible completed result JSON")
+            results[name] = result
+        except (OSError, RuntimeError, ValueError) as error:
+            errors[name] = f"{type(error).__name__}: {error}"
+            print(f"Online epoch {epoch}: {errors[name]}", flush=True)
     result = {
-        "evaluation": "online_probes",
-        "status": "completed",
-        "epoch": epoch,
-        "started_at": started,
-        "finished_at": utc_now(),
+        "evaluation": "online_probes", "protocol_version": 2,
+        "status": "failed" if errors else "completed", "epoch": epoch,
+        "checkpoint": str(checkpoint), "checkpoint_key": "teacher",
+        "datasets_root": str(datasets_root), "seed": seed, "frequency": frequency,
+        "started_at": started, "finished_at": utc_now(),
         "elapsed_seconds": time.monotonic() - timer,
-        "checkpoint": str(Path(checkpoint).resolve()),
-        "datasets_root": str(datasets_root),
-        "model": model_metadata,
-        "protocol": {
-            "teacher_checkpoint_key": "teacher",
-            "seed": seed,
-            "k": k,
-            "distance": "cosine",
-            "frequency": frequency,
-            "imagenet": "fixed stratified train/validation subsets, center crop 224",
-            "voc": "fixed train/validation subsets, resize 256, final 16x16 patch tokens",
-        },
-        "imagenet_cls_knn": imagenet,
-        "voc_dense_knn": voc,
-        "metrics": {
-            "imagenet_cls_knn": imagenet,
-            "voc_dense_knn": voc,
-        },
+        "selected_evaluations": list(ONLINE_EVALUATIONS),
+        "evaluations": results, "errors": errors,
     }
-    output = Path(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, output)
+    if errors:
+        result["error"] = "; ".join(errors.values())
+    write_json(output, result)
     return result
 
 
 def immutable_checkpoint_copy(source, destination):
-    """Copy a completed checkpoint through a same-directory atomic rename."""
+    """Copy the full checkpoint through a same-directory atomic rename."""
     source, destination = Path(source), Path(destination)
     if not source.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: {source}")
@@ -557,135 +152,127 @@ def immutable_checkpoint_copy(source, destination):
 
 
 class OnlineProbeRunner:
-    """Launch bounded asynchronous probes from immutable epoch snapshots."""
+    """Queue each scheduled epoch and bound the number of active workers."""
 
     def __init__(self, args, repository_root=None):
         self.args = args
-        self.repository_root = Path(repository_root or Path(__file__).resolve().parents[1])
+        self.repository_root = Path(repository_root or REPO_ROOT)
         self.processes = []
+        self.pending = []
         self.submitted_results = []
         self.completed_results = set()
         self.process_results = {}
+        self.submitted_epochs = set()
 
     def _reap(self):
         active = []
         for process, log in self.processes:
             if process.poll() is None:
                 active.append((process, log))
-            else:
-                log.close()
-                entry = self.process_results.pop(process.pid, None)
-                if entry is not None:
-                    epoch, result_path = entry
-                    if not result_path.is_file():
-                        result_path.write_text(json.dumps({
-                            "status": "failed", "epoch": epoch,
-                            "error": f"Worker exited with code {process.returncode} without a result",
-                        }) + "\n", encoding="utf-8")
+                continue
+            log.close()
+            epoch, path = self.process_results.pop(process.pid)
+            try:
+                terminal = json.loads(path.read_text()).get("status") in {"completed", "failed"}
+            except (OSError, ValueError):
+                terminal = False
+            if not terminal:
+                write_json(path, {"status": "failed", "epoch": epoch,
+                                  "error": f"Worker exited with code {process.returncode} without a result"})
         self.processes = active
 
+    def _launch_pending(self):
+        maximum = self.args.online_probe_max_concurrent_jobs
+        while self.pending and len(self.processes) < maximum:
+            epoch, snapshot, result = self.pending.pop(0)
+            log_path = result.parent / "logs" / f"epoch{epoch:04d}.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            command = [
+                sys.executable, "-m", "evaluation.online_probes",
+                "--checkpoint", str(snapshot), "--datasets-root",
+                str(Path(os.path.expandvars(str(self.args.online_probe_datasets_root))).expanduser().resolve()),
+                "--output", str(result), "--arch", self.args.arch, "--seed", str(self.args.seed),
+                "--batch-size", str(self.args.online_probe_batch_size),
+                "--num-workers", str(self.args.online_probe_num_workers),
+                "--epoch", str(epoch), "--frequency", str(self.args.online_probe_frequency),
+            ]
+            log = log_path.open("w", encoding="utf-8")
+            try:
+                process = subprocess.Popen(
+                    command, cwd=self.repository_root,
+                    env=probe_environment(getattr(self.args, "online_probe_gpu", None)),
+                    stdout=log, stderr=subprocess.STDOUT,
+                )
+            except (OSError, ValueError) as error:
+                log.close()
+                write_json(result, {"status": "failed", "epoch": epoch, "error": str(error)})
+                continue
+            self.processes.append((process, log))
+            self.process_results[process.pid] = (epoch, result)
+            print(f"Online probes: launched all three offline evaluations for epoch {epoch}", flush=True)
+
     def submit(self, epoch, checkpoint):
-        """Snapshot and launch a probe for completed one-based ``epoch``."""
         if not getattr(self.args, "online_probes_enabled", False):
             return None
-        if not probe_due(epoch, self.args.online_probe_frequency):
+        if not probe_due(epoch, self.args.online_probe_frequency) or epoch in self.submitted_epochs:
             return None
         self._reap()
-        maximum = self.args.online_probe_max_concurrent_jobs
         root = Path(self.args.output_dir).resolve() / "online_probes"
-        # The copy is made even when all worker slots are occupied, so every
-        # scheduled epoch remains an immutable, retryable teacher snapshot.
-        snapshot = immutable_checkpoint_copy(
-            checkpoint, root / "checkpoints" / f"teacher_epoch{epoch:04d}.pth"
-        )
-        if len(self.processes) >= maximum:
-            print(
-                f"Online probes: skipping epoch {epoch}; {maximum} job(s) still running "
-                f"(snapshot retained at {snapshot})",
-                flush=True,
-            )
-            return {"epoch": epoch, "checkpoint": snapshot, "status": "skipped"}
+        snapshot = immutable_checkpoint_copy(checkpoint, root / "checkpoints" / f"teacher_epoch{epoch:04d}.pth")
         result = root / f"epoch{epoch:04d}.json"
-        log_path = root / "logs" / f"epoch{epoch:04d}.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        command = [
-            sys.executable, "-m", "evaluation.online_probes",
-            "--checkpoint", str(snapshot), "--datasets-root",
-            str(Path(os.path.expandvars(str(self.args.online_probe_datasets_root))).expanduser().resolve()),
-            "--output", str(result), "--arch", self.args.arch, "--seed", str(self.args.seed),
-            "--imagenet-train-size", str(self.args.online_probe_imagenet_train_size),
-            "--imagenet-val-size", str(self.args.online_probe_imagenet_val_size),
-            "--voc-train-size", str(self.args.online_probe_voc_train_size),
-            "--voc-val-size", str(self.args.online_probe_voc_val_size),
-            "--k", str(self.args.online_probe_k), "--batch-size", str(self.args.online_probe_batch_size),
-            "--num-workers", str(self.args.online_probe_num_workers), "--epoch", str(epoch),
-            "--frequency", str(self.args.online_probe_frequency),
-        ]
-        environment = os.environ.copy()
-        # A probe is a single-process worker, not another torchrun rank.
-        for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
-            environment.pop(key, None)
-        gpu = getattr(self.args, "online_probe_gpu", None)
-        if gpu not in (None, "", "none", "None"):
-            environment["CUDA_VISIBLE_DEVICES"] = str(gpu)
-        log = log_path.open("w", encoding="utf-8")
-        process = subprocess.Popen(command, cwd=self.repository_root, env=environment, stdout=log, stderr=subprocess.STDOUT)
-        self.processes.append((process, log))
+        write_json(result, {"status": "queued", "epoch": epoch, "checkpoint": str(snapshot),
+                            "selected_evaluations": list(ONLINE_EVALUATIONS)})
+        self.pending.append((epoch, snapshot, result))
         self.submitted_results.append((epoch, result))
-        self.process_results[process.pid] = (epoch, result)
-        print(f"Online probes: launched epoch {epoch} from {snapshot}", flush=True)
-        return {"epoch": epoch, "checkpoint": snapshot, "result": result, "pid": process.pid}
+        self.submitted_epochs.add(epoch)
+        self._launch_pending()
+        return {"epoch": epoch, "checkpoint": snapshot, "result": result}
 
     def collect_completed(self):
-        """Return one record per finished probe, including failures.
-
-        A job that is still running is left for the next epoch.  Failed jobs
-        remain visible in their per-epoch log and do not fabricate metrics.
-        """
         self._reap()
+        self._launch_pending()
         records = []
-        completed = getattr(self, "completed_results", set())
-        for _, result_path in getattr(self, "submitted_results", []):
-            if result_path in completed or not result_path.is_file():
+        for epoch, path in self.submitted_results:
+            if path in self.completed_results:
                 continue
             try:
-                result = json.loads(result_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                result = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
                 continue
-            if result.get("status") != "completed":
-                print(f"Online probes: FAILED epoch {result['epoch']}: {result.get('error', 'unknown error')}", flush=True)
-                records.append({"online_probe_epoch": int(result["epoch"]),
-                                "online_probe_success": 0})
-                completed.add(result_path)
+            if result.get("status") not in {"completed", "failed"}:
                 continue
-            image = result.get("imagenet_cls_knn", {})
-            dense = result.get("voc_dense_knn", {})
-            records.append({
-                "online_probe_epoch": int(result["epoch"]),
-                "online_probe_success": 1,
-                "online_imagenet_cls_knn_top1": float(image["top1"]),
-                "online_imagenet_cls_knn_top5": float(image["top5"]),
-                "online_voc_dense_knn_miou": float(dense["miou"]),
-                "online_voc_dense_knn_miou_percent": float(dense["miou_percent"]),
-                "online_voc_dense_knn_pixel_accuracy": float(dense["pixel_accuracy"]),
-                "online_voc_dense_knn_pixel_accuracy_percent": float(
-                    dense["pixel_accuracy_percent"]
-                ),
-                "online_probe_completed_epoch": int(result["epoch"]),
-            })
-            completed.add(result_path)
-        self.completed_results = completed
+            record = {"online_probe_epoch": epoch,
+                      "online_probe_success": int(result["status"] == "completed")}
+            if result["status"] == "failed":
+                print(f"Online probes: FAILED epoch {epoch}: {result.get('error', 'unknown error')}", flush=True)
+            for name in ONLINE_EVALUATIONS:
+                task = result.get("evaluations", {}).get(name)
+                record[f"online_{name}_success"] = int(task is not None and task.get("status") == "completed")
+                if task:
+                    for metric, value in task.get("metrics", {}).items():
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            record[f"online_{name}_{metric}"] = float(value)
+            records.append(record)
+            self.completed_results.add(path)
         return records
 
-    def close(self, wait=False):
-        """Reap completed jobs; optionally wait for all outstanding probes."""
-        if wait:
-            for process, _ in self.processes:
-                process.wait()
+    def close(self, wait=True):
+        """Drain scheduled evaluations at normal exit, unless explicitly disabled.
+
+        With wait=False, queued snapshots/reports remain available for manual
+        retries. Running workers are left alone; Slurm may end them with the job.
+        """
         self._reap()
-        for _, log in self.processes:
-            log.close()
-        self.processes = []
+        self._launch_pending()
+        if wait:
+            while self.processes or self.pending:
+                for process, _ in self.processes:
+                    process.wait()
+                self._reap()
+                self._launch_pending()
+        else:
+            for _, log in self.processes:
+                log.close()
 
 
 def _parser():
@@ -695,12 +282,7 @@ def _parser():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--arch", default="auto", choices=("auto", "vit_small", "vit_base", "vit_large"))
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--imagenet-train-size", type=int, default=IMAGENET_TRAIN_SIZE)
-    parser.add_argument("--imagenet-val-size", type=int, default=IMAGENET_VAL_SIZE)
-    parser.add_argument("--voc-train-size", type=int, default=VOC_TRAIN_SIZE)
-    parser.add_argument("--voc-val-size", type=int, default=VOC_VAL_SIZE)
-    parser.add_argument("--k", type=int, default=ONLINE_K)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=128, help="Segmentation feature-extraction batch size only")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--epoch", type=int, default=None)
     parser.add_argument("--frequency", type=int, default=ONLINE_FREQUENCY)
@@ -710,26 +292,13 @@ def _parser():
 def main():
     args = _parser().parse_args()
     try:
-        run_probe_checkpoint(
-            args.checkpoint, args.datasets_root, args.output, args.arch, args.seed,
-            args.imagenet_train_size, args.imagenet_val_size, args.voc_train_size,
-            args.voc_val_size, args.k, args.batch_size, args.num_workers, args.epoch,
-            args.frequency,
-        )
+        result = run_probe_checkpoint(**vars(args))
     except Exception as error:
-        output = Path(args.output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        temporary = output.with_suffix(output.suffix + ".tmp")
-        temporary.write_text(json.dumps({
-            "evaluation": "online_probes",
-            "status": "failed",
-            "epoch": args.epoch,
-            "checkpoint": str(args.checkpoint),
-            "error": f"{type(error).__name__}: {error}",
-        }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(temporary, output)
+        write_json(args.output, {"evaluation": "online_probes", "status": "failed",
+                                "epoch": args.epoch, "error": f"{type(error).__name__}: {error}"})
         raise
+    return int(result["status"] != "completed")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

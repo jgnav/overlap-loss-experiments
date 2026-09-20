@@ -14,6 +14,7 @@ from evaluation.utils.runtime import worker_environment
 from utils.wandb_logging import init_wandb_run, log_evaluation
 from evaluation.utils.orchestrator import (
     EVALUATIONS, _load_completed_result, _preflight_classification, _safe_name, _write_summary,
+    evaluation_command,
 )
 
 
@@ -22,20 +23,6 @@ def parse_args(argv=None):
     parser.add_argument("config", nargs="?", type=Path, default=REPO_ROOT / "evaluation.yaml",
                         help="YAML configuration (default: evaluation.yaml beside this script)")
     return parser.parse_args(argv)
-
-
-def evaluation_command(args, name, module, result_path):
-    command = [
-        sys.executable, "-m", module, str(args.checkpoint),
-        "--checkpoint-key", args.checkpoint_key, "--arch", args.arch,
-        "--datasets-root", str(args.datasets_root), "--output-dir", str(args.output_dir),
-        "--result-json", str(result_path), "--num-workers", str(args.num_workers),
-        "--seed", str(args.seed), "--classification-manifests", str(args.classification_manifests),
-    ]
-    if name in {"pascal_voc_knn", "pascal_voc_linear", "ade20k_knn", "ade20k_linear",
-                "cityscapes_knn", "cityscapes_linear"}:
-        command.extend(("--batch-size", str(args.segmentation_batch_size)))
-    return command
 
 
 def run_evaluations(args):

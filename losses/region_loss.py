@@ -81,15 +81,17 @@ def intersection_patch_fractions(crop_boxes, patch_count, min_area):
 
 
 class RegionLoss(nn.Module):
-    """Symmetric consistency between means of selected patch representations."""
+    """Symmetric consistency with binary or overlap-area-weighted pooling."""
 
     def __init__(self, min_area=0.0, patch_threshold=0.5, temperature=0.1,
                  normalization="softmax", student_temperature=0.1):
         super().__init__()
         if not 0.0 <= min_area <= 1.0:
             raise ValueError("region_min_area must be between 0 and 1")
-        if not 0.0 < patch_threshold <= 1.0:
-            raise ValueError("region_patch_threshold must be in (0, 1]")
+        if patch_threshold != "weighted" and not (
+            type(patch_threshold) in (int, float) and 0.0 < patch_threshold <= 1.0
+        ):
+            raise ValueError("region_patch_threshold must be in (0, 1] or 'weighted'")
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("region_temp must be finite and positive")
         if not math.isfinite(student_temperature) or student_temperature <= 0:
@@ -105,10 +107,11 @@ class RegionLoss(nn.Module):
         self.normalization = normalization
 
     @staticmethod
-    def _region_raw_vector(logits, selected):
+    def _region_raw_vector(logits, weights):
+        selected = weights > 0
         logits = logits.float().masked_fill(~selected[..., None], 0)
         patches = F.normalize(logits, p=2, dim=-1)
-        return patches.sum(dim=1) / selected.sum(dim=1, keepdim=True)
+        return (patches * weights[..., None]).sum(dim=1) / weights.sum(dim=1, keepdim=True)
 
     def _sinkhorn_patches(self, logits, selected):
         # One assignment problem over both views and all valid selected patches,
@@ -119,27 +122,31 @@ class RegionLoss(nn.Module):
         return dense.masked_scatter(selected[..., None], assignments), assignments
 
     @staticmethod
-    def _pool_log_probabilities(log_probabilities, selected):
-        return torch.logsumexp(log_probabilities, dim=1) - selected.sum(
+    def _pool_log_probabilities(log_probabilities, weights):
+        # log(sum(w * p) / sum(w)); zero coverage contributes exactly zero.
+        log_weights = weights.float().log()
+        return torch.logsumexp(log_probabilities + log_weights[..., None], dim=1) - weights.sum(
             dim=1, keepdim=True
         ).float().log()
 
-    def _region_log_distribution(self, logits, selected, temperature=None):
-        # log(mean(softmax(z / T))) preserves the exact probability-mean
+    def _region_log_distribution(self, logits, weights, temperature=None):
+        # Log-space weighted pooling preserves the exact probability-mean
         # objective without clamping away gradients for small probabilities.
         # Excluded logits never enter softmax or the region representation.
+        selected = weights > 0
         logits = logits.float().masked_fill(~selected[..., None], 0)
         temperature = self.temperature if temperature is None else temperature
         log_probabilities = F.log_softmax(logits / temperature, dim=-1)
         log_probabilities = log_probabilities.masked_fill(~selected[..., None], -torch.inf)
-        return self._pool_log_probabilities(log_probabilities, selected)
+        return self._pool_log_probabilities(log_probabilities, weights)
 
     @staticmethod
-    def _region_probability_mean(probabilities, selected):
+    def _region_probability_mean(probabilities, weights):
+        selected = weights > 0
         probabilities = probabilities.float().masked_fill(
             ~selected[..., None], 0
         )
-        return probabilities.sum(dim=1) / selected.sum(dim=1, keepdim=True)
+        return (probabilities * weights[..., None]).sum(dim=1) / weights.sum(dim=1, keepdim=True)
 
     def forward(
         self,
@@ -170,10 +177,13 @@ class RegionLoss(nn.Module):
         fractions, valid, intersection_area = intersection_patch_fractions(
             crop_boxes.float(), shape[1], self.min_area
         )
-        selected = (fractions >= self.patch_threshold) & valid[:, None, None]
+        weights = (fractions if self.patch_threshold == "weighted" else
+                   (fractions >= self.patch_threshold).float())
+        selected = (weights > 0) & valid[:, None, None]
         # Both cross-view directions require at least one patch in each view.
         valid = valid & selected.any(dim=-1).all(dim=-1)
         selected = selected & valid[:, None, None]
+        weights = weights * selected
         global_valid_count = valid.sum().float()
         world_size = 1
         if dist.is_available() and dist.is_initialized():
@@ -193,34 +203,34 @@ class RegionLoss(nn.Module):
         if valid.any():
             if self.normalization == "sinkhorn":
                 student_regions = [
-                    self._pool_log_probabilities(student_patches[valid, v], selected[valid, v])
+                    self._pool_log_probabilities(student_patches[valid, v], weights[valid, v])
                     for v in range(2)
                 ]
                 teacher_regions = [
-                    self._pool_log_probabilities(teacher_patches[valid, v], selected[valid, v]).exp()
+                    self._pool_log_probabilities(teacher_patches[valid, v], weights[valid, v]).exp()
                     for v in range(2)
                 ]
             elif self.normalization == "centering":
                 student_regions = [
                     self._region_log_distribution(
-                        x[valid], selected[valid, view], self.student_temperature
+                        x[valid], weights[valid, view], self.student_temperature
                     )
                     for view, x in enumerate(student_patch_logits)
                 ]
                 with torch.no_grad():
                     teacher_regions = [
                         self._region_probability_mean(
-                            target.detach()[valid], selected[valid, view]
+                            target.detach()[valid], weights[valid, view]
                         )
                         for view, target in enumerate(teacher_patch_targets)
                     ]
             else:
                 transform = (self._region_raw_vector if self.normalization == "raw_logits"
                              else self._region_log_distribution)
-                student_regions = [transform(x[valid], selected[valid, v])
+                student_regions = [transform(x[valid], weights[valid, v])
                                    for v, x in enumerate(student_patch_logits)]
                 with torch.no_grad():
-                    teacher_regions = [transform(x.detach()[valid], selected[valid, v])
+                    teacher_regions = [transform(x.detach()[valid], weights[valid, v])
                                        for v, x in enumerate(teacher_patch_logits)]
                     if self.normalization == "softmax":
                         teacher_regions = [x.exp() for x in teacher_regions]
@@ -244,5 +254,6 @@ class RegionLoss(nn.Module):
             "valid_ratio": valid.float().mean(),
             "intersection_area": intersection_area.mean(),
             "patch_mask": selected,
+            "patch_weights": weights,
             "valid": valid,
         }

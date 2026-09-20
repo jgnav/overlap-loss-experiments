@@ -22,11 +22,12 @@ def reference_sk(logits, temperature):
     return q
 
 
-def reference_loss(student, teacher, boxes, mode, temperature=.2):
+def reference_loss(student, teacher, boxes, mode, temperature=.2, patch_threshold=.51):
     fractions, valid, _ = intersection_patch_fractions(boxes, 4, 0.)
-    selected = fractions >= .51
+    selected = fractions > 0 if patch_threshold == 'weighted' else fractions >= patch_threshold
     valid = valid & selected.any(-1).all(-1)
     selected = selected & valid[:, None, None]
+    weights = fractions * selected if patch_threshold == 'weighted' else selected.float()
     if not valid.any():
         return student.sum() * 0
     regions = []
@@ -38,8 +39,8 @@ def reference_loss(student, teacher, boxes, mode, temperature=.2):
             normalized = (x / temperature).softmax(-1)
         else:
             normalized = x / x.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        regions.append((normalized * selected[..., None]).sum(2)[valid]
-                       / selected.sum(2)[valid, :, None])
+        regions.append((normalized * weights[..., None]).sum(2)[valid]
+                       / weights.sum(2)[valid, :, None])
     s, t = regions
     if mode == 'raw_logits':
         return (1 - .5 * (F.cosine_similarity(s[:, 1], t[:, 0])
@@ -53,7 +54,9 @@ def distributed_sk_worker(rank, rendezvous):
     dist.init_process_group('gloo', init_method=rendezvous, rank=rank, world_size=2,
                             timeout=datetime.timedelta(seconds=30))
     try:
-        for valid_count in (3, 2, 0):
+        for valid_count, patch_threshold in (
+            (count, threshold) for count in (3, 2, 0) for threshold in (.51, 'weighted')
+        ):
             torch.manual_seed(37)
             student = (torch.randn(4, 2, 4, 3) * .1).requires_grad_()
             teacher = (torch.randn(4, 2, 4, 3) * .1).requires_grad_()
@@ -61,12 +64,12 @@ def distributed_sk_worker(rank, rendezvous):
             if valid_count:
                 boxes[:valid_count] = boxes_full(valid_count)
                 boxes[0, 1, 0] = .25  # unequal selected patch counts across ranks
-            expected = reference_loss(student, teacher, boxes, 'sinkhorn')
+            expected = reference_loss(student, teacher, boxes, 'sinkhorn', patch_threshold=patch_threshold)
             expected.backward()
             part = slice(2 * rank, 2 * rank + 2)
             local_student = student.detach()[part].clone().requires_grad_()
             local_teacher = teacher.detach()[part].clone().requires_grad_()
-            loss = RegionLoss(patch_threshold=.51, temperature=.2, normalization='sinkhorn')
+            loss = RegionLoss(patch_threshold=patch_threshold, temperature=.2, normalization='sinkhorn')
             result = loss(tuple(local_student.unbind(1)), tuple(local_teacher.unbind(1)), boxes[part])
             result['loss'].backward()
             # Each rank scales its local sum for DDP's eventual gradient average.

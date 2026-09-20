@@ -2,6 +2,7 @@
 
 import json
 import re
+import sys
 
 from evaluation.utils.common import (
     checkpoint_fingerprint,
@@ -30,6 +31,20 @@ EVALUATIONS = (
     ("coco_multilabel", "evaluation.utils.coco_multilabel", None),
 )
 
+
+def evaluation_command(args, name, module, result_path):
+    """Shared worker invocation for offline evaluation and online monitoring."""
+    command = [
+        sys.executable, "-m", module, str(args.checkpoint),
+        "--checkpoint-key", args.checkpoint_key, "--arch", args.arch,
+        "--datasets-root", str(args.datasets_root), "--output-dir", str(args.output_dir),
+        "--result-json", str(result_path), "--num-workers", str(args.num_workers),
+        "--seed", str(args.seed), "--classification-manifests", str(args.classification_manifests),
+    ]
+    if name in {"pascal_voc_knn", "pascal_voc_linear", "ade20k_knn", "ade20k_linear",
+                "cityscapes_knn", "cityscapes_linear"}:
+        command.extend(("--batch-size", str(args.segmentation_batch_size)))
+    return command
 
 
 def _safe_name(value):

@@ -59,11 +59,6 @@ def load_config(path):
         raise ValueError("online_probes_enabled must be a boolean")
     for name, minimum in (
         ("online_probe_frequency", 1),
-        ("online_probe_imagenet_train_size", 1),
-        ("online_probe_imagenet_val_size", 1),
-        ("online_probe_voc_train_size", 1),
-        ("online_probe_voc_val_size", 1),
-        ("online_probe_k", 1),
         ("online_probe_batch_size", 1),
         ("online_probe_max_concurrent_jobs", 1),
     ):
@@ -79,8 +74,11 @@ def load_config(path):
         raise ValueError("ibot_plus_plus must be a boolean")
     if type(config["register"]) is not int or config["register"] < 0:
         raise ValueError("register must be an integer >= 0")
-    if not 0 < config["region_patch_threshold"] <= 1:
-        raise ValueError("region_patch_threshold must be in (0, 1]")
+    threshold = config["region_patch_threshold"]
+    if threshold != "weighted" and not (
+        type(threshold) in (int, float) and 0 < threshold <= 1
+    ):
+        raise ValueError("region_patch_threshold must be in (0, 1] or 'weighted'")
     if not math.isfinite(config["region_temp"]) or config["region_temp"] <= 0:
         raise ValueError("region_temp must be finite and positive")
     if config["region_normalization"] not in (
