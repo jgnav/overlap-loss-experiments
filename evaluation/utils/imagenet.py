@@ -1,6 +1,6 @@
 import hashlib
-import math
 import time
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -34,6 +34,20 @@ IMAGENET_KNN_FRACTIONS = {
     "imagenet_knn": IMAGENET_KNN_TRAINING_FRACTION,
     "imagenet_knn_100pct": 1.0,
 }
+SIMCLRV2_SUBSET_URL = (
+    "https://github.com/google-research/simclr/tree/master/imagenet_subsets"
+)
+SIMCLRV2_SUBSET_FILES = {
+    0.01: "1percent.txt",
+    0.10: "10percent.txt",
+}
+SIMCLRV2_SUBSET_SHA256 = {
+    0.01: "71e82a48ba78252683ae334c4d019ebd5c6e855b9599c1389fbe83eb9549cf17",
+    0.10: "6d09de11e7bdaf5b1f3b1f249b6183695f97310cdd20f0c03e7235b6b9392091",
+}
+SIMCLRV2_SUBSET_DIRECTORY = (
+    Path(__file__).resolve().parents[1] / "resources" / "simclrv2_imagenet_subsets"
+)
 
 
 def _resolve_imagenet_root(datasets_root):
@@ -74,32 +88,57 @@ class IndexedSubset(torch.utils.data.Dataset):
         return image, label, index
 
 
-def _stratified_subset_indices(targets, fraction, seed):
-    """Select an exact-size, deterministic proportional subset of every class."""
-    if not 0.0 < fraction <= 1.0:
-        raise ValueError(f"Subset fraction must be in (0, 1], got {fraction}")
-    targets = torch.as_tensor(targets, dtype=torch.long)
-    subset_size = round(len(targets) * fraction)
-    classes = torch.unique(targets, sorted=True)
-    class_indices = [torch.where(targets == label)[0] for label in classes]
-    exact_counts = [len(indices) * fraction for indices in class_indices]
-    selected_counts = [math.floor(count) for count in exact_counts]
-    remaining = subset_size - sum(selected_counts)
-    remainder_order = sorted(
-        range(len(classes)),
-        key=lambda index: (exact_counts[index] - selected_counts[index], -index),
-        reverse=True,
-    )
-    for index in remainder_order[:remaining]:
-        selected_counts[index] += 1
+def _simclrv2_subset_names(fraction):
+    """Return the official fixed SimCLRv2 ImageNet image-name list."""
+    try:
+        filename = SIMCLRV2_SUBSET_FILES[fraction]
+    except KeyError as error:
+        raise ValueError(f"No SimCLRv2 subset exists for fraction {fraction}") from error
+    path = SIMCLRV2_SUBSET_DIRECTORY / filename
+    contents = path.read_bytes()
+    digest = hashlib.sha256(contents).hexdigest()
+    expected_digest = SIMCLRV2_SUBSET_SHA256[fraction]
+    if digest != expected_digest:
+        raise RuntimeError(
+            f"SimCLRv2 subset file checksum mismatch for {path}: "
+            f"expected {expected_digest}, got {digest}"
+        )
+    names = tuple(line.strip() for line in contents.decode("utf-8").splitlines() if line.strip())
+    if len(names) != len(set(names)):
+        raise RuntimeError(f"SimCLRv2 subset file contains duplicate image names: {path}")
+    return names
 
-    generator = torch.Generator().manual_seed(seed)
-    selected = []
-    for indices, count in zip(class_indices, selected_counts, strict=True):
-        order = torch.randperm(len(indices), generator=generator)[:count]
-        selected.extend(indices[order].tolist())
-    shuffle = torch.randperm(len(selected), generator=generator)
-    return [selected[index] for index in shuffle.tolist()]
+
+def _simclrv2_subset_indices(dataset, fraction):
+    """Resolve a supplied SimCLRv2 image-name list against ImageFolder samples."""
+    names = _simclrv2_subset_names(fraction)
+    indices_by_name = {}
+    for index, (sample, _) in enumerate(dataset.samples):
+        name = Path(sample).name
+        if name in indices_by_name:
+            raise RuntimeError(
+                "ImageNet training set has duplicate image basenames; cannot "
+                f"unambiguously resolve the SimCLRv2 split ({name})"
+            )
+        indices_by_name[name] = index
+    missing = [name for name in names if name not in indices_by_name]
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise FileNotFoundError(
+            f"SimCLRv2 {round(fraction * 100)}% ImageNet split is missing "
+            f"{len(missing)} images below {dataset.root}; first missing: {preview}"
+        )
+    return [indices_by_name[name] for name in names]
+
+
+def _simclrv2_subset_protocol(fraction):
+    filename = SIMCLRV2_SUBSET_FILES[fraction]
+    return {
+        "training_subset": f"official SimCLRv2 {round(fraction * 100)}% ImageNet split",
+        "training_subset_file": f"evaluation/resources/simclrv2_imagenet_subsets/{filename}",
+        "training_subset_file_sha256": SIMCLRV2_SUBSET_SHA256[fraction],
+        "training_subset_source": SIMCLRV2_SUBSET_URL,
+    }
 
 
 def _indices_sha256(indices):
@@ -244,8 +283,12 @@ def run_imagenet_knn(args, evaluation_name="imagenet_knn"):
     )
     if fraction == 1.0:
         train_indices = list(range(len(full_train_dataset)))
+        subset_protocol = {
+            "training_subset": "all training images in dataset order",
+        }
     else:
-        train_indices = _stratified_subset_indices(full_train_dataset.targets, fraction, args.seed)
+        train_indices = _simclrv2_subset_indices(full_train_dataset, fraction)
+        subset_protocol = _simclrv2_subset_protocol(fraction)
     train_dataset = IndexedSubset(full_train_dataset, train_indices)
     val_dataset = IndexedImageFolder(root / "val", transform=_eval_transform())
     if full_train_dataset.class_to_idx != val_dataset.class_to_idx or len(full_train_dataset.classes) != 1000:
@@ -254,7 +297,7 @@ def run_imagenet_knn(args, evaluation_name="imagenet_knn"):
         print(
             "ImageNet loaded: "
             f"{len(train_dataset)}/{len(full_train_dataset)} train ({percent}%), "
-            f"{len(val_dataset)} val; subset seed={args.seed}",
+            f"{len(val_dataset)} val; {subset_protocol['training_subset']}",
             flush=True,
         )
     train_features, train_labels = _extract_distributed_features(
@@ -291,17 +334,17 @@ def run_imagenet_knn(args, evaluation_name="imagenet_knn"):
                 "test": len(val_dataset),
             },
             "protocol": {
-                "source": "CRISP Table 4 (10% also Section 4.4) / original iBOT weighted k-NN",
+                "source": "CRISP Table 4 / original iBOT frozen-feature weighted k-NN",
                 "input_resolution": 224,
                 "training_fraction": fraction,
-                "training_subset": "all training images in dataset order" if fraction == 1.0 else "deterministic proportional stratified sample",
-                "training_subset_seed": args.seed,
+                "training_fraction_actual": len(train_dataset) / len(full_train_dataset),
                 "training_subset_indices_sha256": _indices_sha256(train_indices),
                 "subset_note": (
-                    "CRISP specifies 1%, 10%, and 100% ImageNet-1K k-NN evaluations but does "
-                    "not publish subset indices; the seed and index hash make "
-                    "this implementation reproducible."
+                    "iBOT uses the predefined SimCLRv2 ImageNet subsets for its "
+                    "1% and 10% frozen-feature evaluations."
+                    if fraction < 1.0 else "The 100% evaluation uses all ImageNet training images."
                 ),
+                **subset_protocol,
                 "feature": f"final normalized {args.checkpoint_key} CLS token",
                 "feature_l2_normalization": True,
                 "temperature": 0.07,

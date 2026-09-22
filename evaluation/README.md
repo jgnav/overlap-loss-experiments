@@ -101,11 +101,13 @@ mode; only a linear layer is trained. The existing `imagenet_knn` remains the
 k-NN fractions. All three evaluate the **entire ImageNet validation set** and
 use the same iBOT weighted k-NN recipe: final CLS features, L2 normalization,
 temperature 0.07, and primary k=20 (also reporting k=10/100/200). The 1% and
-10% banks use deterministic proportional stratified sampling; 100% uses every
-training image in dataset order. The existing 10% sampler is unchanged. Each
-result records its fraction, seed, sample counts and index hash. CRISP does not
-provide the exact sampled images or detailed k-NN settings. Each task extracts
-its own features; the 100% bank needs substantially more GPU memory and work.
+10% banks use the fixed ImageNet image lists supplied by SimCLRv2, as required
+by iBOT's semi-supervised frozen-feature protocol. The lists are vendored under
+`evaluation/resources/simclrv2_imagenet_subsets/` and resolved against the
+canonical ImageNet training directory; 100% uses every training image in
+dataset order. Each result records the supplied-list checksum, sample counts,
+and resolved-index hash. Each task extracts its own features; the 100% bank
+needs substantially more GPU memory and work.
 
 `pascal_voc_1shot`, `pascal_voc_2shot`, and `pascal_voc_5shot` implement CRISP
 Table 3's low-shot classification settings. They use the same VOC classification

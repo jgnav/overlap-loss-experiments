@@ -11,7 +11,7 @@ Each scheduled teacher snapshot runs exactly the same offline task modules:
 
 - `evaluation.utils.pascal_voc_knn`: original VOC train/val, CAPI parameter search, selection, refit and pixel scoring.
 - `evaluation.utils.pascal_voc_linear`: offline VOC linear segmentation, including its complete parameter search.
-- `evaluation.utils.imagenet_knn`: seeded stratified 10% training bank, full validation, final CLS features and temperature-weighted k-NN.
+- `evaluation.utils.imagenet_knn`: official SimCLRv2/iBOT fixed 10% training bank, full validation, final CLS features and temperature-weighted k-NN.
 
 Online and offline evaluation share the worker command builder and task entrypoints.
 See [the offline protocols](../evaluation/README.md) for full recipes.

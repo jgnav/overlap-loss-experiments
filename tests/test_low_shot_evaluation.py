@@ -79,16 +79,27 @@ class FewShotTest(unittest.TestCase):
 
 
 class ImageNetFractionsTest(unittest.TestCase):
-    def test_exact_fraction_and_class_proportions(self):
-        targets = [0] * 103 + [1] * 197 + [2] * 200
-        for fraction in (0.01, 0.1, 1.0):
-            selected = imagenet._stratified_subset_indices(targets, fraction, 7)
-            self.assertEqual(len(selected), round(len(targets) * fraction))
-            self.assertEqual(len(set(selected)), len(selected))
-            for label in (0, 1, 2):
-                actual = sum(targets[i] == label for i in selected)
-                self.assertLessEqual(abs(actual - targets.count(label) * fraction), 1)
-            self.assertEqual(selected, imagenet._stratified_subset_indices(targets, fraction, 7))
+    def test_simclrv2_split_resolves_the_supplied_image_order(self):
+        class Folder:
+            root = "/imagenet/train"
+            samples = [
+                ("/imagenet/train/n00000001/n00000001_1.JPEG", 0),
+                ("/imagenet/train/n00000002/n00000002_2.JPEG", 1),
+                ("/imagenet/train/n00000003/n00000003_3.JPEG", 2),
+            ]
+
+        with mock.patch.object(
+            imagenet, "_simclrv2_subset_names",
+            return_value=("n00000003_3.JPEG", "n00000001_1.JPEG"),
+        ):
+            self.assertEqual(imagenet._simclrv2_subset_indices(Folder(), 0.1), [2, 0])
+        with mock.patch.object(imagenet, "_simclrv2_subset_names", return_value=("missing.JPEG",)):
+            with self.assertRaisesRegex(FileNotFoundError, "missing 1 images"):
+                imagenet._simclrv2_subset_indices(Folder(), 0.1)
+
+    def test_vendored_simclrv2_lists_have_the_official_checksums(self):
+        self.assertEqual(len(imagenet._simclrv2_subset_names(0.01)), 12_811)
+        self.assertEqual(len(imagenet._simclrv2_subset_names(0.10)), 128_116)
 
     def test_all_regimes_report_correct_bank_and_full_validation(self):
         vocabulary = {str(i): i for i in range(1000)}
@@ -110,6 +121,8 @@ class ImageNetFractionsTest(unittest.TestCase):
         def extract(model, dataset, args, description):
             seen.append(len(dataset))
             return torch.ones(len(dataset), 2), torch.zeros(len(dataset), dtype=torch.long)
+        def predefined_subset(dataset, fraction):
+            return list(range(round(len(dataset) * fraction)))
         with tempfile.TemporaryDirectory() as directory:
             args = SimpleNamespace(checkpoint=Path(directory) / 'model.pth', checkpoint_key='teacher',
                                    arch='vit_small', datasets_root=Path(directory), seed=7,
@@ -129,12 +142,23 @@ class ImageNetFractionsTest(unittest.TestCase):
                         stack.enter_context(mock.patch.object(imagenet, target, return_value=value) if '.' not in target
                                             else mock.patch('evaluation.utils.imagenet.' + target, return_value=value))
                     stack.enter_context(mock.patch.object(imagenet, '_extract_distributed_features', side_effect=extract))
+                    stack.enter_context(mock.patch.object(imagenet, '_simclrv2_subset_indices', side_effect=predefined_subset))
                     stack.enter_context(mock.patch.object(imagenet.dist, 'barrier'))
                     stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
                     result = imagenet.run_imagenet_knn(args, name)
                     self.assertEqual(seen, [round(100000 * fraction), 2000])
                     self.assertEqual(result['evaluation'], name)
                     self.assertEqual(result['protocol']['training_fraction'], fraction)
+                    self.assertNotIn('training_subset_seed', result['protocol'])
+                    if fraction < 1.0:
+                        self.assertEqual(
+                            result['protocol']['training_subset'],
+                            f"official SimCLRv2 {round(fraction * 100)}% ImageNet split",
+                        )
+                        self.assertEqual(
+                            result['protocol']['training_subset_file_sha256'],
+                            imagenet.SIMCLRV2_SUBSET_SHA256[fraction],
+                        )
                     self.assertEqual(result['metrics'], result['metrics_by_neighbors']['20'])
                     self.assertEqual(json.loads(args.result_json.read_text()), result)
 

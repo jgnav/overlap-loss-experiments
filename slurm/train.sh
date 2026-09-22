@@ -26,4 +26,4 @@ nvidia-smi
 ./.conda-env/bin/torchrun \
     --standalone \
     --nproc_per_node=4 \
-    train.py config/trainv6_ref.yaml
+    train.py config/train.yaml

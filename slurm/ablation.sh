@@ -5,7 +5,7 @@
 #SBATCH --job-name=ibot-ablation
 #SBATCH --array=0-13
 #SBATCH --partition=3090_risk,a100,rtx_pro6000_risk
-# aisurrey14 currently exposes allocated GPUs but cannot initialize CUDA.
+# aisurrey14 currently cannot initialize the CUDA driver for this account.
 #SBATCH --exclude=aisurrey14
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
@@ -35,6 +35,8 @@ fi
 
 repo_root="${SLURM_SUBMIT_DIR}"
 cd "$repo_root"
+source slurm/training_runtime.sh
+configure_training_compatibility
 name="${configs[$SLURM_ARRAY_TASK_ID]}"
 config_path="config/ablations/${name}.yaml"
 [[ -f "$config_path" ]] || { echo "Missing config: $config_path" >&2; exit 2; }
@@ -46,6 +48,8 @@ unset IBOT_PRECISION_OVERRIDE IBOT_BATCH_SIZE_PER_GPU_OVERRIDE IBOT_GPU_COUNT_OV
 run_dir="output/ablation/$IBOT_RUN_ID"
 mkdir -p "$run_dir"
 cp "$config_path" "$run_dir/ablation.yaml"
+runtime_config="$run_dir/runtime_config.yaml"
+prepare_training_config ./.conda-env/bin/python "$config_path" "$runtime_config" "$run_dir"
 
 echo "Array job: ${SLURM_ARRAY_JOB_ID}"
 echo "Array task: ${SLURM_ARRAY_TASK_ID}"
@@ -53,9 +57,8 @@ echo "Ablation: $name"
 echo "Config: $config_path"
 echo "Output: $run_dir"
 echo "Node: $(hostname)"
-nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 
 exec ./.conda-env/bin/torchrun \
     --standalone \
     --nproc_per_node=4 \
-    train.py "$config_path"
+    train.py "$runtime_config"
