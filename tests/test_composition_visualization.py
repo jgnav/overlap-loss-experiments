@@ -34,13 +34,29 @@ class CompositionMathTest(unittest.TestCase):
 
     def test_cross_image_donor_pairing_is_deterministic(self):
         regions = [
-            experiment.CocoRegion(i, i, 1, "x", "unused", np.ones((2, 2), bool), (0, 0, 2, 2))
+            experiment.CocoRegion(
+                i, i, 1, "x", "unused", np.ones((2, 2), bool),
+                (0, 0, 2, 2), (0, 0, 2, 2),
+            )
             for i in range(8)
         ]
-        first = experiment.pair_shuffled_regions(regions, seed=4)
-        second = experiment.pair_shuffled_regions(regions, seed=4)
-        self.assertEqual([x.donor.image_id for x in first], [x.donor.image_id for x in second])
-        self.assertTrue(all(x.target.image_id != x.donor.image_id for x in first))
+        first = experiment.pair_negative_regions(regions, seed=4)
+        second = experiment.pair_negative_regions(regions, seed=4)
+        self.assertEqual(
+            [x.random_donor.image_id for x in first],
+            [x.random_donor.image_id for x in second],
+        )
+        self.assertTrue(all(x.target.image_id != x.random_donor.image_id for x in first))
+        self.assertTrue(all(x.target.image_id != x.same_category_donor.image_id for x in first))
+
+    def test_spatial_negative_has_same_size_and_no_object_pixels(self):
+        mask = np.zeros((100, 120), dtype=bool)
+        mask[35:65, 45:75] = True
+        box = (40, 30, 80, 70)
+        negative = experiment.find_spatial_negative_box(mask, box)
+        self.assertEqual(negative[2] - negative[0], 40)
+        self.assertEqual(negative[3] - negative[1], 40)
+        self.assertFalse(mask[negative[1]:negative[3], negative[0]:negative[2]].any())
 
     def test_bootstrap_clusters_multiple_parents_by_image(self):
         rows = []
@@ -50,17 +66,24 @@ class CompositionMathTest(unittest.TestCase):
                     for parts in (2, 4, 9):
                         value = image_id / 100 + parts / 1000
                         rows.append(experiment.Measurement(
-                            model, image_id, annotation_id, 99, parts,
-                            value, value + .1, .1,
+                            model, image_id, annotation_id, 98, 99, parts,
+                            value, value + .1, value + .2, value + .3,
                         ))
         summary = experiment.bootstrap_summary(rows, samples=100, seed=2)
-        self.assertEqual(len(summary), 2 * 3 * 3)
+        self.assertEqual(len(summary), 2 * 3 * 7)
         item = next(
             x for x in summary
             if x["model"] == "a" and x["parts"] == 4 and x["metric"] == "composition_js"
         )
         self.assertEqual(item["images"], 3)
         self.assertAlmostEqual(item["mean"], .024)
+        image_rows = experiment.image_level_measurements(rows)
+        score = next(
+            row["score_same_category"] for row in image_rows
+            if row["model"] == "a" and row["image_id"] == 1 and row["parts"] == 2
+        )
+        expected = 1 - .012 / (.212 + experiment.SCORE_EPSILON)
+        self.assertAlmostEqual(score, expected)
 
 
 class CompositionIOTest(unittest.TestCase):
@@ -78,8 +101,8 @@ class CompositionIOTest(unittest.TestCase):
                 images.append({"id": image_id, "file_name": filename, "height": 100, "width": 100})
                 annotations.append({
                     "id": image_id + 10, "image_id": image_id, "category_id": 1,
-                    "area": 3600, "bbox": [20, 20, 60, 60], "iscrowd": 0,
-                    "segmentation": [[20, 20, 80, 20, 80, 80, 20, 80]],
+                    "area": 900, "bbox": [30, 30, 30, 30], "iscrowd": 0,
+                    "segmentation": [[30, 30, 60, 30, 60, 60, 30, 60]],
                 })
             (annotation_dir / "instances_val2017.json").write_text(json.dumps({
                 "images": images, "annotations": annotations,
@@ -91,6 +114,7 @@ class CompositionIOTest(unittest.TestCase):
             self.assertEqual(len(regions), 2)
             self.assertTrue(all(region.mask.any() for region in regions))
             self.assertTrue(all(Path(region.image_path).is_file() for region in regions))
+            self.assertTrue(all(region.spatial_negative_box for region in regions))
 
     def test_encode_region_is_one_sample_and_averages_patch_softmax(self):
         class Backbone(torch.nn.Module):
@@ -118,13 +142,21 @@ class CompositionIOTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target_path, donor_path = root / "target.png", root / "donor.png"
+            category_path = root / "category.png"
             Image.new("RGB", (90, 90), "red").save(target_path)
             Image.new("RGB", (90, 90), "blue").save(donor_path)
+            Image.new("RGB", (90, 90), "green").save(category_path)
             target = experiment.CocoRegion(
-                1, 10, 1, "a", str(target_path), np.ones((90, 90), bool), (0, 0, 90, 90)
+                1, 10, 1, "a", str(target_path), np.ones((90, 90), bool),
+                (0, 0, 90, 90), (0, 0, 90, 90),
             )
             donor = experiment.CocoRegion(
-                2, 20, 2, "b", str(donor_path), np.ones((90, 90), bool), (0, 0, 90, 90)
+                2, 20, 2, "b", str(donor_path), np.ones((90, 90), bool),
+                (0, 0, 90, 90), (0, 0, 90, 90),
+            )
+            category = experiment.CocoRegion(
+                3, 30, 1, "a", str(category_path), np.ones((90, 90), bool),
+                (0, 0, 90, 90), (0, 0, 90, 90),
             )
             calls = []
             def fake_encode(image, box, backbone, head, patch_size):
@@ -132,12 +164,12 @@ class CompositionIOTest(unittest.TestCase):
                 return np.array([.8, .2]) if image.getpixel((0, 0))[0] > 200 else np.array([.1, .9])
             with mock.patch.object(experiment, "encode_region", side_effect=fake_encode):
                 rows = experiment.evaluate_pair(
-                    experiment.RegionPair(target, donor), "model", None, None, 16
+                    experiment.RegionPair(target, donor, category), "model", None, None, 16
                 )
             self.assertEqual(len(rows), 3)
-            self.assertEqual(len(calls), 1 + 2 * sum(experiment.PART_COUNTS))
+            self.assertEqual(len(calls), 1 + 4 * sum(experiment.PART_COUNTS))
             self.assertTrue(all(row.composition_js == 0 for row in rows))
-            self.assertTrue(all(row.shuffled_js > 0 and row.specificity_gap > 0 for row in rows))
+            self.assertTrue(all(row.random_image_js > 0 and row.same_category_js > 0 for row in rows))
 
 
 if __name__ == "__main__":

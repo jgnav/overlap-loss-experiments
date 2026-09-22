@@ -31,8 +31,7 @@ from patch_concept_visualization import (
 # ---- Standalone experiment configuration ---------------------------------
 CHECKPOINTS = {
     "iBOT initialization": Path("checkpoints/ibot_vit_small.pth"),
-    "iBOT + 200 epoch control": Path("checkpoints/checkpoint_source1000_continuation0200.pth"),
-    "Ours + 200 epochs": Path("checkpoints/checkpoint_source1000_continuation0200.pth"),
+    "Region-trained +200 epochs": Path("checkpoints/checkpoint_source1000_continuation0200.pth"),
 }
 DATASETS_ROOT = Path("/mnt/fast/nobackup/scratch4weeks/jg02228/datasets")
 COCO_SPLIT = "val2017"
@@ -49,6 +48,8 @@ MIN_PARENT_SIDE = 48
 TEMPERATURE = 0.1
 BOOTSTRAP_SAMPLES = 10_000
 CONFIDENCE = 0.95
+SCORE_EPSILON = 1e-12
+QUALITATIVE_PROTOTYPES = 32
 SEED = 0
 DPI = 300
 # ---------------------------------------------------------------------------
@@ -63,12 +64,14 @@ class CocoRegion:
     image_path: str
     mask: np.ndarray
     box: tuple[int, int, int, int]
+    spatial_negative_box: tuple[int, int, int, int]
 
 
 @dataclass(frozen=True)
 class RegionPair:
     target: CocoRegion
-    donor: CocoRegion
+    random_donor: CocoRegion
+    same_category_donor: CocoRegion
 
 
 @dataclass(frozen=True)
@@ -76,11 +79,13 @@ class Measurement:
     model: str
     image_id: int
     annotation_id: int
-    donor_image_id: int
+    random_donor_image_id: int
+    same_category_donor_image_id: int
     parts: int
     composition_js: float
-    shuffled_js: float
-    specificity_gap: float
+    random_image_js: float
+    same_category_js: float
+    same_image_js: float
 
 
 def _decode_coco_segmentation(annotation, height, width, mask_utils):
@@ -117,6 +122,26 @@ def _resolve_coco_image(coco_root, split, filename):
     if len(matches) != 1:
         raise FileNotFoundError(f"Expected exactly one COCO image for {filename}; found {matches}")
     return matches[0]
+
+
+def find_spatial_negative_box(mask, parent_box):
+    """Find an equal-sized box in the image containing no parent-mask pixels."""
+    height, width = mask.shape
+    left, top, right, bottom = parent_box
+    box_width, box_height = right - left, bottom - top
+    if box_width > width or box_height > height:
+        return None
+    xs = np.unique(np.rint(np.linspace(0, width - box_width, 17)).astype(int))
+    ys = np.unique(np.rint(np.linspace(0, height - box_height, 17)).astype(int))
+    candidates = []
+    for y in ys:
+        for x in xs:
+            box = (int(x), int(y), int(x + box_width), int(y + box_height))
+            overlap = int(mask[box[1]:box[3], box[0]:box[2]].sum())
+            distance = (x - left) ** 2 + (y - top) ** 2
+            candidates.append((overlap, -distance, box))
+    overlap, _, box = min(candidates)
+    return box if overlap == 0 else None
 
 
 def load_coco_regions(
@@ -158,7 +183,7 @@ def load_coco_regions(
     rng = np.random.default_rng(seed)
     image_ids = np.array(sorted(by_image))
     rng.shuffle(image_ids)
-    regions, used_images = [], 0
+    regions = []
     for image_id in image_ids:
         record = images[int(image_id)]
         image_path = _resolve_coco_image(coco, split, record["file_name"])
@@ -184,36 +209,103 @@ def load_coco_regions(
             )
             if min(box[2] - box[0], box[3] - box[1]) < MIN_PARENT_SIDE:
                 continue
+            spatial_box = find_spatial_negative_box(mask, box)
+            if spatial_box is None:
+                continue
             image_regions.append(CocoRegion(
                 int(image_id), int(annotation["id"]), int(annotation["category_id"]),
-                categories[int(annotation["category_id"])], str(image_path), mask, box,
+                categories[int(annotation["category_id"])], str(image_path), mask,
+                box, spatial_box,
             ))
         if image_regions:
             regions.extend(image_regions)
-            used_images += 1
-        if used_images == num_images:
+    category_images = {}
+    for region in regions:
+        category_images.setdefault(region.category_id, set()).add(region.image_id)
+    eligible = [
+        region for region in regions
+        if len(category_images[region.category_id]) >= 2
+    ]
+    provisional, provisional_images = [], set()
+    for region in eligible:
+        if region.image_id not in provisional_images and len(provisional_images) == num_images:
+            continue
+        if region.image_id not in provisional_images:
+            provisional_images.add(region.image_id)
+        if sum(item.image_id == region.image_id for item in provisional) < parents_per_image:
+            provisional.append(region)
+    provisional_categories = {}
+    for region in provisional:
+        provisional_categories.setdefault(region.category_id, set()).add(region.image_id)
+    selected = [
+        region for region in provisional
+        if len(provisional_categories[region.category_id]) >= 2
+    ]
+    selected_images = {region.image_id for region in selected}
+    for region in eligible:
+        if len(selected_images) >= num_images:
             break
-    if used_images < num_images:
-        raise ValueError(f"Only {used_images} COCO images passed the region filters; requested {num_images}")
-    return regions
+        if region.image_id in selected_images:
+            continue
+        existing_category_images = {
+            item.image_id for item in selected if item.category_id == region.category_id
+        }
+        if existing_category_images:
+            selected.append(region)
+            selected_images.add(region.image_id)
+            continue
+        mate = next((
+            item for item in eligible
+            if item.category_id == region.category_id
+            and item.image_id != region.image_id
+            and item.image_id not in selected_images
+        ), None)
+        if mate is not None and len(selected_images) + 2 <= num_images:
+            selected.extend((region, mate))
+            selected_images.update((region.image_id, mate.image_id))
+    if len(selected_images) < num_images:
+        raise ValueError(
+            f"Only {len(selected_images)} COCO images support all three negatives; "
+            f"requested {num_images}"
+        )
+    return selected
 
 
-def pair_shuffled_regions(regions, seed=SEED):
-    """Assign each target a deterministic donor from a different image."""
+def pair_negative_regions(regions, seed=SEED):
+    """Assign deterministic random-image and same-category donors."""
     if len({region.image_id for region in regions}) < 2:
         raise ValueError("Shuffled controls require at least two source images")
     rng = np.random.default_rng(seed + 1)
     donors = list(regions)
+    random_donors = None
     for _ in range(10_000):
         rng.shuffle(donors)
         if all(a.image_id != b.image_id for a, b in zip(regions, donors)):
-            return [RegionPair(a, b) for a, b in zip(regions, donors)]
-    donors = sorted(regions, key=lambda item: (item.image_id, item.annotation_id))
-    for offset in range(1, len(donors)):
-        shifted = donors[offset:] + donors[:offset]
-        if all(a.image_id != b.image_id for a, b in zip(regions, shifted)):
-            return [RegionPair(a, b) for a, b in zip(regions, shifted)]
-    raise RuntimeError("Could not construct a cross-image donor assignment")
+            random_donors = list(donors)
+            break
+    if random_donors is None:
+        donors = sorted(regions, key=lambda item: (item.image_id, item.annotation_id))
+        for offset in range(1, len(donors)):
+            shifted = donors[offset:] + donors[:offset]
+            if all(a.image_id != b.image_id for a, b in zip(regions, shifted)):
+                random_donors = shifted
+                break
+    if random_donors is None:
+        raise RuntimeError("Could not construct a cross-image donor assignment")
+    pairs = []
+    for target, random_donor in zip(regions, random_donors):
+        choices = [
+            region for region in regions
+            if region.category_id == target.category_id
+            and region.image_id != target.image_id
+        ]
+        if not choices:
+            raise ValueError(
+                f"No cross-image same-category donor for annotation {target.annotation_id}"
+            )
+        index = int(rng.integers(0, len(choices)))
+        pairs.append(RegionPair(target, random_donor, choices[index]))
+    return pairs
 
 
 def load_teacher(path):
@@ -295,48 +387,89 @@ def jensen_shannon(p, q):
     return .5 * (kl(p) + kl(q))
 
 
+def normalized_score(composition_js, negative_js, epsilon=SCORE_EPSILON):
+    """Return 1 - D_comp/(D_negative + epsilon)."""
+    if epsilon <= 0:
+        raise ValueError("SCORE_EPSILON must be positive")
+    return 1.0 - float(composition_js) / (float(negative_js) + epsilon)
+
+
 def evaluate_pair(pair, model_name, backbone, head, patch_size):
-    """Evaluate one target parent against own and donor child crops."""
+    """Evaluate one parent against correct parts and all three negatives."""
     with Image.open(pair.target.image_path) as source:
         target_image = source.convert("RGB")
-    with Image.open(pair.donor.image_path) as source:
-        donor_image = source.convert("RGB")
+    with Image.open(pair.random_donor.image_path) as source:
+        random_image = source.convert("RGB")
+    with Image.open(pair.same_category_donor.image_path) as source:
+        category_image = source.convert("RGB")
     parent_q = encode_region(target_image, pair.target.box, backbone, head, patch_size)
     rows = []
     for parts in PART_COUNTS:
         child_boxes, weights = partition_box(pair.target.box, parts)
-        donor_boxes, _ = partition_box(pair.donor.box, parts)
+        random_boxes, _ = partition_box(pair.random_donor.box, parts)
+        category_boxes, _ = partition_box(pair.same_category_donor.box, parts)
+        spatial_boxes, _ = partition_box(pair.target.spatial_negative_box, parts)
         child_q = np.stack([encode_region(target_image, box, backbone, head, patch_size) for box in child_boxes])
-        shuffled_q = np.stack([encode_region(donor_image, box, backbone, head, patch_size) for box in donor_boxes])
+        random_q = np.stack([encode_region(random_image, box, backbone, head, patch_size) for box in random_boxes])
+        category_q = np.stack([encode_region(category_image, box, backbone, head, patch_size) for box in category_boxes])
+        spatial_q = np.stack([encode_region(target_image, box, backbone, head, patch_size) for box in spatial_boxes])
         composition_js = jensen_shannon(parent_q, weights @ child_q)
-        shuffled_js = jensen_shannon(parent_q, weights @ shuffled_q)
         rows.append(Measurement(
             model_name, pair.target.image_id, pair.target.annotation_id,
-            pair.donor.image_id, parts, composition_js, shuffled_js,
-            shuffled_js - composition_js,
+            pair.random_donor.image_id, pair.same_category_donor.image_id,
+            parts, composition_js,
+            jensen_shannon(parent_q, weights @ random_q),
+            jensen_shannon(parent_q, weights @ category_q),
+            jensen_shannon(parent_q, weights @ spatial_q),
         ))
     return rows
 
 
+def image_level_measurements(measurements):
+    """Aggregate divergences per image before computing normalized scores."""
+    divergence_metrics = (
+        "composition_js", "random_image_js", "same_category_js", "same_image_js"
+    )
+    rows = []
+    keys = sorted({(row.model, row.image_id, row.parts) for row in measurements})
+    for model, image_id, parts in keys:
+        subset = [
+            row for row in measurements
+            if (row.model, row.image_id, row.parts) == (model, image_id, parts)
+        ]
+        values = {
+            metric: float(np.mean([getattr(row, metric) for row in subset]))
+            for metric in divergence_metrics
+        }
+        rows.append({
+            "model": model, "image_id": image_id, "parts": parts,
+            "parents": len(subset), **values,
+            "score_random": normalized_score(values["composition_js"], values["random_image_js"]),
+            "score_same_category": normalized_score(values["composition_js"], values["same_category_js"]),
+            "score_same_image": normalized_score(values["composition_js"], values["same_image_js"]),
+        })
+    return rows
+
+
 def bootstrap_summary(measurements, samples=BOOTSTRAP_SAMPLES, confidence=CONFIDENCE, seed=SEED):
-    """Cluster bootstrap over images, averaging parents within each image."""
+    """Bootstrap per-image divergences and per-image normalized scores."""
     if samples < 1 or not 0 < confidence < 1:
         raise ValueError("Bootstrap samples must be positive and confidence in (0, 1)")
     rng = np.random.default_rng(seed)
     result = []
-    models = list(dict.fromkeys(row.model for row in measurements))
+    image_rows = image_level_measurements(measurements)
+    models = list(dict.fromkeys(row["model"] for row in image_rows))
     alpha = (1 - confidence) / 2
-    metrics = ("composition_js", "shuffled_js", "specificity_gap")
+    metrics = (
+        "composition_js", "random_image_js", "same_category_js", "same_image_js",
+        "score_random", "score_same_category", "score_same_image",
+    )
     for model in models:
         for parts in PART_COUNTS:
-            subset = [row for row in measurements if row.model == model and row.parts == parts]
-            image_ids = sorted({row.image_id for row in subset})
-            if len(image_ids) < 2:
+            subset = [row for row in image_rows if row["model"] == model and row["parts"] == parts]
+            if len(subset) < 2:
                 raise ValueError("Bootstrap intervals require at least two evaluated images")
-            image_values = np.array([
-                [np.mean([getattr(row, metric) for row in subset if row.image_id == image_id]) for metric in metrics]
-                for image_id in image_ids
-            ])
+            image_values = np.array([[row[metric] for metric in metrics] for row in subset])
             draws = image_values[rng.integers(0, len(image_values), (samples, len(image_values)))].mean(1)
             means = image_values.mean(0)
             lower, upper = np.quantile(draws, (alpha, 1 - alpha), axis=0)
@@ -344,24 +477,45 @@ def bootstrap_summary(measurements, samples=BOOTSTRAP_SAMPLES, confidence=CONFID
                 result.append({
                     "model": model, "parts": parts, "metric": metric,
                     "mean": float(means[index]), "ci_low": float(lower[index]),
-                    "ci_high": float(upper[index]), "images": len(image_ids),
+                    "ci_high": float(upper[index]), "images": len(subset),
                 })
     return result
 
 
-def render_plot(summary, path):
-    colors = ("#64748B", "#D97706", "#2563EB", "#059669", "#DC2626")
+def collect_qualitative(pair, backbone, head, patch_size):
+    """Collect a K=4 parent/parts distribution example."""
+    with Image.open(pair.target.image_path) as source:
+        image = source.convert("RGB")
+    boxes, weights = partition_box(pair.target.box, 4)
+    parent_q = encode_region(image, pair.target.box, backbone, head, patch_size)
+    child_q = np.stack([encode_region(image, box, backbone, head, patch_size) for box in boxes])
+    return {
+        "image_id": pair.target.image_id, "category": pair.target.category,
+        "parent": image.crop(pair.target.box), "parts": [image.crop(box) for box in boxes],
+        "child_q": child_q, "reconstruction": weights @ child_q, "parent_q": parent_q,
+    }
+
+
+def _metric_rows(summary, model, metric):
+    return sorted(
+        (row for row in summary if row["model"] == model and row["metric"] == metric),
+        key=lambda row: row["parts"],
+    )
+
+
+def render_plot(summary, qualitative, path):
+    colors = ("#64748B", "#2563EB")
     models = list(dict.fromkeys(row["model"] for row in summary))
-    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.2), constrained_layout=True)
+    fig = plt.figure(figsize=(15, 8.5), constrained_layout=True)
+    grid = fig.add_gridspec(2, 1, height_ratios=(1, .9))
+    top = grid[0].subgridspec(1, 3)
+    axes = [fig.add_subplot(top[0, index]) for index in range(3)]
     for model, color in zip(models, colors):
         for axis, metric, title, ylabel in (
-            (axes[0], "composition_js", "Part-to-whole re-encoding", "JS composition error ↓"),
-            (axes[1], "specificity_gap", "Shuffled-parts control", "Composition specificity gap ↑"),
+            (axes[0], "composition_js", "Part-to-whole diagnostic", "Raw JS composition error ↓"),
+            (axes[1], "score_same_category", "Main result: same-category negative", "Normalized composition score ↑"),
         ):
-            rows = sorted(
-                (row for row in summary if row["model"] == model and row["metric"] == metric),
-                key=lambda row: row["parts"],
-            )
+            rows = _metric_rows(summary, model, metric)
             x = np.array([row["parts"] for row in rows])
             y = np.array([row["mean"] for row in rows])
             low = np.array([row["ci_low"] for row in rows])
@@ -372,8 +526,53 @@ def render_plot(summary, path):
             axis.set_xticks(PART_COUNTS)
             axis.grid(axis="y", alpha=.22)
             axis.spines[["top", "right"]].set_visible(False)
+        for metric, label, linestyle in (
+            ("score_random", "random image", ":"),
+            ("score_same_category", "same category", "-"),
+            ("score_same_image", "same image", "--"),
+        ):
+            rows = _metric_rows(summary, model, metric)
+            axes[2].plot(
+                [row["parts"] for row in rows], [row["mean"] for row in rows],
+                marker="o", color=color, linestyle=linestyle,
+                label=f"{model} · {label}",
+            )
     axes[0].legend(frameon=False, fontsize=8)
-    fig.suptitle(f"COCO {COCO_SPLIT} · image-level {CONFIDENCE:.0%} bootstrap intervals", fontsize=12)
+    axes[1].axhline(0, color="#94A3B8", linewidth=.8)
+    axes[2].set(
+        title="Negative-control difficulty", xlabel="Number of independently encoded parts K",
+        ylabel="Normalized composition score ↑", xticks=PART_COUNTS,
+    )
+    axes[2].grid(axis="y", alpha=.22)
+    axes[2].spines[["top", "right"]].set_visible(False)
+    axes[2].legend(frameon=False, fontsize=6.7, ncol=2)
+
+    bottom = grid[1].subgridspec(1, 6, width_ratios=(1, 1, 1, 1, 1, 2.5))
+    image_axes = [fig.add_subplot(bottom[0, index]) for index in range(5)]
+    for axis, image, title in zip(
+        image_axes, [qualitative["parent"], *qualitative["parts"]],
+        ["Parent R", "Part 1", "Part 2", "Part 3", "Part 4"],
+    ):
+        axis.imshow(image)
+        axis.set_title(title, fontsize=9)
+        axis.set_axis_off()
+    distributions = np.vstack((
+        qualitative["child_q"], qualitative["reconstruction"], qualitative["parent_q"]
+    ))
+    prototype_indices = np.argsort(-qualitative["parent_q"])[:QUALITATIVE_PROTOTYPES]
+    heatmap = distributions[:, prototype_indices]
+    heatmap /= np.maximum(heatmap.max(axis=1, keepdims=True), 1e-15)
+    axis = fig.add_subplot(bottom[0, 5])
+    handle = axis.imshow(heatmap, aspect="auto", cmap="magma", vmin=0, vmax=1)
+    axis.set_yticks(range(6), ["part 1", "part 2", "part 3", "part 4", "reconstructed", "actual parent"])
+    axis.set_xlabel(f"Top-{len(prototype_indices)} parent prototypes")
+    axis.set_title("Independently encoded prototype distributions", fontsize=9)
+    fig.colorbar(handle, ax=axis, fraction=.025, pad=.02, label="row-normalized probability")
+    fig.suptitle(
+        f"COCO {COCO_SPLIT} · image-level {CONFIDENCE:.0%} bootstrap intervals · "
+        f"qualitative image {qualitative['image_id']} ({qualitative['category']})",
+        fontsize=12,
+    )
     fig.savefig(path, dpi=DPI, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
@@ -391,8 +590,8 @@ def validate_configuration():
         raise ValueError("This protocol evaluates exactly K=(2, 4, 9)")
     if INPUT_SIZE < 1 or not math.isfinite(TEMPERATURE) or TEMPERATURE <= 0:
         raise ValueError("INPUT_SIZE and TEMPERATURE must be positive")
-    if not CHECKPOINTS:
-        raise ValueError("Configure at least one checkpoint")
+    if len(CHECKPOINTS) != 2:
+        raise ValueError("Configure exactly two checkpoints: initialization and trained")
     missing = [str(path) for path in CHECKPOINTS.values() if not Path(path).expanduser().is_file()]
     if missing:
         raise FileNotFoundError(f"Missing checkpoints: {missing}")
@@ -402,8 +601,8 @@ def main():
     validate_configuration()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     regions = load_coco_regions()
-    pairs = pair_shuffled_regions(regions)
-    measurements, model_metadata = [], {}
+    pairs = pair_negative_regions(regions)
+    measurements, model_metadata, qualitative = [], {}, None
     for model_name, checkpoint in CHECKPOINTS.items():
         print(f"Loading {model_name}: {checkpoint}", flush=True)
         backbone, head, metadata, prototypes = load_teacher(checkpoint)
@@ -416,16 +615,32 @@ def main():
             "patch_size": patch_size, "prototypes": int(prototypes),
             "checkpoint_region_normalization": _checkpoint_argument(checkpoint_state, "region_normalization", None),
         }
+        model_rows = []
         for index, pair in enumerate(pairs, 1):
-            measurements.extend(evaluate_pair(pair, model_name, backbone, head, patch_size))
+            model_rows.extend(evaluate_pair(pair, model_name, backbone, head, patch_size))
             if index % 25 == 0 or index == len(pairs):
                 print(f"  {index}/{len(pairs)} parents", flush=True)
+        measurements.extend(model_rows)
+        if model_name == list(CHECKPOINTS)[-1]:
+            k4 = [row for row in model_rows if row.parts == 4]
+            ordered = sorted(
+                k4,
+                key=lambda row: normalized_score(row.composition_js, row.same_category_js),
+            )
+            representative = ordered[len(ordered) // 2]
+            pair = next(
+                item for item in pairs
+                if item.target.annotation_id == representative.annotation_id
+            )
+            qualitative = collect_qualitative(pair, backbone, head, patch_size)
         del backbone, head
         if str(DEVICE).startswith("cuda"):
             torch.cuda.empty_cache()
 
     summary = bootstrap_summary(measurements)
+    image_rows = image_level_measurements(measurements)
     _write_csv(OUTPUT_DIR / "measurements.csv", [asdict(row) for row in measurements])
+    _write_csv(OUTPUT_DIR / "image_measurements.csv", image_rows)
     _write_csv(OUTPUT_DIR / "summary.csv", summary)
     _write_csv(OUTPUT_DIR / "regions.csv", [{
         "image_id": pair.target.image_id,
@@ -437,10 +652,16 @@ def main():
         "parent_box_top": pair.target.box[1],
         "parent_box_right": pair.target.box[2],
         "parent_box_bottom": pair.target.box[3],
-        "donor_image_id": pair.donor.image_id,
-        "donor_annotation_id": pair.donor.annotation_id,
+        "random_donor_image_id": pair.random_donor.image_id,
+        "random_donor_annotation_id": pair.random_donor.annotation_id,
+        "same_category_donor_image_id": pair.same_category_donor.image_id,
+        "same_category_donor_annotation_id": pair.same_category_donor.annotation_id,
+        "spatial_box_left": pair.target.spatial_negative_box[0],
+        "spatial_box_top": pair.target.spatial_negative_box[1],
+        "spatial_box_right": pair.target.spatial_negative_box[2],
+        "spatial_box_bottom": pair.target.spatial_negative_box[3],
     } for pair in pairs])
-    render_plot(summary, OUTPUT_DIR / "composition_reencoding.png")
+    render_plot(summary, qualitative, OUTPUT_DIR / "composition_reencoding.png")
     protocol = {
         "experiment": "independent part-to-whole compositional re-encoding",
         "models": model_metadata, "coco_split": COCO_SPLIT,
@@ -448,10 +669,16 @@ def main():
         "part_counts": list(PART_COUNTS), "input_size": INPUT_SIZE,
         "softmax_temperature": TEMPERATURE, "parent_padding": PARENT_PADDING,
         "bootstrap_samples": BOOTSTRAP_SAMPLES, "confidence": CONFIDENCE,
-        "seed": SEED, "js_log_base": "natural",
+        "seed": SEED, "js_log_base": "natural", "score_epsilon": SCORE_EPSILON,
         "parent_definition": "padded bounding rectangle of a valid COCO instance mask",
         "independence": "one crop per forward call",
-        "shuffled_control": "same partition index from a different COCO image",
+        "principal_negative": "same-category instance from a different COCO image",
+        "additional_negatives": [
+            "random instance from a different COCO image",
+            "equal-sized parent-mask-free region from the same image",
+        ],
+        "score_aggregation": "aggregate divergences per image, compute score, then bootstrap images",
+        "scale_stress_test": "each smaller constituent is independently resized to model input resolution",
     }
     (OUTPUT_DIR / "protocol.json").write_text(json.dumps(protocol, indent=2) + "\n")
     print(f"Wrote results to {OUTPUT_DIR.resolve()}", flush=True)
