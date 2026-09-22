@@ -244,10 +244,20 @@ def _teacher_head_state(raw_state: dict[str, torch.Tensor]) -> dict[str, torch.T
 def _copy_shared_head_aliases(
     state: dict[str, torch.Tensor], shared_head: bool
 ) -> dict[str, torch.Tensor]:
-    """Accept checkpoints that serialize only one name for an aliased layer."""
-    if not shared_head:
-        return state
+    """Expand legacy shared projection paths into the current head layout.
+
+    Original iBOT checkpoints share ``mlp`` between CLS and patch tokens while
+    retaining separate ``last_layer`` and ``last_layer2`` prototype matrices.
+    The current non-shared head has a dedicated ``patch_mlp``.  Copying the
+    learned shared MLP into that branch preserves the checkpoint's outputs.
+    Fully shared heads may instead omit aliased final-layer names.
+    """
     state = dict(state)
+    if not shared_head and not any(name.startswith("patch_mlp.") for name in state):
+        for name, value in list(state.items()):
+            if name.startswith("mlp."):
+                state.setdefault("patch_mlp." + name[len("mlp.") :], value)
+        return state
     for first, second in (("last_layer.", "last_layer2."), ("last_norm.", "last_norm2.")):
         for name, value in list(state.items()):
             if name.startswith(first):

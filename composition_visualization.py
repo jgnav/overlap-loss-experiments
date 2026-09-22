@@ -30,8 +30,8 @@ from patch_concept_visualization import (
 
 # ---- Standalone experiment configuration ---------------------------------
 CHECKPOINTS = {
-    "iBOT initialization": Path("checkpoints/checkpoint_source1000.pth"),
-    "iBOT + 200 epoch control": Path("checkpoints/checkpoint_control0200.pth"),
+    "iBOT initialization": Path("checkpoints/ibot_vit_small.pth"),
+    "iBOT + 200 epoch control": Path("checkpoints/checkpoint_source1000_continuation0200.pth"),
     "Ours + 200 epochs": Path("checkpoints/checkpoint_source1000_continuation0200.pth"),
 }
 DATASETS_ROOT = Path("/mnt/fast/nobackup/scratch4weeks/jg02228/datasets")
