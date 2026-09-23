@@ -41,8 +41,8 @@ CHECKPOINTS = {
     "iBOT": REPO_ROOT / "checkpoints" / "ibot_vit_small.pth",
     "Ours": REPO_ROOT / "checkpoints" / "checkpoint_source1000_continuation0200.pth",
 }
-N_IMAGES = 5
-SEED = 0
+N_IMAGES = 10
+SEED = 1
 VIS_RESOLUTION = 560        # 35 x 35 patches for ViT-S/16
 N_LAST_LAYERS = 4           # mean of normalized final block outputs
 VIEW_CROP_FRACTION = 0.80  # opposing overlapping crops, each resized to 560
@@ -340,7 +340,7 @@ def top_correspondences(
 
 def _heatmap_axis(axis, scores: np.ndarray, grid: int, title: str):
     heat = scores.reshape(grid, grid)
-    mappable = axis.imshow(heat, cmap="Greens", vmin=-1, vmax=1,
+    mappable = axis.imshow(heat, cmap="viridis", vmin=-1, vmax=1,
                            interpolation="nearest", extent=(0, VIS_RESOLUTION, VIS_RESOLUTION, 0))
     axis.set_title(title, fontsize=10)
     axis.axis("off")
@@ -532,7 +532,7 @@ def main() -> None:
         "imagenet_val": str(IMAGENET_VAL.resolve()), "images": N_IMAGES,
         "seed": SEED, "resolution": VIS_RESOLUTION, "patch_size": patch_size,
         "feature": f"mean of last {N_LAST_LAYERS} normalized transformer blocks for PCA, regions, and correspondences",
-        "cosine_similarity": "final-block output tokens; fixed [-1, 1] scale; standalone green heatmaps",
+        "cosine_similarity": "final-block output tokens; fixed [-1, 1] scale; standalone viridis heatmaps",
         "views": "top-left and bottom-right overlapping crops of the same square image, resized independently",
         "view_crop_fraction": VIEW_CROP_FRACTION,
         "pca": "joint whitened PCA across original and two views per model; Ours' components aligned to iBOT on original patch grid; shared sigmoid RGB mapping",

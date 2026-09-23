@@ -688,16 +688,25 @@ def _object_means(rows, metric):
 
 
 def hard_negative_statistics(rows, metric, negative):
-    from scipy.stats import binomtest
+    from scipy.stats import wilcoxon
 
+    if metric == "acos" and negative == "drop":
+        return math.nan, math.nan, 0
     key = f"pass_{negative}_{metric}"
     negative_key = f"{metric}_{'position_hard' if negative == 'position' else negative}"
-    valid = [
-        bool(row[key]) for row in rows
-        if row[f"{metric}_positive"] is not None and row[negative_key] is not None
-    ]
+    eligible = [row for row in rows if row[f"{metric}_positive"] is not None and row[negative_key] is not None]
+    valid = [bool(row[key]) for row in eligible]
     successes, count = sum(valid), len(valid)
-    pvalue = float(binomtest(successes, count, p=.5, alternative="greater").pvalue) if count else 1.0
+    # Position chooses the closest of three alternatives, so an exchangeable
+    # positive has a one-in-four chance of ranking first. Test object-level
+    # pass rates because tuples from the same physical object are dependent.
+    chance_rate = .25 if negative == "position" else .5
+    by_object = defaultdict(list)
+    for row in eligible:
+        by_object[row["object_id"]].append(bool(row[key]))
+    differences = [float(np.mean(values)) - chance_rate for values in by_object.values()]
+    pvalue = (float(wilcoxon(differences, alternative="greater").pvalue)
+              if any(differences) else (1.0 if differences else math.nan))
     return successes / count if count else math.nan, pvalue, count
 
 
@@ -751,7 +760,7 @@ def summarize(all_rows, bootstrap):
                 record[f"{negative}_pvalue_{metric}"] = pvalue
                 record[f"{negative}_valid_tuples_{metric}"] = count
                 pvalues.append(pvalue)
-            record[f"valid_{metric}"] = all(value < ALPHA for value in pvalues)
+            record[f"valid_{metric}"] = all(math.isfinite(value) and value < ALPHA for value in pvalues)
         summaries.append(record)
     return summaries
 
@@ -823,6 +832,9 @@ def main():
         "hard_negatives": {
             "drop": "D=C", "position": "lowest loss among other three target-scene positions",
             "pixel": "unclamped float D=B-A+C before ImageNet normalization",
+            "chance_pass_rates": {"drop_l2": .5, "position": .25, "pixel": .5},
+            "significance_test": "one-sided Wilcoxon signed-rank test of per-object pass rates against chance",
+            "angular_drop": "undefined because D=C gives a zero displacement vector",
         },
         "hard_negative_alpha": ALPHA, "angular_tuples_excluded": angular_excluded,
         "bootstrap_unit": "physical object_id", "bootstrap_samples": BOOTSTRAP_SAMPLES,
@@ -844,10 +856,15 @@ def main():
     for row in summary:
         for metric in ("l2", "acos"):
             rates = [row[f"{negative}_pass_rate_{metric}"] for negative in ("drop", "position", "pixel")]
-            validity = "PASS" if row[f"valid_{metric}"] else "FAIL"
-            print(f"{row['model']} {metric}: " + " / ".join(f"{value:.3f}" for value in rates) + f"  {validity}")
+            validity = "INCOMPLETE" if metric == "acos" else ("PASS" if row[f"valid_{metric}"] else "FAIL")
+            print(f"{row['model']} {metric}: " + " / ".join(
+                f"{value:.3f}" if math.isfinite(value) else "N/A" for value in rates
+            ) + f"  {validity}")
             if not row[f"valid_{metric}"]:
-                print("WARNING: COAT score should not be interpreted as evidence of compositionality because the representation failed the shortcut-detection test.")
+                if metric == "acos":
+                    print("WARNING: Angular drop control is undefined for D=C; angular shortcut validation is incomplete.")
+                else:
+                    print("WARNING: COAT score should not be interpreted as evidence of compositionality because the representation failed the shortcut-detection test.")
 
 
 if __name__ == "__main__":
