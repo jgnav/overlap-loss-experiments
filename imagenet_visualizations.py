@@ -87,6 +87,8 @@ class PreparedImage:
 class Tokens:
     cls: np.ndarray             # [D]
     patches: np.ndarray         # [patches, D]
+    output_cls: np.ndarray      # final-block CLS feature for cosine maps
+    output_patches: np.ndarray  # final-block patch features for cosine maps
 
 
 def validate_configuration() -> None:
@@ -147,7 +149,7 @@ def sample_images(patch_size: int) -> list[PreparedImage]:
 
 @torch.inference_mode()
 def extract_tokens(model: torch.nn.Module, image: Image.Image, patch_size: int) -> Tokens:
-    """Average the last normalized layers; the model API omits register tokens."""
+    """Keep final-block output features and the multi-layer average separately."""
     depth = model.get_num_layers()
     if type(N_LAST_LAYERS) is not int or not 1 <= N_LAST_LAYERS <= depth:
         raise ValueError(f"N_LAST_LAYERS must be in [1, {depth}]")
@@ -163,7 +165,11 @@ def extract_tokens(model: torch.nn.Module, image: Image.Image, patch_size: int) 
                 f"expected {expected + 1} tokens"
             )
     averaged = torch.stack([layer.float() for layer in layers]).mean(0)[0]
-    return Tokens(averaged[0].cpu().numpy(), averaged[1:].cpu().numpy())
+    output = layers[-1].float()[0]
+    return Tokens(
+        averaged[0].cpu().numpy(), averaged[1:].cpu().numpy(),
+        output[0].cpu().numpy(), output[1:].cpu().numpy(),
+    )
 
 
 def cosine_similarity_to_patches(query: np.ndarray, patches: np.ndarray) -> np.ndarray:
@@ -332,14 +338,13 @@ def top_correspondences(
     return sorted(matches, key=lambda item: -item["cosine"])[:top_k]
 
 
-def _heatmap_axis(axis, image: Image.Image, scores: np.ndarray, grid: int, title: str):
-    image_array = np.asarray(image)
+def _heatmap_axis(axis, scores: np.ndarray, grid: int, title: str):
     heat = scores.reshape(grid, grid)
-    axis.imshow(image_array)
-    axis.imshow(heat, cmap="magma", vmin=-1, vmax=1, alpha=.68,
-                interpolation="nearest", extent=(0, VIS_RESOLUTION, VIS_RESOLUTION, 0))
+    mappable = axis.imshow(heat, cmap="Greens", vmin=-1, vmax=1,
+                           interpolation="nearest", extent=(0, VIS_RESOLUTION, VIS_RESOLUTION, 0))
     axis.set_title(title, fontsize=10)
     axis.axis("off")
+    return mappable
 
 
 def render_similarity(
@@ -349,18 +354,19 @@ def render_similarity(
     fig, axes = plt.subplots(2, 2, figsize=(10, 10), constrained_layout=True)
     for row, model_name in enumerate(CHECKPOINTS):
         tokens = all_tokens[model_name]["original"]
-        query = tokens.cls if kind == "cls" else tokens.patches[prepared.patch_index]
-        similarities = cosine_similarity_to_patches(query, tokens.patches)
+        query = tokens.output_cls if kind == "cls" else tokens.output_patches[prepared.patch_index]
+        similarities = cosine_similarity_to_patches(query, tokens.output_patches)
         axes[row, 0].imshow(prepared.images["original"])
         if kind == "patch":
             y, x = divmod(prepared.patch_index, grid)
             axes[row, 0].scatter([(x + .5) * VIS_RESOLUTION / grid],
                                  [(y + .5) * VIS_RESOLUTION / grid],
-                                 marker="x", s=130, c="white", linewidths=3)
+                                 marker="x", s=130, c="red", linewidths=3)
         axes[row, 0].set_title(f"{model_name}: query", fontsize=10)
         axes[row, 0].axis("off")
-        _heatmap_axis(axes[row, 1], prepared.images["original"], similarities,
-                      grid, f"{model_name}: cosine similarity")
+        mappable = _heatmap_axis(axes[row, 1], similarities, grid,
+                                 f"{model_name}: cosine similarity")
+    fig.colorbar(mappable, ax=axes[:, 1], label="Cosine similarity", shrink=.82)
     fig.suptitle("CLS to patch similarity" if kind == "cls" else
                  f"Patch {prepared.patch_index} to all patches", fontsize=13)
     fig.savefig(path, dpi=DPI, facecolor="white", bbox_inches="tight")
@@ -525,7 +531,8 @@ def main() -> None:
         "checkpoints": checkpoint_metadata,
         "imagenet_val": str(IMAGENET_VAL.resolve()), "images": N_IMAGES,
         "seed": SEED, "resolution": VIS_RESOLUTION, "patch_size": patch_size,
-        "feature": f"mean of last {N_LAST_LAYERS} normalized transformer blocks",
+        "feature": f"mean of last {N_LAST_LAYERS} normalized transformer blocks for PCA, regions, and correspondences",
+        "cosine_similarity": "final-block output tokens; fixed [-1, 1] scale; standalone green heatmaps",
         "views": "top-left and bottom-right overlapping crops of the same square image, resized independently",
         "view_crop_fraction": VIEW_CROP_FRACTION,
         "pca": "joint whitened PCA across original and two views per model; Ours' components aligned to iBOT on original patch grid; shared sigmoid RGB mapping",

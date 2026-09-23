@@ -37,6 +37,21 @@ class ImageNetVisualizationTest(unittest.TestCase):
         np.testing.assert_allclose(tokens.cls, [13, 3])
         self.assertEqual(tokens.patches.shape, (4, 2))
         np.testing.assert_allclose(tokens.patches[0], [4, 3])
+        np.testing.assert_allclose(tokens.output_cls, [16, 6])
+        np.testing.assert_allclose(tokens.output_patches[0], [7, 6])
+
+    def test_similarity_heatmap_contains_only_green_scores(self):
+        axis = mock.Mock()
+        scores = np.array([-1., -.5, .5, 1.])
+        with mock.patch.object(viz, "VIS_RESOLUTION", 4):
+            mappable = viz._heatmap_axis(axis, scores, 2, "cosine")
+        self.assertIs(mappable, axis.imshow.return_value)
+        axis.imshow.assert_called_once()
+        np.testing.assert_array_equal(axis.imshow.call_args.args[0], scores.reshape(2, 2))
+        options = axis.imshow.call_args.kwargs
+        self.assertEqual(options["cmap"], "Greens")
+        self.assertEqual((options["vmin"], options["vmax"]), (-1, 1))
+        self.assertNotIn("alpha", options)
 
     def test_joint_pca_alignment_uses_original_to_color_all_views(self):
         rng = np.random.default_rng(4)
