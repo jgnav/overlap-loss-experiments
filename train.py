@@ -19,6 +19,7 @@ from tensorboardX import SummaryWriter
 
 from data import DataAugmentationiBOT, ImageFolderMask
 from losses import iBOTLoss
+from losses.region_loss import RegionLoss
 from model import create_model, iBOTHead
 from utils import training as utils
 from utils.checkpoint import (
@@ -87,6 +88,10 @@ def load_config(path):
         raise ValueError(
             "region_normalization must be centering, softmax, raw_logits, or sinkhorn"
         )
+    # Validate the aggregation choice and its normalization combination before
+    # loading checkpoints, datasets, or initializing distributed training.
+    RegionLoss(normalization=config["region_normalization"],
+               aggregation=config["region_aggregation"])
     if "additional_epochs" in user_config and "epochs" in user_config:
         raise ValueError(
             "Configure training length with additional_epochs, not both keys"
@@ -335,6 +340,7 @@ def train_ibot(args, wandb_run=None):
         region_patch_threshold=args.region_patch_threshold,
         region_temp=args.region_temp,
         region_normalization=args.region_normalization,
+        region_aggregation=args.region_aggregation,
         ibot_plus_plus=args.ibot_plus_plus,
         mim_start_epoch=args.pred_start_epoch,
     ).cuda()

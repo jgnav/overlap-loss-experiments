@@ -128,6 +128,11 @@ zero coverage contributes nothing. This applies to both student and teacher
 pooling in all normalization modes; Sinkhorn assignments still balance the
 included patches before their weighted region pooling. The `region_min_area`
 filter remains active. Numeric thresholds preserve the existing binary rule.
+`region_aggregation: mean` preserves the current mean pooling. For the nine
+available moment/distribution ablations and their fixed settings, see
+[region aggregation](docs/region_aggregation.md). Patch thresholding or area
+weighting is applied before aggregation.
+
 `region_normalization` selects the overlap representation:
 
 - `centering`: reuse the ordinary iBOT teacher patch targets after subtracting

@@ -32,6 +32,7 @@ class iBOTLoss(nn.Module):
         region_normalization="softmax",
         ibot_plus_plus=False,
         mim_start_epoch=0,
+        region_aggregation="mean",
     ):
         super().__init__()
         self.student_temp = student_temp
@@ -54,6 +55,7 @@ class iBOTLoss(nn.Module):
             region_temp,
             region_normalization,
             student_temperature=student_temp,
+            aggregation=region_aggregation,
         )
 
         self.teacher_temp_schedule = np.concatenate(

@@ -20,6 +20,7 @@ COMMON_IBOT_RECIPE = {
     "region_patch_threshold": 0.5,
     "region_temp": 0.1,
     "region_normalization": "softmax",
+    "region_aggregation": "mean",
     "ibot_plus_plus": False,
     "center_momentum": 0.9,
     "center_momentum2": 0.9,

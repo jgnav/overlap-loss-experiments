@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .sinkhorn import sinkhorn_log_probabilities
+from .region_aggregation import RegionAggregation
 
 
 def intersection_patch_fractions(crop_boxes, patch_count, min_area):
@@ -84,7 +85,8 @@ class RegionLoss(nn.Module):
     """Symmetric consistency with binary or overlap-area-weighted pooling."""
 
     def __init__(self, min_area=0.0, patch_threshold=0.5, temperature=0.1,
-                 normalization="softmax", student_temperature=0.1):
+                 normalization="softmax", student_temperature=0.1,
+                 aggregation="mean"):
         super().__init__()
         if not 0.0 <= min_area <= 1.0:
             raise ValueError("region_min_area must be between 0 and 1")
@@ -105,6 +107,7 @@ class RegionLoss(nn.Module):
         self.temperature = temperature
         self.student_temperature = student_temperature
         self.normalization = normalization
+        self.aggregation = RegionAggregation(aggregation)
 
     @staticmethod
     def _region_raw_vector(logits, weights):
@@ -240,6 +243,29 @@ class RegionLoss(nn.Module):
             else:
                 loss_ab = -(teacher_regions[0] * student_regions[1]).sum(dim=-1)
                 loss_ba = -(teacher_regions[1] * student_regions[0]).sum(dim=-1)
+            if self.aggregation.method != "mean":
+                # Coverage weights precede all statistics/distribution matching.
+                def patch_values(logits, view, teacher=False):
+                    if self.normalization == "sinkhorn":
+                        bank = teacher_patches if teacher else student_patches
+                        return bank[valid, view].exp()
+                    if teacher and self.normalization == "centering":
+                        return teacher_patch_targets[view].detach()[valid].float()
+                    x = logits.detach() if teacher else logits
+                    x = x[valid].float().masked_fill(~selected[valid, view, :, None], 0)
+                    if self.normalization == "raw_logits":
+                        return F.normalize(x, dim=-1)
+                    temp = self.student_temperature if self.normalization == "centering" else self.temperature
+                    return (x / temp).softmax(-1)
+
+                sp = [patch_values(x, v) for v, x in enumerate(student_patch_logits)]
+                with torch.no_grad():
+                    tp = [patch_values(x, v, True) for v, x in enumerate(teacher_patch_logits)]
+                # Matmul/projections and squared moments must stay float32
+                # even inside the training loop's mixed-precision context.
+                with torch.autocast(device_type=sp[0].device.type, enabled=False):
+                    loss_ab = self.aggregation(sp[1], tp[0], weights[valid, 1], weights[valid, 0], loss_ab)
+                    loss_ba = self.aggregation(sp[0], tp[1], weights[valid, 0], weights[valid, 1], loss_ba)
             local_loss_sum = (0.5 * (loss_ab + loss_ba)).sum()
         else:
             # Empty ranks must still participate in DDP backward with zero grads.

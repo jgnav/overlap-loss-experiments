@@ -42,6 +42,7 @@ RESUME_COMPATIBILITY_KEYS = (
     "region_patch_threshold",
     "region_temp",
     "region_normalization",
+    "region_aggregation",
     "ibot_plus_plus",
     "momentum_teacher",
     "epochs",
@@ -158,6 +159,8 @@ def _validate_resume_compatibility(checkpoint, args):
     mismatches = []
     for key in RESUME_COMPATIBILITY_KEYS:
         saved_value = _checkpoint_argument(checkpoint, key)
+        if key == "region_aggregation" and saved_value is None:
+            saved_value = "mean"
         if key == "region_normalization" and saved_value is None:
             # Region-composition checkpoints before this selector used softmax.
             saved_value = "softmax"
