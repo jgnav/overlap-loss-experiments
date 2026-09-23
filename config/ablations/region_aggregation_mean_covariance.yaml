@@ -25,7 +25,7 @@ region_normalization: centering
 # mean, mean_scalar_variance, mean_variance, mean_covariance,
 # mean_projected_variance, mean_projected_covariance, swd,
 # mean_centered_swd, mean_normalized_swd. Selection/area weights apply first.
-region_aggregation: mean
+region_aggregation: mean_covariance
 region_temp: 0.07
 momentum_teacher: 0.9995
 teacher_temp: 0.07
