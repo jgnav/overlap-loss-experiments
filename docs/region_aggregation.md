@@ -9,6 +9,7 @@ sum to one within each view/region for all statistics and empirical CDFs.
 | Value | Symmetric cross-view region loss |
 | --- | --- |
 | `mean` | Cross-entropy of arithmetic probability means |
+| `hellinger` | Cross-entropy of normalized squared means of square-root probabilities (fixed r=0.5) |
 | `mean_scalar_variance` | Mean loss + squared difference of total standard deviations |
 | `mean_variance` | Mean loss + average squared difference of per-dimension standard deviations |
 | `mean_covariance` | Mean loss + squared Frobenius covariance difference |
@@ -17,6 +18,17 @@ sum to one within each view/region for all statistics and empirical CDFs.
 | `swd` | Sliced Wasserstein squared distance alone |
 | `mean_centered_swd` | Mean loss + SWD of centered patch distributions |
 | `mean_normalized_swd` | Mean loss + projected scale matching + standardized residual SWD |
+
+`hellinger` computes `q = normalize((sum_i w_i sqrt(p_i))^2)` independently
+for teacher and student, followed by the existing symmetric cross-view
+cross-entropy. Weights are selected before pooling as above. It adds no
+auxiliary losses or tunable exponent. Student pooling uses log space for
+stable gradients. Centered teacher probabilities reuse the ordinary iBOT
+targets. This option supports `centering`, `softmax`, and `sinkhorn`;
+`raw_logits` is rejected because signed vectors have no real square-root
+probability embedding. Its ready-to-run configuration is
+`config/ablations/region_aggregation_hellinger.yaml`, identical to the base
+training YAML except for `region_aggregation`.
 
 All moments use population normalization (no Bessel correction). Variance
 variants match `sqrt(variance + 1e-8)`. Fixed settings live in

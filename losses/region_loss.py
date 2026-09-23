@@ -108,6 +108,8 @@ class RegionLoss(nn.Module):
         self.student_temperature = student_temperature
         self.normalization = normalization
         self.aggregation = RegionAggregation(aggregation)
+        if aggregation == "hellinger" and normalization == "raw_logits":
+            raise ValueError("hellinger aggregation requires probability distributions, not raw_logits")
 
     @staticmethod
     def _region_raw_vector(logits, weights):
@@ -124,8 +126,14 @@ class RegionLoss(nn.Module):
         dense = logits.new_full(logits.shape, -torch.inf, dtype=torch.float32)
         return dense.masked_scatter(selected[..., None], assignments), assignments
 
-    @staticmethod
-    def _pool_log_probabilities(log_probabilities, weights):
+    def _pool_log_probabilities(self, log_probabilities, weights):
+        if self.aggregation.method == "hellinger":
+            # r=1/2: square the weighted mean of square roots, then
+            # normalize across prototypes. Stay in log space for gradients.
+            pooled = 2 * torch.logsumexp(
+                .5 * log_probabilities + weights.float().log()[..., None], dim=1
+            )
+            return F.log_softmax(pooled, dim=-1)
         # log(sum(w * p) / sum(w)); zero coverage contributes exactly zero.
         log_weights = weights.float().log()
         return torch.logsumexp(log_probabilities + log_weights[..., None], dim=1) - weights.sum(
@@ -143,12 +151,14 @@ class RegionLoss(nn.Module):
         log_probabilities = log_probabilities.masked_fill(~selected[..., None], -torch.inf)
         return self._pool_log_probabilities(log_probabilities, weights)
 
-    @staticmethod
-    def _region_probability_mean(probabilities, weights):
+    def _region_probability_mean(self, probabilities, weights):
         selected = weights > 0
         probabilities = probabilities.float().masked_fill(
             ~selected[..., None], 0
         )
+        if self.aggregation.method == "hellinger":
+            pooled = (probabilities.sqrt() * weights[..., None]).sum(dim=1).square()
+            return pooled / pooled.sum(dim=-1, keepdim=True)
         return (probabilities * weights[..., None]).sum(dim=1) / weights.sum(dim=1, keepdim=True)
 
     def forward(
@@ -243,7 +253,7 @@ class RegionLoss(nn.Module):
             else:
                 loss_ab = -(teacher_regions[0] * student_regions[1]).sum(dim=-1)
                 loss_ba = -(teacher_regions[1] * student_regions[0]).sum(dim=-1)
-            if self.aggregation.method != "mean":
+            if self.aggregation.method not in ("mean", "hellinger"):
                 # Coverage weights precede all statistics/distribution matching.
                 def patch_values(logits, view, teacher=False):
                     if self.normalization == "sinkhorn":

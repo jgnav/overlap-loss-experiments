@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 
 METHODS = (
-    "mean", "mean_scalar_variance", "mean_variance",
+    "mean", "hellinger", "mean_scalar_variance", "mean_variance",
     "mean_covariance", "mean_projected_variance", "mean_projected_covariance",
     "swd", "mean_centered_swd", "mean_normalized_swd",
 )

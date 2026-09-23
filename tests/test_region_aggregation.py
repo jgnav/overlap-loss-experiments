@@ -13,6 +13,33 @@ from utils.checkpoint import _validate_resume_compatibility
 
 
 class RegionAggregationTest(unittest.TestCase):
+    def test_hellinger_formula_weights_and_gradients(self):
+        loss = RegionLoss(aggregation='hellinger', temperature=1.)
+        z = torch.tensor([[[2., -1., 0.], [-1., 3., 1.], [999., -999., 0.]]], requires_grad=True)
+        w = torch.tensor([[1., .25, 0.]])
+        actual = loss._region_log_distribution(z, w)
+        p = z.softmax(-1)
+        expected = (p[:, :2].sqrt() * w[:, :2, None]).sum(1).square()
+        expected = expected / expected.sum(-1, keepdim=True)
+        torch.testing.assert_close(actual.exp(), expected)
+        torch.testing.assert_close(loss._region_probability_mean(p.detach(), w), expected.detach())
+        ga = torch.autograd.grad(actual.sum(), z, retain_graph=True)[0]
+        ge = torch.autograd.grad(expected.log().sum(), z)[0]
+        torch.testing.assert_close(ga, ge)
+        self.assertEqual(ga[:, 2].count_nonzero(), 0)
+        torch.testing.assert_close(actual, loss._region_log_distribution(z[:, [1, 0, 2]], w[:, [1, 0, 2]]))
+        extreme = torch.tensor([[[1000., -1000.], [900., -900.]]], requires_grad=True)
+        log_q = loss._region_log_distribution(extreme, torch.ones(1, 2))
+        log_q.sum().backward()
+        self.assertTrue(torch.isfinite(log_q).all())
+        self.assertTrue(torch.isfinite(extreme.grad).all())
+
+    def test_hellinger_ablation_only_changes_method(self):
+        root = Path(__file__).parents[1] / 'config'
+        expected = (root / 'train.yaml').read_bytes().replace(
+            b'region_aggregation: mean', b'region_aggregation: hellinger')
+        self.assertEqual((root / 'ablations/region_aggregation_hellinger.yaml').read_bytes(), expected)
+
     def test_yaml_selector_and_resume_guard(self):
         from train import load_config
         path = Path(__file__).parents[1] / 'config/train.yaml'
@@ -112,6 +139,10 @@ class RegionAggregationTest(unittest.TestCase):
         torch.manual_seed(9)
         for method in METHODS:
             for mode in ('softmax', 'centering', 'sinkhorn', 'raw_logits'):
+                if method == 'hellinger' and mode == 'raw_logits':
+                    with self.assertRaisesRegex(ValueError, 'probability distributions'):
+                        RegionLoss(normalization=mode, aggregation=method)
+                    continue
                 for threshold in (.75, 'weighted'):
                     s = tuple(torch.randn(2, 4, 5, requires_grad=True) for _ in range(2))
                     t = tuple(torch.randn(2, 4, 5, requires_grad=True) for _ in range(2))
