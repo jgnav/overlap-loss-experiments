@@ -24,11 +24,11 @@ from patch_concept_visualization import (
 
 
 CHECKPOINTS = {
-    "Control +200": Path("checkpoints/ibot_vit_small.pth"),
+    "iBOT baseline": Path("checkpoints/ibot_vit_small.pth"),
     "Region +200": Path("checkpoints/checkpoint_source1000_continuation0200.pth"),
 }
-ORIDA_ROOT = Path("/mnt/fast/nobackup/scratch4weeks/jg02228/datasets/orida")
-OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "coat_orida"
+ORIDA_ROOT = Path("/mnt/fast/nobackup/scratch4weeks/jg02228/datasets/orida/ORIDa_v1.0")
+OUTPUT_DIR = Path("/mnt/fast/nobackup/scratch4weeks/jg02228/coat_orida")
 DEVICE = "cuda"
 INPUT_SIZE = 224
 BATCH_SIZE = 12
@@ -244,11 +244,110 @@ def _adapt_rows(records, root, metadata_path):
     ]
 
 
+def _parse_orida_bbox(path, image_path):
+    """Read ORIDa's normalized x1,y1,x2,y2 bbox into absolute xywh."""
+    values = [float(value) for value in path.read_text().replace(",", " ").split()]
+    if len(values) != 4:
+        raise ValueError(f"Expected four x1,y1,x2,y2 values in {path}; got {values}")
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError(f"Non-finite ORIDa bbox values in {path}: {values}")
+    x1, y1, x2, y2 = values
+    with Image.open(image_path) as image:
+        width, height = image.size
+    if all(0.0 <= value <= 1.0 for value in values):
+        x1, x2 = x1 * width, x2 * width
+        y1, y2 = y1 * height, y2 * height
+    elif not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+        raise ValueError(f"ORIDa bbox is outside image bounds in {path}: {values}")
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError(f"Invalid ORIDa x1,y1,x2,y2 box in {path}: {values}")
+    return (x1, y1, x2 - x1, y2 - y1)
+
+
+def _load_directory_fcf_sets(root):
+    """Read the official ORIDa_v1.0 split/object/scene directory structure."""
+    sets = []
+    found_split = False
+    for split_name in ("train", "validation"):
+        split_root = root / split_name
+        if not split_root.is_dir():
+            continue
+        found_split = True
+        for object_root in sorted(path for path in split_root.iterdir() if path.is_dir()):
+            fcf_root = object_root / "factual_counterfactual"
+            if not fcf_root.is_dir():
+                continue
+            for scene_root in sorted(path for path in fcf_root.iterdir() if path.is_dir()):
+                images_root = scene_root / "images"
+                if not images_root.is_dir():
+                    continue
+                images = {}
+                for image_path in images_root.iterdir():
+                    if not image_path.is_file() or image_path.suffix.casefold() not in {".jpg", ".jpeg"}:
+                        continue
+                    try:
+                        position = int(image_path.stem.rsplit("_", 1)[1])
+                    except (IndexError, ValueError):
+                        continue
+                    if position in range(5):
+                        if position in images:
+                            raise ValueError(f"Duplicate ORIDa position {position}: {scene_root}")
+                        images[position] = image_path
+                if set(images) != set(range(5)):
+                    raise ValueError(
+                        f"Expected ORIDa images at positions 0..4 in {scene_root}; "
+                        f"found {sorted(images)}"
+                    )
+                factuals = []
+                for position in range(1, 5):
+                    image_path = images[position]
+                    bbox_path = (
+                        scene_root / "annotations" / "bbox"
+                        / f"{image_path.stem}_bbox.txt"
+                    )
+                    if not bbox_path.is_file():
+                        raise FileNotFoundError(f"Missing ORIDa bbox annotation: {bbox_path}")
+                    mask_path = (
+                        scene_root / "annotations" / "masks"
+                        / f"{image_path.stem}_mask.jpg"
+                    )
+                    factuals.append(FactualImage(
+                        str(image_path.resolve()),
+                        _parse_orida_bbox(bbox_path, image_path),
+                        str(position),
+                        str(mask_path.resolve()) if mask_path.is_file() else None,
+                    ))
+                sets.append(FCFSet(
+                    str(object_root.name),
+                    f"{split_name}:{scene_root.name}",
+                    str(images[0].resolve()),
+                    tuple(factuals),
+                ))
+    if not found_split:
+        return []
+    identities = [(item.object_id, item.scene_id) for item in sets]
+    if len(identities) != len(set(identities)):
+        raise ValueError("ORIDa folder tree contains duplicate object/scene F-CF sets")
+    return sorted(sets, key=lambda item: (item.object_id, item.scene_id))
+
+
 def load_orida_fcf_sets(root=ORIDA_ROOT):
-    """Adapt official ORIDa metadata to the canonical FCFSet structure."""
+    """Load official ORIDa folders, with JSON/CSV support for alternate exports."""
     root = Path(root).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Configure ORIDA_ROOT; directory not found: {root}")
+    split_roots = [root / "train", root / "validation"]
+    present_splits = [path.is_dir() for path in split_roots]
+    if any(present_splits):
+        if not all(present_splits):
+            raise FileNotFoundError(
+                "ORIDa extraction is incomplete; expected both train/ and validation/"
+            )
+        directory_sets = _load_directory_fcf_sets(root)
+        if not directory_sets:
+            raise ValueError("No factual-counterfactual ORIDa scenes were indexed")
+        print(f"Indexed {len(directory_sets)} ORIDa factual-counterfactual scenes", flush=True)
+        return directory_sets
     candidates = _load_metadata_candidates(root)
     valid = []
     errors = []
@@ -376,8 +475,8 @@ def sha256(path):
 
 
 def validate_checkpoints(checkpoints=CHECKPOINTS):
-    if list(checkpoints) != ["Control +200", "Region +200"]:
-        raise ValueError("Configure exactly Control +200 and Region +200 checkpoints")
+    if list(checkpoints) != ["iBOT baseline", "Region +200"]:
+        raise ValueError("Configure exactly the iBOT baseline and Region +200 checkpoints")
     records = {}
     for label, configured_path in checkpoints.items():
         path = Path(configured_path).expanduser().resolve()
@@ -393,11 +492,9 @@ def validate_checkpoints(checkpoints=CHECKPOINTS):
             "region_normalization": _checkpoint_argument(checkpoint, "region_normalization", None),
             "region_temp": _checkpoint_argument(checkpoint, "region_temp", None),
         }
-    if records["Control +200"]["sha256"] == records["Region +200"]["sha256"]:
-        raise ValueError("Control and region-trained checkpoints are byte-identical")
-    control_lambda, region_lambda = records["Control +200"]["lambda3"], records["Region +200"]["lambda3"]
-    if control_lambda is not None and float(control_lambda) != 0:
-        raise ValueError(f"Control checkpoint lambda3 must be 0; got {control_lambda}")
+    if records["iBOT baseline"]["sha256"] == records["Region +200"]["sha256"]:
+        raise ValueError("iBOT baseline and region-trained checkpoints are byte-identical")
+    region_lambda = records["Region +200"]["lambda3"]
     if region_lambda is not None and float(region_lambda) <= 0:
         raise ValueError(f"Region checkpoint lambda3 must be positive; got {region_lambda}")
     for key in ("arch", "patch_size", "prototype_dim"):
@@ -408,8 +505,8 @@ def validate_checkpoints(checkpoints=CHECKPOINTS):
     if architecture is not None and "small" not in str(architecture).casefold():
         raise ValueError(f"Expected ViT-S/16 checkpoint architecture; got {architecture!r}")
     normalization = records["Region +200"]["region_normalization"]
-    if normalization not in (None, "softmax"):
-        raise ValueError(f"Primary COAT representation requires region_normalization='softmax'; got {normalization!r}")
+    if normalization not in (None, "centering", "softmax", "raw_logits", "sinkhorn"):
+        raise ValueError(f"Unknown training region normalization: {normalization!r}")
     temperature = records["Region +200"]["region_temp"]
     temperature = .1 if temperature is None else float(temperature)
     if not math.isfinite(temperature) or temperature <= 0:
@@ -423,6 +520,9 @@ def load_teacher(path):
     head, prototypes = _build_teacher_head(
         backbone, checkpoint, _teacher_head_state(_teacher_state(checkpoint))
     )
+    backbone = backbone.to(DEVICE).eval().requires_grad_(False)
+    head = head.to(DEVICE).eval().requires_grad_(False)
+    return backbone, head, metadata, prototypes
 
 
 def validate_loaded_checkpoint_shapes(records):
@@ -444,10 +544,6 @@ def validate_loaded_checkpoint_shapes(records):
     patch_size, _ = next(iter(shapes))
     if patch_size != 16:
         raise ValueError(f"Expected ViT-S/16 patch size 16; got {patch_size}")
-    return (
-        backbone.to(DEVICE).eval().requires_grad_(False),
-        head.to(DEVICE).eval().requires_grad_(False), metadata, prototypes,
-    )
 
 
 def load_rgb_tensor(path):
@@ -705,7 +801,7 @@ def main():
     summary = summarize(all_rows, bootstrap)
     _write_csv(OUTPUT_DIR / "summary.csv", summary)
     comparison = [{
-        "metric": metric, "region_minus_control": values["difference"][0],
+        "metric": metric, "region_minus_ibot_baseline": values["difference"][0],
         "ci_low": values["difference"][1], "ci_high": values["difference"][2],
         "objects": values["objects"],
     } for metric, values in bootstrap.items()]
@@ -717,6 +813,7 @@ def main():
         "input_resolution": INPUT_SIZE,
         "preprocessing": "full RGB scene; bicubic 224x224; ImageNet normalization; no augmentation",
         "representation": "mean of per-patch softmax(raw uncentered teacher patch-head logits / T)",
+        "region_training_normalization": checkpoint_records["Region +200"]["region_normalization"],
         "orida_root": str(Path(ORIDA_ROOT).expanduser().resolve()),
         "indexed_fcf_sets": len(fcf_sets), "objects": len({item.object_id for item in tuples}),
         "selected_scene_pairs": len({(item.object_id, item.scene_1_id, item.scene_2_id) for item in tuples}),
@@ -738,7 +835,7 @@ def main():
     print(f"{'':24} {'COAT-L2':>12} {'COAT-acos':>12}")
     for row in summary:
         print(f"{row['model']:24} {row['coat_l2_macro']:12.4f} {row['coat_acos_macro']:12.4f}")
-    print(f"{'Region - Control':24} {bootstrap['coat_l2']['difference'][0]:12.4f} {bootstrap['coat_acos']['difference'][0]:12.4f}")
+    print(f"{'Region - iBOT baseline':24} {bootstrap['coat_l2']['difference'][0]:12.4f} {bootstrap['coat_acos']['difference'][0]:12.4f}")
     print("\n95% CI of difference:")
     for metric in ("coat_l2", "coat_acos"):
         value = bootstrap[metric]["difference"]

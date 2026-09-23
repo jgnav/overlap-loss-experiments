@@ -25,7 +25,7 @@ configs=(
     region_min_area_0p10 region_min_area_0p20 region_min_area_0p30 region_min_area_0p50
     lambda3_0p20 lambda3_0p50 lambda3_1p0 lambda3_2p0
     region_patch_threshold_0p2 region_patch_threshold_0p5 region_patch_threshold_0p8
-    region_patch_threshold_weighted lambda3_0p10 region_min_area_1p0
+    region_patch_threshold_weighted lambda3_0p10 region_patch_threshold_1p0
 )
 
 if (( SLURM_ARRAY_TASK_ID < 0 || SLURM_ARRAY_TASK_ID >= ${#configs[@]} )); then

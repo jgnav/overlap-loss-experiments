@@ -24,16 +24,24 @@ case "$task" in
         config_path="config/ablations/region_min_area_0p10.yaml"
         ;;
     1)
-        original_run_id="65866_1"
+        original_run_id="67958_1"
         config_path="config/ablations/region_min_area_0p20.yaml"
         ;;
     2)
         original_run_id="65866_2"
         config_path="config/ablations/region_min_area_0p30.yaml"
         ;;
+    3)
+        original_run_id="65948_3"
+        config_path="config/ablations/region_min_area_0p50.yaml"
+        ;;
     5)
         original_run_id="65866_5"
         config_path="config/ablations/lambda3_0p50.yaml"
+        ;;
+    9)
+        original_run_id="65866_9"
+        config_path="config/ablations/region_patch_threshold_0p5.yaml"
         ;;
     10)
         original_run_id="65866_10"
@@ -44,11 +52,11 @@ case "$task" in
         config_path="config/ablations/lambda3_0p10.yaml"
         ;;
     13)
-        original_run_id="66555_13"
-        config_path="config/ablations/region_min_area_1p0.yaml"
+        original_run_id="68508_13"
+        config_path="config/ablations/region_patch_threshold_1p0.yaml"
         ;;
     *)
-        echo "Unknown task ID: $task (expected 0, 1, 2, 5, 10, 12, or 13)" >&2
+        echo "Unknown task ID: $task (expected 1, 2, 3, 5, 9, 10, 12, or 13)" >&2
         exit 2
         ;;
 esac

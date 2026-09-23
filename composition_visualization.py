@@ -31,7 +31,7 @@ from patch_concept_visualization import (
 
 # ---- Standalone experiment configuration ---------------------------------
 CHECKPOINTS = {
-    "Matched control (+200 epochs)": Path("checkpoints/checkpoint_control0200.pth"),
+    "Matched control (+200 epochs)": Path("checkpoints/ibot_vit_small.pth"),
     "Region-trained (+200 epochs)": Path("checkpoints/checkpoint_source1000_continuation0200.pth"),
 }
 DATASETS_ROOT = Path("/mnt/fast/nobackup/scratch4weeks/jg02228/datasets")
