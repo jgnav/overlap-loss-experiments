@@ -28,7 +28,8 @@ CHECKPOINTS = {
     "Region +200": Path("checkpoints/checkpoint_source1000_continuation0200.pth"),
 }
 ORIDA_ROOT = Path("/mnt/fast/nobackup/scratch4weeks/jg02228/datasets/orida/ORIDa_v1.0")
-OUTPUT_DIR = Path("/mnt/fast/nobackup/scratch4weeks/jg02228/coat_orida")
+OUTPUT_DIR = Path("/mnt/fast/nobackup/scratch4weeks/jg02228/coat_orida_validation")
+EVALUATION_SPLIT = "validation"
 DEVICE = "cuda"
 INPUT_SIZE = 224
 BATCH_SIZE = 12
@@ -268,7 +269,7 @@ def _load_directory_fcf_sets(root):
     """Read the official ORIDa_v1.0 split/object/scene directory structure."""
     sets = []
     found_split = False
-    for split_name in ("train", "validation"):
+    for split_name in (EVALUATION_SPLIT,):
         split_root = root / split_name
         if not split_root.is_dir():
             continue
@@ -332,52 +333,17 @@ def _load_directory_fcf_sets(root):
 
 
 def load_orida_fcf_sets(root=ORIDA_ROOT):
-    """Load official ORIDa folders, with JSON/CSV support for alternate exports."""
+    """Load factual-counterfactual scenes from the ORIDa validation split."""
     root = Path(root).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Configure ORIDA_ROOT; directory not found: {root}")
-    split_roots = [root / "train", root / "validation"]
-    present_splits = [path.is_dir() for path in split_roots]
-    if any(present_splits):
-        if not all(present_splits):
-            raise FileNotFoundError(
-                "ORIDa extraction is incomplete; expected both train/ and validation/"
-            )
-        directory_sets = _load_directory_fcf_sets(root)
-        if not directory_sets:
-            raise ValueError("No factual-counterfactual ORIDa scenes were indexed")
-        print(f"Indexed {len(directory_sets)} ORIDa factual-counterfactual scenes", flush=True)
-        return directory_sets
-    candidates = _load_metadata_candidates(root)
-    valid = []
-    errors = []
-    for path, payload in candidates:
-        records = _nested_records(payload)
-        for adapter in (_adapt_nested, _adapt_rows):
-            try:
-                sets = adapter(records, root, path)
-            except (ValueError, FileNotFoundError) as exc:
-                errors.append(f"{path}: {exc}")
-                continue
-            if sets:
-                valid.append((path, sets))
-    if not valid:
-        _metadata_diagnostic(root, candidates)
-        if errors:
-            print("Adapter errors:", *errors[:20], sep="\n  ")
-        raise ValueError("No usable ORIDa F-CF metadata source was found")
-    valid.sort(key=lambda item: (-len(item[1]), str(item[0])))
-    if len(valid) > 1 and len(valid[0][1]) == len(valid[1][1]):
-        first_ids = {(item.object_id, item.scene_id) for item in valid[0][1]}
-        second_ids = {(item.object_id, item.scene_id) for item in valid[1][1]}
-        if first_ids != second_ids:
-            _metadata_diagnostic(root, candidates)
-            raise ValueError("Multiple incompatible ORIDa F-CF metadata sources were found")
-    _, sets = valid[0]
-    identities = [(item.object_id, item.scene_id) for item in sets]
-    if len(identities) != len(set(identities)):
-        raise ValueError("ORIDa metadata contains duplicate object_id/scene_id F-CF sets")
-    return sorted(sets, key=lambda item: (item.object_id, item.scene_id))
+    if not (root / EVALUATION_SPLIT).is_dir():
+        raise FileNotFoundError(f"ORIDa {EVALUATION_SPLIT} split not found under {root}")
+    directory_sets = _load_directory_fcf_sets(root)
+    if not directory_sets:
+        raise ValueError(f"No factual-counterfactual ORIDa {EVALUATION_SPLIT} scenes were indexed")
+    print(f"Indexed {len(directory_sets)} ORIDa {EVALUATION_SPLIT} factual-counterfactual scenes", flush=True)
+    return directory_sets
 
 
 def _geometry(factual):
@@ -824,6 +790,7 @@ def main():
         "representation": "mean of per-patch softmax(raw uncentered teacher patch-head logits / T)",
         "region_training_normalization": checkpoint_records["Region +200"]["region_normalization"],
         "orida_root": str(Path(ORIDA_ROOT).expanduser().resolve()),
+        "evaluation_split": EVALUATION_SPLIT,
         "indexed_fcf_sets": len(fcf_sets), "objects": len({item.object_id for item in tuples}),
         "selected_scene_pairs": len({(item.object_id, item.scene_1_id, item.scene_2_id) for item in tuples}),
         "final_tuples": len(tuples), "center_threshold": CENTER_THRESHOLD,
