@@ -17,7 +17,7 @@ shared_head: true
 # Loss and teacher
 lambda1: 1.0
 lambda2: 1.0
-lambda3: 0.2
+lambda3: 1.0
 ibot_plus_plus: false
 koleo_regularizer: false
 region_min_area: 0.1

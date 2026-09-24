@@ -97,6 +97,27 @@ class ContinuationConfigTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ibot_plus_plus must be a boolean"):
                 load_config(path)
 
+    def test_koleo_flag_and_batch_requirements(self):
+        path = Path(__file__).parents[1] / "config" / "train.yaml"
+        values = yaml.safe_load(path.read_text())
+        for flag in (False, True):
+            with mock.patch.object(
+                Path, "open", mock.mock_open(
+                    read_data=yaml.safe_dump({**values, "koleo_regularizer": flag})
+                )
+            ):
+                self.assertEqual(load_config(path).koleo_regularizer, flag)
+        for change in (
+            {"koleo_regularizer": "true"},
+            {"koleo_regularizer": True, "batch_size_per_gpu": 1},
+            {"koleo_regularizer": True, "global_crops_number": 1},
+        ):
+            with mock.patch.object(
+                Path, "open", mock.mock_open(read_data=yaml.safe_dump({**values, **change}))
+            ):
+                with self.assertRaisesRegex(ValueError, "KoLeo|koleo_regularizer"):
+                    load_config(path)
+
     def test_continuation_cosine_schedule_starts_at_configured_lr(self):
         schedule = utils.cosine_scheduler(
             1e-4,

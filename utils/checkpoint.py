@@ -44,6 +44,7 @@ RESUME_COMPATIBILITY_KEYS = (
     "region_normalization",
     "region_aggregation",
     "ibot_plus_plus",
+    "koleo_regularizer",
     "momentum_teacher",
     "epochs",
     "batch_size_per_gpu",
@@ -159,6 +160,8 @@ def _validate_resume_compatibility(checkpoint, args):
     mismatches = []
     for key in RESUME_COMPATIBILITY_KEYS:
         saved_value = _checkpoint_argument(checkpoint, key)
+        if key == "koleo_regularizer" and saved_value is None:
+            saved_value = False
         if key == "region_aggregation" and saved_value is None:
             saved_value = "mean"
         if key == "region_normalization" and saved_value is None:

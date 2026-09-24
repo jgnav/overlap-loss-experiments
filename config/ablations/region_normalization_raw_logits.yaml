@@ -22,7 +22,7 @@ ibot_plus_plus: false
 koleo_regularizer: false
 region_min_area: 0.1
 region_patch_threshold: 1.0
-region_normalization: centering
+region_normalization: raw_logits
 # mean, mean_scalar_variance, mean_variance, mean_covariance,
 # mean_projected_variance, mean_projected_covariance, swd,
 # mean_centered_swd, mean_normalized_swd. Selection/area weights apply first.

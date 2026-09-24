@@ -115,6 +115,16 @@ The masked and visible terms are normalized separately and summed, preserving
 the original masked-patch signal. The result also reports `patch_masked`,
 `patch_visible`, and `patch_all` metrics.
 
+`koleo_regularizer: false` leaves the original objective unchanged. With
+`true`, the [DINOv2 KoLeo regularizer](https://github.com/facebookresearch/dinov2/blob/main/dinov2/loss/koleo_loss.py)
+L2-normalizes each student's pre-head CLS feature, finds its nearest other
+feature in the local batch, and minimizes the negative log distance. The two
+global crops are processed separately so two views of the same image cannot
+be nearest neighbors. The training objective adds 0.1 times the **sum** of
+their KoLeo losses, matching [DINOv2's training integration](https://github.com/facebookresearch/dinov2/blob/main/dinov2/train/ssl_meta_arch.py).
+The option requires two global crops and at least two images per GPU; KoLeo
+runs in float32 even under FP16/BF16 autocast.
+
 The additional region-composition branch uses **raw, uncentered patch-head
 logits** from the same two global views (including the existing masked student
 forward). Crop geometry and horizontal flips map their shared region to each
@@ -161,7 +171,7 @@ self-attention but are excluded from the CLS/patch heads and every spatial
 loss. `register: 0` preserves the original iBOT token sequence.
 
 `lambda3` weights this additional loss;
-`lambda3: 0.0` disables the branch for the unchanged iBOT baseline.
+`lambda3: 0.0` disables the branch; with KoLeo and iBOT++ off, this is the unchanged iBOT baseline.
 `region_min_area` keeps the existing minimum intersection-area filter.
 Pairs with no selected patches in either view are skipped. Use a new
 continuation run for this changed objective: `resume_checkpoint: null`, with

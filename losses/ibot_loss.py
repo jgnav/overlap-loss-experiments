@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .region_loss import RegionLoss
+from .koleo_loss import KoLeoLoss
 
 
 class iBOTLoss(nn.Module):
@@ -31,6 +32,7 @@ class iBOTLoss(nn.Module):
         region_temp=0.1,
         region_normalization="softmax",
         ibot_plus_plus=False,
+        koleo_regularizer=False,
         mim_start_epoch=0,
         region_aggregation="mean",
     ):
@@ -49,6 +51,10 @@ class iBOTLoss(nn.Module):
         if type(ibot_plus_plus) is not bool:
             raise ValueError("ibot_plus_plus must be a boolean")
         self.ibot_plus_plus = ibot_plus_plus
+        if type(koleo_regularizer) is not bool:
+            raise ValueError("koleo_regularizer must be a boolean")
+        self.koleo_regularizer = koleo_regularizer
+        self.koleo_loss = KoLeoLoss() if koleo_regularizer else None
         self.region_loss = RegionLoss(
             region_min_area,
             region_patch_threshold,
@@ -204,6 +210,7 @@ class iBOTLoss(nn.Module):
         crop_boxes,
         *,
         teacher_patch_logits=None,
+        student_cls_features=None,
     ):
         """Compute baseline centered DINO/iBOT plus region composition."""
         student_cls, student_patch = student_output
@@ -309,6 +316,25 @@ class iBOTLoss(nn.Module):
             region_active = zero.new_ones(())
             objective = total_loss1 + total_loss2 + total_loss3
 
+        if self.koleo_regularizer:
+            if (
+                student_cls_features is None
+                or student_cls_features.ndim != 2
+                or student_cls_features.shape[0] != student_output[0].shape[0]
+                or student_cls_features.shape[0] % self.ngcrops != 0
+            ):
+                raise ValueError("KoLeo requires pre-head student CLS features for every global crop")
+            koleo_raw = sum(
+                self.koleo_loss(crop_features)
+                for crop_features in student_cls_features.chunk(self.ngcrops)
+            )
+            # DINOv2 weights the sum of the two separate crop losses by 0.1.
+            koleo = 0.1 * koleo_raw
+            objective = objective + koleo
+        else:
+            koleo_raw = zero
+            koleo = zero
+
         student_diagnostics = self._distribution_diagnostics(
             student_patch_c,
             are_probabilities=False,
@@ -324,6 +350,9 @@ class iBOTLoss(nn.Module):
             "patch_visible": visible_patch_loss.detach().float(),
             "patch_all": raw_patch_loss.detach().float(),
             "ibot_plus_plus": total_loss2.new_tensor(float(self.ibot_plus_plus)),
+            "koleo": koleo,
+            "koleo_raw": koleo_raw,
+            "koleo_active": total_loss2.new_tensor(float(self.koleo_regularizer)),
             "patch_masked_inside_overlap": patch_inside_overlap,
             "patch_masked_outside_overlap": patch_outside_overlap,
             "student_patch_entropy": student_diagnostics["entropy"],

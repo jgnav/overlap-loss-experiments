@@ -20,7 +20,7 @@ lambda2: 1.0
 lambda3: 0.2
 ibot_plus_plus: false
 koleo_regularizer: false
-region_min_area: 0.1
+region_min_area: 0.3
 region_patch_threshold: 1.0
 region_normalization: centering
 # mean, mean_scalar_variance, mean_variance, mean_covariance,

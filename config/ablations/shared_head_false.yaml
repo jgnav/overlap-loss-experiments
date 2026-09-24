@@ -12,7 +12,7 @@ reset_optimizer: true
 # Model
 arch: vit_small
 register: 0
-shared_head: true
+shared_head: false
 
 # Loss and teacher
 lambda1: 1.0

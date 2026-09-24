@@ -74,6 +74,8 @@ def load_config(path):
         raise ValueError("shared_head must be a boolean")
     if type(config["ibot_plus_plus"]) is not bool:
         raise ValueError("ibot_plus_plus must be a boolean")
+    if type(config["koleo_regularizer"]) is not bool:
+        raise ValueError("koleo_regularizer must be a boolean")
     if type(config["register"]) is not int or config["register"] < 0:
         raise ValueError("register must be an integer >= 0")
     threshold = config["region_patch_threshold"]
@@ -147,6 +149,10 @@ def load_config(path):
             if value <= 0:
                 raise ValueError(f"{environment_key} must be positive")
             config[config_key] = value
+    if config["koleo_regularizer"] and (
+        config["global_crops_number"] != 2 or config["batch_size_per_gpu"] < 2
+    ):
+        raise ValueError("KoLeo requires two global crops and batch_size_per_gpu >= 2")
     config["precision"] = requested_precision
     config["use_fp16"] = requested_precision == "fp16"
     for key in ("data_path", "initial_checkpoint", "output_dir"):
@@ -351,6 +357,7 @@ def train_ibot(args, wandb_run=None):
         region_normalization=args.region_normalization,
         region_aggregation=args.region_aggregation,
         ibot_plus_plus=args.ibot_plus_plus,
+        koleo_regularizer=args.koleo_regularizer,
         mim_start_epoch=args.pred_start_epoch,
     ).cuda()
 
@@ -760,10 +767,19 @@ def train_one_epoch(
                 else:
                     teacher_output = teacher(images[: args.global_crops_number])
                 teacher_targets = get_teacher_targets(teacher_output, ibot_loss, epoch)
-            student_output = student(
-                images[: args.global_crops_number],
-                mask=masks[: args.global_crops_number],
-            )
+            if ibot_loss.koleo_regularizer:
+                student_backbone_features, student_output = student(
+                    images[: args.global_crops_number],
+                    mask=masks[: args.global_crops_number],
+                    return_backbone_feat=True,
+                )
+                student_cls_features = student_backbone_features[:, 0]
+            else:
+                student_output = student(
+                    images[: args.global_crops_number],
+                    mask=masks[: args.global_crops_number],
+                )
+                student_cls_features = None
 
             student.module.backbone.masked_im_modeling = False
             student_local_cls = (
@@ -780,6 +796,7 @@ def train_one_epoch(
                 masks,
                 crop_boxes,
                 teacher_patch_logits=teacher_output[1],
+                student_cls_features=student_cls_features,
             )
             loss = all_loss.pop("loss")
 
