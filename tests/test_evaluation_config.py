@@ -41,6 +41,13 @@ class EvaluationConfigTest(unittest.TestCase):
     def save(self):
         self.path.write_text(yaml.safe_dump(self.values))
 
+    def test_default_config_points_to_existing_yaml(self):
+        self.assertEqual(
+            entrypoint.parse_args([]).config,
+            ROOT / "config" / "evaluation.yaml",
+        )
+        self.assertTrue(entrypoint.parse_args([]).config.is_file())
+
     def test_resolves_paths_from_config_and_disables_omitted_tasks(self):
         config = load_config(self.path)
         self.assertEqual(config.checkpoint, self.root / 'model.pth')
@@ -125,6 +132,16 @@ class EvaluationConfigTest(unittest.TestCase):
                 self.assertEqual(entrypoint.main([str(self.path)]), 0)
             launch.assert_not_called()
             self.assertEqual(set(json.loads(summary_path.read_text())['evaluations']), {'imagenet_knn_1pct'})
+
+    def test_wandb_start_failure_records_failed_summary(self):
+        with mock.patch.object(entrypoint, "init_wandb_run", side_effect=RuntimeError("W&B unavailable")):
+            with mock.patch.object(entrypoint.subprocess, "run") as launch:
+                with self.assertRaisesRegex(RuntimeError, "W&B unavailable"):
+                    entrypoint.main([str(self.path)])
+                launch.assert_not_called()
+        summary = json.loads((self.root / "results/full_evaluation.json").read_text())
+        self.assertEqual(summary["status"], "failed")
+        self.assertIn("W&B unavailable", summary["error"])
 
     def test_failure_stops_following_tasks_and_records_failure(self):
         with mock.patch.object(entrypoint.subprocess, 'run', return_value=SimpleNamespace(returncode=7)) as launch:

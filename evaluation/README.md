@@ -302,16 +302,16 @@ resuming an unfinished linear probe, keep the same GPU count: its saved
 protocol includes GPU/batch settings. Completed compatible scores remain reusable.
 
 The main entrypoint is [`evaluation.py`](../evaluation.py); edit
-[`evaluation.yaml`](../evaluation.yaml) to choose the checkpoint, checkpoint
+[`config/evaluation.yaml`](../config/evaluation.yaml) to choose the checkpoint, checkpoint
 key, architecture, dataset/manifest paths, output paths, seed, worker count,
 segmentation extraction batch size, and individual evaluations. Numerical
 probe recipes remain the fixed protocols described above.
 
 ```bash
-python evaluation.py                    # Uses evaluation.yaml beside the script
+python evaluation.py                    # Uses config/evaluation.yaml
 python evaluation.py /path/to/run.yaml  # Uses another configuration
-sbatch slurm/slurm_evaluation.sh        # Same evaluation.yaml on Slurm
-sbatch slurm/slurm_evaluation.sh /path/to/run.yaml
+sbatch slurm/evaluation.sh              # Same config/evaluation.yaml on Slurm
+sbatch slurm/evaluation.sh /path/to/run.yaml
 ```
 
 The Slurm script contains scheduler resources and environment setup; it passes
@@ -325,8 +325,8 @@ by the evaluator, so the Slurm launcher follows the training launcher's layout.
 ### Weights & Biases
 
 Set `wandb_mode`, `wandb_project`, `wandb_entity`, `wandb_run_name`,
-`wandb_run_id`, and `wandb_resume` in `evaluation.yaml`. The corresponding
-training settings live in `train.yaml` (or `train_iptc.yaml`). Slurm contains no
+`wandb_run_id`, and `wandb_resume` in `config/evaluation.yaml`. The corresponding
+training settings live in `config/train.yaml`. Slurm contains no
 W&B settings. `wandb_mode` accepts `online`, `offline`, or `disabled`.
 
 Both training and evaluation read online authentication from `.wandb_key` at

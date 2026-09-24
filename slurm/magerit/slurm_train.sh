@@ -13,7 +13,7 @@ set -euo pipefail
 
 cd "${SLURM_SUBMIT_DIR}"
 
-CONFIG_PATH="${1:-train.yaml}"
+CONFIG_PATH="${1:-config/train.yaml}"
 if [[ ! -f "${CONFIG_PATH}" ]]; then
     echo "Training configuration not found: ${CONFIG_PATH}" >&2
     exit 2

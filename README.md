@@ -92,7 +92,7 @@ wget -c -O checkpoints/ibot_vit_large.pth \
   https://lf3-nlp-opensource.bytetos.com/obj/nlp-opensource/archive/2022/ibot/vitl_16/checkpoint.pth
 ```
 
-In `train.yaml`, set `data_path` to `<prepared-data-path>/imagenet/train` and
+In `config/train.yaml`, set `data_path` to `<prepared-data-path>/imagenet/train` and
 `initial_checkpoint: checkpoints/ibot_vit_small.pth`.
 
 `shared_head: true` uses one projection MLP and prototype layer for CLS and
@@ -162,14 +162,12 @@ loss. `register: 0` preserves the original iBOT token sequence.
 
 `lambda3` weights this additional loss;
 `lambda3: 0.0` disables the branch for the unchanged iBOT baseline.
-For the twelve 50-epoch, one-factor continuation runs, see
-[`docs/ablations.md`](docs/ablations.md).
 `region_min_area` keeps the existing minimum intersection-area filter.
 Pairs with no selected patches in either view are skipped. Use a new
 continuation run for this changed objective: `resume_checkpoint: null`, with
 `initial_checkpoint` pointing to the desired full teacher/student checkpoint.
 
-In `evaluation.yaml`, set `datasets_root` to the prepared-data path, select your `checkpoint`,
+In `config/evaluation.yaml`, set `datasets_root` to the prepared-data path, select your `checkpoint`,
 and keep `output_dir: null` for separate results per launch.
 
 For a paper-style A+B composition test from a COCO image ID and datasets root,

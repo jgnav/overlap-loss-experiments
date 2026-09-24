@@ -1,19 +1,14 @@
-from pathlib import Path
 import unittest
 from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
-import yaml
 
 from losses.region_loss import RegionLoss
 from tests.test_region_loss import boxes_full, boxes_disjoint
 from tests.test_region_normalization import reference_sk
-from train import load_config
 from utils.checkpoint import _validate_resume_compatibility
 
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 class WeightedRegionTest(unittest.TestCase):
@@ -88,35 +83,6 @@ class WeightedRegionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'region_patch_threshold'):
             _validate_resume_compatibility(saved, SimpleNamespace(region_patch_threshold='weighted', lambda3=0))
 
-
-class AblationConfigTest(unittest.TestCase):
-    def test_twelve_configs_change_only_their_factor_and_common_run_settings(self):
-        base = yaml.safe_load((ROOT / 'config/train.yaml').read_text())
-        base.update(additional_epochs=50, online_probes_enabled=True, output_dir='output/ablation')
-        groups = {'region_min_area': ['0.10', '0.20', '0.30', '0.50'],
-                  'lambda3': ['0.20', '0.50', '1.0', '2.0'],
-                  'region_patch_threshold': ['0.2', '0.5', '0.8', 'weighted']}
-        paths = list((ROOT / 'config/ablations').glob('*.yaml'))
-        self.assertEqual(len(paths), 12)
-        for key, values in groups.items():
-            for value in values:
-                path = ROOT / 'config/ablations' / (key + '_' + value.replace('.', 'p') + '.yaml')
-                expected = dict(base, **{key: yaml.safe_load(value)})
-                self.assertEqual(yaml.safe_load(path.read_text()), expected)
-                args = load_config(path)
-                self.assertEqual(args.epochs, 50)
-                self.assertTrue(args.online_probes_enabled)
-                self.assertEqual(args.gpu_count, 4)
-
-    def test_launcher_is_a_twelve_task_array_with_identical_resources(self):
-        script = (ROOT / 'slurm/ablation.sh').read_text()
-        for setting in ('--array=0-11', '--gpus-per-node=4', '--cpus-per-task=24',
-                        '--mem=128G', '--time=50:00:00',
-                        '--partition=3090_risk,a100,rtx_pro6000_risk',
-                        '--output=logs/abaltion/%A_%a.out'):
-            self.assertIn('#SBATCH ' + setting, script)
-        for path in (ROOT / 'config/ablations').glob('*.yaml'):
-            self.assertIn(path.stem, script)
 
 
 if __name__ == '__main__':

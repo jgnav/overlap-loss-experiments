@@ -13,7 +13,7 @@ set -euo pipefail
 
 cd "${SLURM_SUBMIT_DIR}"
 
-CONFIG_PATH="${1:-evaluation.yaml}"
+CONFIG_PATH="${1:-config/evaluation.yaml}"
 if [[ ! -f "${CONFIG_PATH}" ]]; then
     echo "Evaluation configuration not found: ${CONFIG_PATH}" >&2
     exit 2

@@ -2,11 +2,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 import torch.nn as nn
 
 from losses import iBOTLoss
+from utils.training import save_on_master
 from utils.checkpoint import (
     continuation_provenance,
     load_continuation_state,
@@ -337,6 +339,30 @@ class ResumeCheckpointTest(unittest.TestCase):
             torch.save(checkpoint, path)
             with self.assertRaisesRegex(ValueError, "predates the region-composition"):
                 read_resume_checkpoint(args)
+
+
+class AtomicCheckpointTest(unittest.TestCase):
+    def test_failed_save_keeps_previous_resume_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.pth"
+            original = {"epoch": 1, "tensor": torch.arange(3)}
+            torch.save(original, path)
+
+            def interrupted_save(_state, handle):
+                handle.write(b"partial checkpoint")
+                raise OSError("interrupted")
+
+            with mock.patch("utils.training.torch.save", side_effect=interrupted_save):
+                with self.assertRaisesRegex(OSError, "interrupted"):
+                    save_on_master({"epoch": 2}, path)
+
+            restored = torch.load(path, map_location="cpu", weights_only=False)
+            self.assertEqual(restored["epoch"], 1)
+            torch.testing.assert_close(restored["tensor"], original["tensor"])
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+            save_on_master({"epoch": 2}, path)
+            self.assertEqual(torch.load(path, map_location="cpu", weights_only=False)["epoch"], 2)
 
 
 if __name__ == "__main__":

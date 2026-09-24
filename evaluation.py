@@ -20,8 +20,8 @@ from evaluation.utils.orchestrator import (
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("config", nargs="?", type=Path, default=REPO_ROOT / "evaluation.yaml",
-                        help="YAML configuration (default: evaluation.yaml beside this script)")
+    parser.add_argument("config", nargs="?", type=Path, default=REPO_ROOT / "config" / "evaluation.yaml",
+                        help="YAML configuration (default: config/evaluation.yaml)")
     return parser.parse_args(argv)
 
 
@@ -55,9 +55,10 @@ def run_evaluations(args):
     _write_summary(args.result_json, args, started_at, "running", results)
     print(f"Config: {args.config_path}\nCheckpoint: {args.checkpoint}\nDatasets: {args.datasets_root}", flush=True)
     print(f"Output: {args.output_dir}\nSelected: {', '.join(args.evaluations)}", flush=True)
-    wandb_run = init_wandb_run(args, snapshot, "evaluation")
+    wandb_run = None
     exit_code = 1
     try:
+        wandb_run = init_wandb_run(args, snapshot, "evaluation")
         for index, (name, module, _) in enumerate(evaluations, start=1):
             result_path = args.output_dir / f"{name}.json"
             result = _load_completed_result(result_path, args, name)
@@ -84,6 +85,9 @@ def run_evaluations(args):
         print(f"Evaluation completed. Result table: {args.result_json}", flush=True)
         exit_code = 0
         return 0
+    except BaseException as error:
+        _write_summary(args.result_json, args, started_at, "failed", results, error=str(error))
+        raise
     finally:
         if wandb_run is not None:
             wandb_run.summary["state/status"] = "completed" if exit_code == 0 else "failed"

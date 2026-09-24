@@ -91,8 +91,16 @@ def load_config(path):
         )
     # Validate the aggregation choice and its normalization combination before
     # loading checkpoints, datasets, or initializing distributed training.
-    RegionLoss(normalization=config["region_normalization"],
-               aggregation=config["region_aggregation"])
+    RegionLoss(
+        min_area=config["region_min_area"],
+        patch_threshold=threshold,
+        temperature=config["region_temp"],
+        normalization=config["region_normalization"],
+        student_temperature=config["student_temp"],
+        aggregation=config["region_aggregation"],
+    )
+    if config["lambda3"] != 0 and config["global_crops_number"] != 2:
+        raise ValueError("Active region loss requires exactly two global crops")
     if "additional_epochs" in user_config and "epochs" in user_config:
         raise ValueError(
             "Configure training length with additional_epochs, not both keys"
@@ -801,6 +809,7 @@ def train_one_epoch(
         accuracy = (pred1 == pred2).sum() / pred1.size(0)
 
         optimizer.zero_grad()
+        optimizer_updated = True
         if fp16_scaler is None:
             loss.backward()
             if args.clip_grad:
@@ -821,15 +830,19 @@ def train_one_epoch(
                 student,
                 args.freeze_last_layer,
             )
+            scale_before = fp16_scaler.get_scale()
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
+            # GradScaler decreases its scale only when it skipped the step.
+            optimizer_updated = fp16_scaler.get_scale() >= scale_before
 
-        with torch.no_grad():
-            momentum = momentum_schedule[schedule_iteration]
-            for param_q, param_k in zip(params_q, params_k):
-                param_k.data.mul_(momentum).add_(
-                    (1 - momentum) * param_q.detach().data
-                )
+        if optimizer_updated:
+            with torch.no_grad():
+                momentum = momentum_schedule[schedule_iteration]
+                for param_q, param_k in zip(params_q, params_k):
+                    param_k.data.mul_(momentum).add_(
+                        (1 - momentum) * param_q.detach().data
+                    )
 
         torch.cuda.synchronize()
         metric_logger.update(loss=loss.item())

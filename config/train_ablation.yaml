@@ -17,7 +17,7 @@ shared_head: true
 # Loss and teacher
 lambda1: 1.0
 lambda2: 1.0
-lambda3: 0.1
+lambda3: 0.2
 ibot_plus_plus: false
 region_min_area: 0.1
 region_patch_threshold: 1.0
@@ -25,7 +25,7 @@ region_normalization: centering
 # mean, mean_scalar_variance, mean_variance, mean_covariance,
 # mean_projected_variance, mean_projected_covariance, swd,
 # mean_centered_swd, mean_normalized_swd. Selection/area weights apply first.
-region_aggregation: hellinger
+region_aggregation: mean
 region_temp: 0.07
 momentum_teacher: 0.9995
 teacher_temp: 0.07

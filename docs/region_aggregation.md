@@ -26,9 +26,7 @@ auxiliary losses or tunable exponent. Student pooling uses log space for
 stable gradients. Centered teacher probabilities reuse the ordinary iBOT
 targets. This option supports `centering`, `softmax`, and `sinkhorn`;
 `raw_logits` is rejected because signed vectors have no real square-root
-probability embedding. Its ready-to-run configuration is
-`config/ablations/region_aggregation_hellinger.yaml`, identical to the base
-training YAML except for `region_aggregation`.
+probability embedding. To try it, set `region_aggregation: hellinger` in a training YAML.
 
 All moments use population normalization (no Bessel correction). Variance
 variants match `sqrt(variance + 1e-8)`. Fixed settings live in

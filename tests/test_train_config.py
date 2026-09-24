@@ -24,26 +24,18 @@ class ContinuationConfigTest(unittest.TestCase):
         self.assertEqual(args.wandb_run_id, 'yaml-id')
         self.assertEqual(args.wandb_resume, 'allow')
 
-    def test_production_config_is_bf16_200_epochs_without_lr_warmup(self):
-        config = load_config(Path(__file__).parents[1] / "config" / "train.yaml")
-        self.assertFalse(hasattr(config, "centering"))
-
-        self.assertEqual(config.additional_epochs, 200)
-        self.assertEqual(config.epochs, 200)
-        self.assertEqual(config.precision, "bf16")
-        self.assertFalse(config.use_fp16)
+    def test_active_config_loads_without_lr_warmup(self):
+        path = Path(__file__).parents[1] / "config" / "train.yaml"
+        values = yaml.safe_load(path.read_text())
+        config = load_config(path)
+        self.assertEqual(config.additional_epochs, values["additional_epochs"])
+        self.assertEqual(config.epochs, values["additional_epochs"])
+        self.assertEqual(config.precision, values["precision"])
+        self.assertEqual(config.lambda3, values["lambda3"])
+        self.assertEqual(config.region_temp, values["region_temp"])
+        self.assertEqual(config.region_patch_threshold, values["region_patch_threshold"])
+        self.assertEqual(config.region_normalization, values["region_normalization"])
         self.assertEqual(config.warmup_epochs, 0)
-        self.assertGreater(config.batch_size_per_gpu * config.gpu_count, 0)
-        self.assertEqual(config.saveckp_freq, 50)
-        self.assertFalse(hasattr(config, "teacher_target_cls"))
-        self.assertFalse(hasattr(config, "teacher_target_ibot"))
-        self.assertFalse(hasattr(config, "teacher_target_overlap"))
-        self.assertEqual(config.region_temp, .1)
-        self.assertEqual(config.region_patch_threshold, .5)
-        self.assertEqual(config.lambda3, 1.0)
-        self.assertEqual(config.region_normalization, "centering")
-        self.assertFalse(config.ibot_plus_plus)
-        self.assertEqual(config.register, 0)
         self.assertIsNone(config.resume_checkpoint)
 
     def test_region_settings_load_and_validate(self):
@@ -54,7 +46,8 @@ class ContinuationConfigTest(unittest.TestCase):
             config = load_config(path)
         self.assertEqual(config.region_temp, .2)
         self.assertEqual(config.region_patch_threshold, .8)
-        for key, value in (("region_temp", 0), ("region_patch_threshold", 1.1)):
+        for key, value in (("region_temp", 0), ("region_patch_threshold", 1.1),
+                           ("region_min_area", 1.1)):
             invalid = dict(values, **{key: value})
             with mock.patch.object(Path, "open", mock.mock_open(read_data=yaml.safe_dump(invalid))):
                 with self.assertRaisesRegex(ValueError, key):

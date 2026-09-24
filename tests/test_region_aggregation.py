@@ -34,12 +34,6 @@ class RegionAggregationTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(log_q).all())
         self.assertTrue(torch.isfinite(extreme.grad).all())
 
-    def test_hellinger_ablation_only_changes_method(self):
-        root = Path(__file__).parents[1] / 'config'
-        expected = (root / 'train.yaml').read_bytes().replace(
-            b'region_aggregation: mean', b'region_aggregation: hellinger')
-        self.assertEqual((root / 'ablations/region_aggregation_hellinger.yaml').read_bytes(), expected)
-
     def test_yaml_selector_and_resume_guard(self):
         from train import load_config
         path = Path(__file__).parents[1] / 'config/train.yaml'

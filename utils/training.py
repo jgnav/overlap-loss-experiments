@@ -4,9 +4,11 @@ import math
 import os
 import random
 import sys
+import tempfile
 import time
 import warnings
 from collections import defaultdict, deque
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -274,9 +276,28 @@ def is_main_process():
     return get_rank() == 0
 
 
-def save_on_master(*args, **kwargs):
-    if is_main_process():
-        torch.save(*args, **kwargs)
+def save_on_master(state, path):
+    """Atomically replace a checkpoint after the complete write succeeds."""
+    if not is_main_process():
+        return
+    destination = Path(path)
+    with tempfile.NamedTemporaryFile(
+        mode="wb", dir=destination.parent, prefix=f".{destination.name}.",
+        suffix=".tmp", delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        try:
+            torch.save(state, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def setup_for_distributed(is_master):
