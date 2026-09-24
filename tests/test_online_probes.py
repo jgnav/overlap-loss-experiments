@@ -151,6 +151,39 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(record['online_probe_success'], 0)
         self.assertIn('-9', json.loads(path.read_text())['error'])
 
+    def test_restarted_training_reports_successful_probe_retry_once(self):
+        root = self.root / 'online_probes'
+        root.mkdir()
+        (root / 'metrics.jsonl').write_text(json.dumps({
+            'online_probe_epoch': 10, 'online_probe_success': 0,
+        }) + '\n')
+        write_json(root / 'epoch0010.json', {
+            'epoch': 10, 'status': 'completed', 'evaluations': {
+                name: {'status': 'completed', 'metrics': {'score': 42}}
+                for name in ONLINE_EVALUATIONS
+            },
+        })
+        restarted = OnlineProbeRunner(self.args)
+        record, = restarted.collect_completed()
+        self.assertEqual(record['online_probe_success'], 1)
+        self.assertEqual(record['online_imagenet_knn_score'], 42)
+        self.assertEqual(restarted.collect_completed(), [])
+
+    def test_failed_saved_probe_retries_its_original_snapshot(self):
+        root = self.root / 'online_probes'
+        snapshot = root / 'checkpoints' / 'teacher_epoch0010.pth'
+        snapshot.parent.mkdir(parents=True)
+        snapshot.write_bytes(b'original epoch 10')
+        result = root / 'epoch0010.json'
+        write_json(result, {'epoch': 10, 'status': 'failed', 'error': 'CUDA OOM'})
+        restarted = OnlineProbeRunner(self.args)
+        with mock.patch('evaluation.online_probes.subprocess.Popen') as launch:
+            restarted.retry_failed()
+        self.assertEqual(launch.call_count, 1)
+        command = launch.call_args.args[0]
+        self.assertEqual(command[command.index('--checkpoint') + 1], str(snapshot))
+        self.assertEqual(json.loads(result.read_text())['status'], 'queued')
+
 
 class ConfigurationTest(unittest.TestCase):
     def test_interval(self):

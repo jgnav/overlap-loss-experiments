@@ -163,6 +163,29 @@ class OnlineProbeRunner:
         self.completed_results = set()
         self.process_results = {}
         self.submitted_epochs = set()
+        root = Path(args.output_dir) / "online_probes"
+        reported = {}
+        metrics_path = root / "metrics.jsonl"
+        if metrics_path.is_file():
+            for line in metrics_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    record = json.loads(line)
+                    reported[record["online_probe_epoch"]] = record["online_probe_success"]
+                except (ValueError, KeyError, TypeError):
+                    continue
+        for path in sorted(root.glob("epoch[0-9][0-9][0-9][0-9].json")):
+            try:
+                result = json.loads(path.read_text(encoding="utf-8"))
+                epoch = int(result["epoch"])
+                status = result["status"]
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            if status not in {"completed", "failed"}:
+                continue
+            self.submitted_results.append((epoch, path))
+            self.submitted_epochs.add(epoch)
+            if reported.get(epoch) == int(status == "completed"):
+                self.completed_results.add(path)
 
     def _reap(self):
         active = []
@@ -255,6 +278,26 @@ class OnlineProbeRunner:
             records.append(record)
             self.completed_results.add(path)
         return records
+
+    def retry_failed(self):
+        """Retry failed saved snapshots after a training restart."""
+        root = Path(self.args.output_dir) / "online_probes"
+        for epoch, path in self.submitted_results:
+            try:
+                status = json.loads(path.read_text(encoding="utf-8")).get("status")
+            except (OSError, ValueError):
+                continue
+            snapshot = root / "checkpoints" / f"teacher_epoch{epoch:04d}.pth"
+            if status == "failed" and snapshot.is_file():
+                previous_log = root / "logs" / f"epoch{epoch:04d}.log"
+                if previous_log.is_file():
+                    shutil.copy2(previous_log, previous_log.with_suffix(".failed.log"))
+                write_json(path, {"status": "queued", "epoch": epoch,
+                                  "checkpoint": str(snapshot),
+                                  "selected_evaluations": list(ONLINE_EVALUATIONS)})
+                self.completed_results.discard(path)
+                self.pending.append((epoch, snapshot, path))
+        self._launch_pending()
 
     def close(self, wait=True):
         """Drain scheduled evaluations at normal exit, unless explicitly disabled.

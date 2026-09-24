@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import torch
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
 import torch.nn as nn
 import yaml
 from tensorboardX import SummaryWriter
@@ -34,7 +35,7 @@ from utils.checkpoint import (
 from utils.recipe import get_ibot_recipe
 from utils.collapse_diagnostics import FeatureCollapseDiagnostics, prototype_geometry_metrics
 from utils.wandb_logging import configure_wandb, init_wandb_run
-from evaluation.online_probes import OnlineProbeRunner, validate_probe_data
+from evaluation.online_probes import OnlineProbeRunner, probe_due, validate_probe_data
 
 
 def parse_args():
@@ -483,11 +484,29 @@ def train_ibot(args, wandb_run=None):
     )
 
     output_checkpoint = Path(args.output_dir) / "checkpoint.pth"
+    sync_probes = os.environ.get("IBOT_SYNC_PROBES") == "1"
     probe_runner = (
         OnlineProbeRunner(args)
         if args.online_probes_enabled and utils.is_main_process()
         else None
     )
+    probe_group = (
+        dist.new_group(backend="gloo", timeout=datetime.timedelta(hours=12))
+        if sync_probes and args.online_probes_enabled and dist.is_initialized()
+        else None
+    )
+    if sync_probes and args.online_probes_enabled:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        if probe_group is not None:
+            dist.barrier(group=probe_group)
+        if probe_runner is not None:
+            probe_runner.retry_failed()
+            probe_runner.close(wait=True)
+        if probe_group is not None:
+            dist.barrier(group=probe_group)
+    if probe_runner is not None:
+        log_online_probe_records(probe_runner, args.output_dir, writer, wandb_run)
     start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
         data_epoch = source_equivalent_epoch(args.source_checkpoint_epoch, epoch)
@@ -510,7 +529,7 @@ def train_ibot(args, wandb_run=None):
             fp16_scaler,
             args,
         )
-        if probe_runner is not None:
+        if probe_runner is not None and not sync_probes:
             log_online_probe_records(probe_runner, args.output_dir, writer, wandb_run)
         train_stats.update(prototype_geometry_metrics(
             student, teacher_without_ddp, args.diagnostic_prototype_chunk_size
@@ -538,7 +557,7 @@ def train_ibot(args, wandb_run=None):
         utils.save_on_master(
             save_dict, os.path.join(args.output_dir, "checkpoint.pth")
         )
-        if probe_runner is not None:
+        if probe_runner is not None and not sync_probes:
             # The runner copies the completed checkpoint before spawning a worker;
             # no probe ever reads the path that the next epoch may overwrite.
             probe_runner.submit(completed_continuation_epoch, output_checkpoint)
@@ -584,6 +603,34 @@ def train_ibot(args, wandb_run=None):
                         },
                     },
                 )
+
+        if sync_probes and args.online_probes_enabled and probe_due(
+            completed_continuation_epoch, args.online_probe_frequency
+        ):
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            if probe_group is not None:
+                dist.barrier(group=probe_group)
+            if probe_runner is not None:
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                print(
+                    f"Online probes at epoch {completed_continuation_epoch}: "
+                    f"{free_bytes / 2**30:.2f}/{total_bytes / 2**30:.2f} GiB free "
+                    "after releasing CUDA cache",
+                    flush=True,
+                )
+                was_training = student.training, teacher.training
+                student.eval()
+                teacher.eval()
+                try:
+                    probe_runner.submit(completed_continuation_epoch, output_checkpoint)
+                    probe_runner.close(wait=True)
+                    log_online_probe_records(probe_runner, args.output_dir, writer, wandb_run)
+                finally:
+                    student.train(was_training[0])
+                    teacher.train(was_training[1])
+            if probe_group is not None:
+                dist.barrier(group=probe_group)
 
     if probe_runner is not None:
         probe_runner.close(wait=args.online_probe_wait_at_exit)
