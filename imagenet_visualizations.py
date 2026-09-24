@@ -46,7 +46,7 @@ SEED = 1
 VIS_RESOLUTION = 560        # 35 x 35 patches for ViT-S/16
 N_LAST_LAYERS = 4           # mean of normalized final block outputs
 VIEW_CROP_FRACTION = 0.80  # opposing overlapping crops, each resized to 560
-PCA_SIGMOID_GAIN = 1.5      # same whitened-PCA color mapping as pca_visualization.py
+PCA_COLOR_PERCENTILE = 99.0 # one robust RGB scale for both models and all views
 REGION_CLUSTERS = 6
 KNN_NEIGHBORS = 12
 SPATIAL_EDGE_WEIGHT = 0.20
@@ -185,13 +185,18 @@ def cosine_similarity_to_patches(query: np.ndarray, patches: np.ndarray) -> np.n
 
 
 def pca_triplet(tokens: dict[str, Tokens]) -> dict[str, np.ndarray]:
-    """Fit one whitened PCA across original plus both independently encoded views."""
+    """Fit one unwhitened PCA over L2-normalized patches from all three views."""
     lengths = [len(tokens[name].patches) for name in VIEW_NAMES]
-    features = np.concatenate([tokens[name].patches for name in VIEW_NAMES])
+    features = np.concatenate([tokens[name].patches for name in VIEW_NAMES]).astype(np.float64)
     if features.shape[0] < 4 or features.shape[1] < 3:
         raise ValueError("At least three feature dimensions and four patches are needed for PCA")
-    projected = PCA(n_components=3, whiten=True, svd_solver="full").fit_transform(features)
-    # Reference sign convention used by pca_visualization.py.
+    norms = np.linalg.norm(features, axis=1, keepdims=True)
+    if not np.all(np.isfinite(norms)) or np.any(norms == 0):
+        raise ValueError("PCA requires finite, nonzero patch features")
+    normalized = features / norms
+    centered = normalized - normalized.mean(axis=0, keepdims=True)
+    projected = PCA(n_components=3, whiten=False, svd_solver="full").fit_transform(centered)
+    # Give each component a deterministic orientation before cross-model alignment.
     for component in range(3):
         column = projected[:, component]
         second_moment = np.mean(column ** 2)
@@ -218,10 +223,22 @@ def align_pca_triplet(reference: dict[str, np.ndarray], target: dict[str, np.nda
     return aligned, record
 
 
-def pca_to_rgb(scores: np.ndarray, grid: int) -> Image.Image:
+def pca_color_scale(scores_by_model: dict[str, dict[str, np.ndarray]]) -> float:
+    """One scalar for all components, views, and models of the same image."""
+    absolute_scores = np.concatenate([
+        np.abs(scores_by_model[model][view]).ravel()
+        for model in CHECKPOINTS for view in VIEW_NAMES
+    ])
+    scale = float(np.percentile(absolute_scores, PCA_COLOR_PERCENTILE))
+    return scale if scale > 0 else 1.0
+
+
+def pca_to_rgb(scores: np.ndarray, grid: int, scale: float) -> Image.Image:
     if scores.shape != (grid * grid, 3):
         raise ValueError("PCA scores do not match the patch grid")
-    rgb = 1.0 / (1.0 + np.exp(-PCA_SIGMOID_GAIN * scores))
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("PCA color scale must be finite and positive")
+    rgb = np.clip(0.5 + scores / (2.0 * scale), 0.0, 1.0)
     pixels = np.clip(rgb.reshape(grid, grid, 3) * 255, 0, 255).astype(np.uint8)
     return Image.fromarray(pixels, "RGB").resize(
         (VIS_RESOLUTION, VIS_RESOLUTION), Image.Resampling.NEAREST
@@ -496,9 +513,10 @@ def main() -> None:
         tokens = {name: all_features[name][number] for name in CHECKPOINTS}
         pca_scores = {name: pca_triplet(tokens[name]) for name in CHECKPOINTS}
         pca_scores["Ours"], alignment = align_pca_triplet(pca_scores["iBOT"], pca_scores["Ours"])
-        alignment_records.append({"image_number": number, **alignment})
+        pca_scale = pca_color_scale(pca_scores)
+        alignment_records.append({"image_number": number, "pca_color_scale": pca_scale, **alignment})
         pca_maps = {
-            model: {view: pca_to_rgb(pca_scores[model][view], grid) for view in VIEW_NAMES}
+            model: {view: pca_to_rgb(pca_scores[model][view], grid, pca_scale) for view in VIEW_NAMES}
             for model in CHECKPOINTS
         }
         regions = {
@@ -535,7 +553,7 @@ def main() -> None:
         "cosine_similarity": "final-block output tokens; fixed [-1, 1] scale; standalone viridis heatmaps",
         "views": "top-left and bottom-right overlapping crops of the same square image, resized independently",
         "view_crop_fraction": VIEW_CROP_FRACTION,
-        "pca": "joint whitened PCA across original and two views per model; Ours' components aligned to iBOT on original patch grid; shared sigmoid RGB mapping",
+        "pca": "L2-normalized patch features, centered across three pooled views per model; ordinary unwhitened PCA scores; Ours aligned to iBOT on original patch grid; one image-level 99th-percentile absolute-score RGB scale across both models, all views, and all channels",
         "region_inference": "spectral clustering of joint feature cosine k-NN graph with spatial neighbor edges",
         "region_clusters": REGION_CLUSTERS, "knn_neighbors": KNN_NEIGHBORS,
         "correspondence": "top mutual cosine-nearest patches in the geometric overlap of two views",
