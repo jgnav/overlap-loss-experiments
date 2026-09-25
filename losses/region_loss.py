@@ -98,10 +98,14 @@ class RegionLoss(nn.Module):
             raise ValueError("region_temp must be finite and positive")
         if not math.isfinite(student_temperature) or student_temperature <= 0:
             raise ValueError("student_temperature must be finite and positive")
-        if normalization not in ("centering", "softmax", "raw_logits", "sinkhorn"):
+        if normalization not in ("centering", "softmax", "raw_logits", "sinkhorn", "raw_logits_deep", "softmax_deep"):
             raise ValueError(
-                "region_normalization must be centering, softmax, raw_logits, or sinkhorn"
+                "region_normalization must be centering, softmax, raw_logits, sinkhorn, raw_logits_deep, or softmax_deep"
             )
+        if normalization.endswith("_deep") and (
+            aggregation != "mean" or patch_threshold == "weighted"
+        ):
+            raise ValueError("Deep region modes require mean aggregation and a numeric patch threshold")
         self.min_area = min_area
         self.patch_threshold = patch_threshold
         self.temperature = temperature
@@ -110,6 +114,77 @@ class RegionLoss(nn.Module):
         self.aggregation = RegionAggregation(aggregation)
         if aggregation == "hellinger" and normalization == "raw_logits":
             raise ValueError("hellinger aggregation requires probability distributions, not raw_logits")
+
+    def prepare_geometry(self, crop_boxes, patch_count):
+        """Compute one overlap mask shared by all selected transformer depths."""
+        fractions, valid, intersection_area = intersection_patch_fractions(
+            crop_boxes.float(), patch_count, self.min_area
+        )
+        weights = (fractions if self.patch_threshold == "weighted" else
+                   (fractions >= self.patch_threshold).float())
+        selected = (weights > 0) & valid[:, None, None]
+        valid = valid & selected.any(dim=-1).all(dim=-1)
+        selected = selected & valid[:, None, None]
+        return {
+            "weights": weights * selected,
+            "selected": selected,
+            "valid": valid,
+            "intersection_area": intersection_area,
+        }
+
+    def forward_deep(self, student_regions, teacher_regions, geometry):
+        if self.normalization not in ("raw_logits_deep", "softmax_deep"):
+            raise ValueError("forward_deep requires a deep normalization mode")
+        if set(student_regions) != {3, 6, 9, 12} or set(teacher_regions) != set(student_regions):
+            raise ValueError("Deep region outputs must contain blocks 3, 6, 9, and 12")
+        weights = geometry["weights"]
+        valid = geometry["valid"]
+        count = valid.sum().float()
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(count)
+            world_size = dist.get_world_size()
+        local_sum = None
+        for depth in (3, 6, 9, 12):
+            student = student_regions[depth]
+            teacher = teacher_regions[depth].detach()
+            if student.shape != teacher.shape or len(student) != 2 * len(weights):
+                raise ValueError("Deep region student and teacher shapes must match two global crops")
+            s0, s1 = student.chunk(2)
+            t0, t1 = teacher.chunk(2)
+            if self.normalization == "raw_logits_deep":
+                if s0.ndim != 3 or s0.shape[1] != weights.shape[-1]:
+                    raise ValueError("Deep raw features must have shape [batch, patches, features]")
+                def pool(features, view):
+                    selected_features = features.float().masked_fill(
+                        ~geometry["selected"][:, view, :, None], 0
+                    )
+                    mean = (selected_features * weights[:, view, :, None]).sum(1)
+                    mean = mean / weights[:, view].sum(1, keepdim=True).clamp_min(1)
+                    return F.normalize(mean, p=2, dim=-1)
+                s0, s1 = pool(s0, 0), pool(s1, 1)
+                t0, t1 = pool(t0, 0), pool(t1, 1)
+                per_pair = 0.5 * (
+                    1 - F.cosine_similarity(t0, s1, dim=-1)
+                    + 1 - F.cosine_similarity(t1, s0, dim=-1)
+                )
+            else:
+                if s0.ndim != 2:
+                    raise ValueError("Deep softmax regions must have shape [batch, prototypes]")
+                per_pair = -0.5 * (
+                    (t0.exp() * s1).sum(-1) + (t1.exp() * s0).sum(-1)
+                )
+            layer_sum = per_pair[valid].sum()
+            local_sum = layer_sum if local_sum is None else local_sum + layer_sum
+        loss = local_sum * world_size / (4 * count.clamp_min(1.0))
+        return {
+            "loss": loss,
+            "valid_ratio": valid.float().mean(),
+            "intersection_area": geometry["intersection_area"].mean(),
+            "patch_mask": geometry["selected"],
+            "patch_weights": weights,
+            "valid": valid,
+        }
 
     @staticmethod
     def _region_raw_vector(logits, weights):
@@ -187,16 +262,9 @@ class RegionLoss(nn.Module):
                 raise ValueError(
                     "Centered teacher patch targets must match region-logit shapes"
                 )
-        fractions, valid, intersection_area = intersection_patch_fractions(
-            crop_boxes.float(), shape[1], self.min_area
-        )
-        weights = (fractions if self.patch_threshold == "weighted" else
-                   (fractions >= self.patch_threshold).float())
-        selected = (weights > 0) & valid[:, None, None]
-        # Both cross-view directions require at least one patch in each view.
-        valid = valid & selected.any(dim=-1).all(dim=-1)
-        selected = selected & valid[:, None, None]
-        weights = weights * selected
+        geometry = self.prepare_geometry(crop_boxes, shape[1])
+        weights, selected = geometry["weights"], geometry["selected"]
+        valid, intersection_area = geometry["valid"], geometry["intersection_area"]
         global_valid_count = valid.sum().float()
         world_size = 1
         if dist.is_available() and dist.is_initialized():

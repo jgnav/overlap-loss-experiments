@@ -68,7 +68,8 @@ class ContinuationConfigTest(unittest.TestCase):
     def test_shared_region_normalization_selector(self):
         path = Path(__file__).parents[1] / "config" / "train.yaml"
         values = yaml.safe_load(path.read_text())
-        for mode in ("centering", "softmax", "raw_logits", "sinkhorn"):
+        for mode in ("centering", "softmax", "raw_logits", "sinkhorn",
+                     "raw_logits_deep", "softmax_deep"):
             values["region_normalization"] = mode
             with mock.patch.object(Path, "open", mock.mock_open(read_data=yaml.safe_dump(values))):
                 self.assertEqual(load_config(path).region_normalization, mode)

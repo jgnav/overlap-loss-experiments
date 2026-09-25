@@ -4,7 +4,7 @@
 # Array tasks have no concurrency cap; Slurm starts each as resources permit.
 
 #SBATCH --job-name=ablation
-#SBATCH --array=0-20
+#SBATCH --array=0-22
 #SBATCH --partition=3090_risk,a100,rtx_pro6000_risk
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
@@ -39,8 +39,10 @@ configs=(
     region_min_area_0p3
     region_min_area_0p5
     region_normalization_raw_logits
+    region_normalization_raw_logits_deep
     region_normalization_sinkhorn
     region_normalization_softmax
+    region_normalization_softmax_deep
     region_patch_threshold_0p2
     region_patch_threshold_0p5
     region_patch_threshold_weighted

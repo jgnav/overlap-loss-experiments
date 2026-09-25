@@ -198,6 +198,18 @@ class iBOTHead(DINOHead):
                 self.last_layer2 = None
             self.last_norm2 = self.last_norm
 
+    def forward_patches(self, patches):
+        """Apply the existing patch projection path to intermediate features."""
+        if self.last_layer2 is not None:
+            mlp = self.mlp if self.shared_head else self.patch_mlp
+            result = self.last_layer2(nn.functional.normalize(mlp(patches), dim=-1, p=2))
+        else:
+            trunk = self.mlp[:-1] if isinstance(self.mlp, nn.Sequential) else nn.Identity()
+            result = self.mlp2(trunk(patches) if self.shared_head else self.patch_mlp(patches))
+        if self.last_norm2 is not None:
+            result = self.last_norm2(result)
+        return result
+
     def forward(self, x):
         if len(x.shape) == 2:
             return super(iBOTHead, self).forward(x)

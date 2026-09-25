@@ -364,10 +364,48 @@ class MultiCropWrapper(nn.Module):
         self.backbone = backbone
         self.head = nn.Identity() if head is None else head
 
-    def forward(self, inputs, mask=None, return_backbone_feat=False, **kwargs):
+    @staticmethod
+    def _pool_patch_softmax(patches, weights, project, temperature, chunk_size=16):
+        """Pool logits by patch chunk; student autograd still saves activations."""
+        if weights.shape != patches.shape[:2]:
+            raise ValueError("Deep region weights must match patch-token shape")
+        weights = weights.float()
+        # Invalid regions are discarded by the loss; give them a finite
+        # temporary representation so no log(0) reaches autograd.
+        empty = weights.sum(dim=1) == 0
+        if empty.any():
+            weights = weights.clone()
+            weights[empty, 0] = 1
+        pooled = None
+        for offset in range(0, patches.shape[1], chunk_size):
+            chunk_weights = weights[:, offset:offset + chunk_size]
+            no_selected_patch = chunk_weights.sum(dim=1) == 0
+            if no_selected_patch.any():
+                safe_weights = chunk_weights.clone()
+                safe_weights[no_selected_patch, 0] = 1
+            else:
+                safe_weights = chunk_weights
+            logits = project(patches[:, offset:offset + chunk_size])
+            logs = nn.functional.log_softmax(logits.float() / temperature, dim=-1)
+            chunk = torch.logsumexp(
+                logs + safe_weights.log().unsqueeze(-1), dim=1
+            )
+            # A finite sentinel prevents undefined gradients in logaddexp when
+            # an entire patch chunk is outside a sample's region.
+            chunk = chunk.masked_fill(no_selected_patch[:, None], -1e9)
+            pooled = chunk if pooled is None else torch.logaddexp(pooled, chunk)
+        return pooled - weights.sum(dim=1, keepdim=True).log()
+
+    def forward(self, inputs, mask=None, return_backbone_feat=False,
+                return_deep_patches=False, deep_region_weights=None,
+                deep_softmax_temperature=None, **kwargs):
         if not isinstance(inputs, list):
             inputs = [inputs]
             mask = [mask] if mask is not None else None
+        if deep_softmax_temperature is not None and (
+            not return_deep_patches or deep_region_weights is None
+        ):
+            raise ValueError("Deep softmax requires intermediate patches and region weights")
         crop_boundaries = torch.cumsum(
             torch.unique_consecutive(
                 torch.tensor([item.shape[-1] for item in inputs]),
@@ -376,24 +414,49 @@ class MultiCropWrapper(nn.Module):
             0,
         )
         start_index = 0
-        output = None
+        outputs = []
+        deep_outputs = {depth: [] for depth in (3, 6, 9, 12)} if return_deep_patches else None
         for end_index in crop_boundaries:
             input_batch = torch.cat(inputs[start_index:end_index])
             if mask is not None:
                 input_mask = torch.cat(mask[start_index:end_index])
                 kwargs.update(mask=input_mask)
-            current_output = self.backbone(input_batch, **kwargs)
-            output = (
-                current_output
-                if output is None
-                else torch.cat((output, current_output))
+            current = (
+                self.backbone(input_batch, return_deep_patches=True, **kwargs)
+                if return_deep_patches else self.backbone(input_batch, **kwargs)
             )
+            if return_deep_patches:
+                current_output, current_deep = current
+                for depth in deep_outputs:
+                    deep_outputs[depth].append(current_deep[depth])
+            else:
+                current_output = current
+            outputs.append(current_output)
             start_index = end_index
+        output = torch.cat(outputs)
         register_count = getattr(self.backbone, "num_register_tokens", 0)
         head_input = torch.cat(
             (output[:, :1], output[:, 1 + register_count:]), dim=1
         )
         projected_output = self.head(head_input)
+        if return_deep_patches:
+            deep_outputs = {
+                depth: torch.cat(chunks) for depth, chunks in deep_outputs.items()
+            }
+            if deep_softmax_temperature is not None:
+                weights = torch.cat(deep_region_weights, dim=0)
+                deep_outputs = {
+                    depth: self._pool_patch_softmax(
+                        projected_output[1] if depth == 12 else patches,
+                        weights,
+                        nn.Identity() if depth == 12 else self.head.forward_patches,
+                        deep_softmax_temperature,
+                    )
+                    for depth, patches in deep_outputs.items()
+                }
+            if return_backbone_feat:
+                return output, projected_output, deep_outputs
+            return projected_output, deep_outputs
         if return_backbone_feat:
             return output, projected_output
         return projected_output

@@ -211,6 +211,9 @@ class iBOTLoss(nn.Module):
         *,
         teacher_patch_logits=None,
         student_cls_features=None,
+        student_deep_regions=None,
+        teacher_deep_regions=None,
+        region_geometry=None,
     ):
         """Compute baseline centered DINO/iBOT plus region composition."""
         student_cls, student_patch = student_output
@@ -295,12 +298,23 @@ class iBOTLoss(nn.Module):
         else:
             if teacher_patch_logits is None:
                 raise ValueError("Active region loss requires raw teacher_patch_logits")
-            region_stats = self.region_loss(
-                raw_student_patch_c,
-                teacher_patch_logits.detach().chunk(self.ngcrops),
-                crop_boxes,
-                teacher_patch_targets=teacher_patch_c,
-            )
+            if self.region_loss.normalization.endswith("_deep"):
+                if student_deep_regions is None or teacher_deep_regions is None:
+                    raise ValueError("Deep regional loss requires intermediate outputs")
+                if region_geometry is None:
+                    region_geometry = self.region_loss.prepare_geometry(
+                        crop_boxes, raw_student_patch_c[0].shape[1]
+                    )
+                region_stats = self.region_loss.forward_deep(
+                    student_deep_regions, teacher_deep_regions, region_geometry
+                )
+            else:
+                region_stats = self.region_loss(
+                    raw_student_patch_c,
+                    teacher_patch_logits.detach().chunk(self.ngcrops),
+                    crop_boxes,
+                    teacher_patch_targets=teacher_patch_c,
+                )
             region_raw = region_stats["loss"]
             total_loss3 = region_raw * region_weight
             region_valid_ratio = region_stats["valid_ratio"]

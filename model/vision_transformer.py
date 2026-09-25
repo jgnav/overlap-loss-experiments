@@ -236,7 +236,7 @@ class VisionTransformer(nn.Module):
 
         return self.pos_drop(x)
 
-    def forward(self, x, return_all_tokens=None, mask=None):
+    def forward(self, x, return_all_tokens=None, mask=None, return_deep_patches=False):
         # mim
         if self.masked_im_modeling:
             assert mask is not None
@@ -244,10 +244,21 @@ class VisionTransformer(nn.Module):
         else:
             x = self.prepare_tokens(x)
 
-        for blk in self.blocks:
+        deep_patches = {} if return_deep_patches else None
+        if return_deep_patches and len(self.blocks) != 12:
+            raise ValueError("Deep regional loss requires a 12-block transformer")
+        for depth, blk in enumerate(self.blocks, start=1):
             x = blk(x)
+            if return_deep_patches and depth in (3, 6, 9):
+                patches = x[:, 1 + self.num_register_tokens:]
+                # Intermediate blocks do not have a dedicated backbone norm.
+                deep_patches[depth] = nn.functional.layer_norm(
+                    patches.float(), (self.embed_dim,), eps=1e-6
+                ).to(patches.dtype)
 
         x = self.norm(x)
+        if return_deep_patches:
+            deep_patches[12] = x[:, 1 + self.num_register_tokens:]
         if self.fc_norm is not None:
             x[:, 0] = self.fc_norm(
                 x[:, 1 + self.num_register_tokens:, :].mean(1)
@@ -255,9 +266,8 @@ class VisionTransformer(nn.Module):
         
         return_all_tokens = self.return_all_tokens if \
             return_all_tokens is None else return_all_tokens
-        if return_all_tokens:
-            return x
-        return x[:, 0]
+        result = x if return_all_tokens else x[:, 0]
+        return (result, deep_patches) if return_deep_patches else result
 
     def get_last_selfattention(self, x):
         x = self.prepare_tokens(x)
