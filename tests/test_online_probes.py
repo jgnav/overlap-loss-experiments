@@ -229,6 +229,20 @@ class ConfigurationTest(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 validate_probe_data(directory)
 
+    def test_wandb_does_not_fill_probe_epoch_from_session_state(self):
+        from train import init_wandb
+        wandb = mock.Mock()
+        with mock.patch('train.init_wandb_run', return_value=wandb):
+            init_wandb(SimpleNamespace(seed=0))
+        self.assertEqual(
+            wandb.define_metric.call_args_list[-2],
+            mock.call('train/*', step_metric='epoch', step_sync=False),
+        )
+        self.assertEqual(
+            wandb.define_metric.call_args_list[-1],
+            mock.call('train/online_*', step_metric='train/online_probe_epoch', step_sync=False),
+        )
+
     def test_logging_uses_snapshot_epoch_and_existing_wandb_run(self):
         from train import log_online_probe_records
         with tempfile.TemporaryDirectory() as directory:
@@ -240,6 +254,8 @@ class ConfigurationTest(unittest.TestCase):
             ]
             log_online_probe_records(runner, directory, writer, wandb)
             self.assertEqual(wandb.log.call_count, 2)
+            self.assertEqual(wandb.log.call_args_list[0].args[0]['epoch'], 10)
+            self.assertEqual(wandb.log.call_args_list[1].args[0]['epoch'], 20)
             self.assertEqual(wandb.log.call_args.args[0]['train/online_probe_epoch'], 20)
             writer.add_scalar.assert_any_call('online_pascal_voc_linear_miou', .42, 10)
             self.assertEqual(len((Path(directory) / 'online_probes/metrics.jsonl').read_text().splitlines()), 2)

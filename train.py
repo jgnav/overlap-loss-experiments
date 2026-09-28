@@ -233,9 +233,11 @@ def init_wandb(args):
     if run is not None:
         run.define_metric("train/online_probe_epoch")
         run.define_metric("epoch")
-        run.define_metric("train/*", step_metric="epoch")
+        run.define_metric("train/*", step_metric="epoch", step_sync=False)
         # Define the narrower rule last so probe curves use checkpoint epochs.
-        run.define_metric("train/online_*", step_metric="train/online_probe_epoch")
+        run.define_metric(
+            "train/online_*", step_metric="train/online_probe_epoch", step_sync=False
+        )
     return run
 
 
@@ -248,7 +250,12 @@ def log_online_probe_records(runner, output_dir, writer, wandb_run):
             for key, value in record.items():
                 writer.add_scalar(key, value, record["online_probe_epoch"])
         if wandb_run is not None:
-            wandb_run.log({f"train/{key}": value for key, value in record.items()})
+            # A worker can finish after later training epochs, including after a
+            # resumed W&B session. Always label its row with the checkpoint epoch.
+            wandb_run.log({
+                "epoch": record["online_probe_epoch"],
+                **{f"train/{key}": value for key, value in record.items()},
+            })
 
 
 def train_ibot(args, wandb_run=None):
