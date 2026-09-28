@@ -10,7 +10,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
-#SBATCH --mem=128G
+#SBATCH --mem=192G
 #SBATCH --time=50:00:00
 #SBATCH --output=logs/ablation_full_resume_%j.out
 #SBATCH --error=logs/ablation_full_resume_%j.err

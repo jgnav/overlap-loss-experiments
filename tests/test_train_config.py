@@ -8,11 +8,25 @@ import torch
 import yaml
 
 from losses import iBOTLoss
-from train import configure_slurm_requeue_resume, get_teacher_targets, load_config
+from train import configure_slurm_requeue_resume, get_teacher_targets, load_config, log_online_probe_records
 from utils import training as utils
 
 
 class ContinuationConfigTest(unittest.TestCase):
+    def test_online_probe_logs_its_checkpoint_epoch_to_wandb(self):
+        record = {"online_probe_epoch": 45, "online_pascal_voc_knn_miou": 0.61}
+        runner = mock.Mock()
+        runner.collect_completed.return_value = [record]
+        wandb_run = mock.Mock()
+        with TemporaryDirectory() as directory:
+            (Path(directory) / "online_probes").mkdir()
+            log_online_probe_records(runner, directory, None, wandb_run)
+        wandb_run.log.assert_called_once_with({
+            "epoch": 45,
+            "train/online_probe_epoch": 45,
+            "train/online_pascal_voc_knn_miou": 0.61,
+        })
+
     def test_slurm_requeue_restores_checkpoint_and_original_wandb_id(self):
         with TemporaryDirectory() as directory:
             run_dir = Path(directory) / "83657_21"

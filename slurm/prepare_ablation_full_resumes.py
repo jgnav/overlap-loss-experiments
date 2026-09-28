@@ -19,14 +19,18 @@ from utils.checkpoint import _validate_resume_compatibility
 
 RUNS = {
     "83650_0": "lambda3_0p4",
+    "83650_3": "region_aggregation_mean_covariance",
     "83650_7": "region_normalization_softmax",
     "83657_10": "lambda3_0p2",
+    "83657_12": "lambda3_0p8",
     "83657_15": "koleo_regularizer_true",
     "83657_17": "region_min_area_0p3",
     "83657_18": "region_min_area_0p5",
     "83657_19": "region_patch_threshold_0p2",
     "83657_20": "region_patch_threshold_0p5",
     "83657_21": "region_patch_threshold_weighted",
+    "83657_22": "register_4",
+    "83657_23": "shared_head_false",
 }
 
 

@@ -248,7 +248,10 @@ def log_online_probe_records(runner, output_dir, writer, wandb_run):
             for key, value in record.items():
                 writer.add_scalar(key, value, record["online_probe_epoch"])
         if wandb_run is not None:
-            wandb_run.log({f"train/{key}": value for key, value in record.items()})
+            wandb_run.log({
+                "epoch": record["online_probe_epoch"],
+                **{f"train/{key}": value for key, value in record.items()},
+            })
 
 
 def train_ibot(args, wandb_run=None):
