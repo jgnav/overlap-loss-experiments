@@ -70,6 +70,8 @@ def load_config(path):
         raise ValueError("online_probe_num_workers must be an integer >= 0")
     if type(config["online_probe_wait_at_exit"]) is not bool:
         raise ValueError("online_probe_wait_at_exit must be a boolean")
+    if type(config["online_probe_cleanup_completed_snapshots"]) is not bool:
+        raise ValueError("online_probe_cleanup_completed_snapshots must be a boolean")
     if type(config["shared_head"]) is not bool:
         raise ValueError("shared_head must be a boolean")
     if type(config["ibot_plus_plus"]) is not bool:

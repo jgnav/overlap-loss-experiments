@@ -277,6 +277,11 @@ class OnlineProbeRunner:
                             record[f"online_{name}_{metric}"] = float(value)
             records.append(record)
             self.completed_results.add(path)
+            if result["status"] == "completed" and getattr(
+                self.args, "online_probe_cleanup_completed_snapshots", False
+            ):
+                snapshot = path.parent / "checkpoints" / f"teacher_epoch{epoch:04d}.pth"
+                snapshot.unlink(missing_ok=True)
         return records
 
     def retry_failed(self):

@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# Submit from the repository root with a walltime allowed by the target cluster:
-#   sbatch --time=<cluster-allowed-walltime> slurm/slurm_long_training.sh
-# Override --time, --cpus-per-task, or --mem at submission if needed.
+# Submit small runs (tasks 0 and 3) on 3090, A100, or RTX Pro 6000:
+#   sbatch --array=0,3 slurm/slurm_long_training.sh
+# Submit base and large runs (tasks 1 and 2) on the larger-memory GPUs:
+#   sbatch --array=1-2 --partition=a100,rtx_pro6000_risk slurm/slurm_long_training.sh
 
 #SBATCH --job-name=ibot-long
 #SBATCH --array=0-3
+#SBATCH --partition=3090_risk,a100,rtx_pro6000_risk
+#SBATCH --exclude=aisurrey37
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=192G
+#SBATCH --time=3-00:00:00
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@600
 #SBATCH --output=logs/long_training_%A_%a.out
 #SBATCH --error=logs/long_training_%A_%a.err
 
@@ -37,7 +43,8 @@ if [[ ! -f "$config_path" ]]; then
 fi
 
 export IBOT_RUN_ID="${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
-export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1
+export IBOT_SYNC_PROBES=1
 
 echo "Config: $config_path"
 echo "Run ID: $IBOT_RUN_ID"
@@ -55,7 +62,16 @@ else
     }
 fi
 
+requeue_before_timeout() {
+    trap - USR1
+    echo "Approaching the Slurm time limit; requeueing ${SLURM_JOB_ID} for checkpoint resume"
+    scontrol requeue "${SLURM_JOB_ID}"
+}
+trap requeue_before_timeout USR1
+
 "$torchrun_bin" \
     --standalone \
     --nproc_per_node=8 \
-    train.py "$config_path"
+    train.py "$config_path" &
+train_pid=$!
+wait "$train_pid"

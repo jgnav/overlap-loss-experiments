@@ -38,8 +38,8 @@ REPO_ROOT = Path(__file__).resolve().parent
 IMAGENET_VAL = Path("/mnt/fast/nobackup/scratch4weeks/jg02228/datasets/imagenet/val")
 OUTPUT_DIR = REPO_ROOT / "output" / "imagenet_visualizations"
 CHECKPOINTS = {
-    "iBOT": REPO_ROOT / "output" / "ablation" / "70860_9" / "checkpoint.pth",
-    "Ours": REPO_ROOT / "checkpoints" / "ibot_vit_small.pth",
+    "iBOT": REPO_ROOT / "output/ablation/83650_2/checkpoint.pth",
+    "Ours": REPO_ROOT / "output/ablation/83650_0/checkpoint.pth",
 }
 N_IMAGES = 10
 SEED = 1

@@ -46,6 +46,7 @@ COMMON_IBOT_RECIPE = {
     "online_probe_num_workers": 0,
     "online_probe_max_concurrent_jobs": 1,
     "online_probe_wait_at_exit": True,
+    "online_probe_cleanup_completed_snapshots": False,
     "online_probe_gpu": None,
 }
 
