@@ -163,7 +163,7 @@ class ContinuationConfigTest(unittest.TestCase):
         for change in (
             {"koleo_regularizer": "true"},
             {"koleo_regularizer": True, "batch_size_per_gpu": 1},
-            {"koleo_regularizer": True, "global_crops_number": 1},
+            {"koleo_regularizer": True, "global_crops_number": 1, "lambda3": 0},
         ):
             with mock.patch.object(
                 Path, "open", mock.mock_open(read_data=yaml.safe_dump({**values, **change}))

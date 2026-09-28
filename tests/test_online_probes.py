@@ -197,9 +197,11 @@ class ConfigurationTest(unittest.TestCase):
         import yaml
         from train import load_config
         path = Path('test-training.yaml')
-        values = dict(arch='vit_small', register=0, additional_epochs=20, warmup_epochs=0,
-                      data_path='dataset', initial_checkpoint='checkpoint.pth',
-                      output_dir='output', wandb_mode='disabled')
+        values = yaml.safe_load(Path('config/train.yaml').read_text())
+        values.update(arch='vit_small', register=0, additional_epochs=20,
+                      warmup_epochs=0, data_path='dataset',
+                      initial_checkpoint='checkpoint.pth', output_dir='output',
+                      wandb_mode='disabled')
         for enabled, frequency in ((False, 3), (True, 7)):
             values.update(online_probes_enabled=enabled, online_probe_frequency=frequency)
             with mock.patch.object(Path, 'open', mock.mock_open(read_data=yaml.safe_dump(values))):
@@ -229,6 +231,20 @@ class ConfigurationTest(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 validate_probe_data(directory)
 
+    def test_wandb_does_not_fill_probe_epoch_from_session_state(self):
+        from train import init_wandb
+        wandb = mock.Mock()
+        with mock.patch('train.init_wandb_run', return_value=wandb):
+            init_wandb(SimpleNamespace(seed=0))
+        self.assertEqual(
+            wandb.define_metric.call_args_list[-2],
+            mock.call('train/*', step_metric='epoch', step_sync=False),
+        )
+        self.assertEqual(
+            wandb.define_metric.call_args_list[-1],
+            mock.call('train/online_*', step_metric='train/online_probe_epoch', step_sync=False),
+        )
+
     def test_logging_uses_snapshot_epoch_and_existing_wandb_run(self):
         from train import log_online_probe_records
         with tempfile.TemporaryDirectory() as directory:
@@ -240,6 +256,8 @@ class ConfigurationTest(unittest.TestCase):
             ]
             log_online_probe_records(runner, directory, writer, wandb)
             self.assertEqual(wandb.log.call_count, 2)
+            self.assertEqual(wandb.log.call_args_list[0].args[0]['epoch'], 10)
+            self.assertEqual(wandb.log.call_args_list[1].args[0]['epoch'], 20)
             self.assertEqual(wandb.log.call_args.args[0]['train/online_probe_epoch'], 20)
             writer.add_scalar.assert_any_call('online_pascal_voc_linear_miou', .42, 10)
             self.assertEqual(len((Path(directory) / 'online_probes/metrics.jsonl').read_text().splitlines()), 2)

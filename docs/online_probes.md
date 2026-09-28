@@ -51,6 +51,9 @@ Artifacts under the training output directory:
 - `online_probes/metrics.jsonl`: flattened metrics collected by training.
 
 Metrics also go to TensorBoard and the existing W&B run at the checkpoint epoch.
+W&B probe rows explicitly set `epoch` to that checkpoint epoch, even when the
+asynchronous result arrives after a later training epoch or a resumed session.
+Plot online metrics against `train/online_probe_epoch` for the checkpoint axis.
 Examples: `online_pascal_voc_knn_miou`, `online_pascal_voc_linear_miou`,
 `online_imagenet_knn_top1` (prefixed with `train/` in W&B).
 Per-task success flags and `online_probe_success` report failures.
