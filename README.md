@@ -160,13 +160,13 @@ weighting is applied before aggregation.
   final block uses the ViT output norm). L2-normalize each regional mean,
   match student against the opposite teacher crop with cosine distance, and
   average the four layer losses. No projection head is used by this branch.
-- `softmax_deep`: use the same blocks and shared binary overlap masks, project
-  intermediate patches through the existing iBOT patch head, apply per-patch
-  softmax at `region_temp`, average distributions within each region, and
-  cross-distill opposite crops. Four layer losses are averaged. The patch
-  head is shared across depths; no extra trainable heads are introduced.
-  The forward pass pools logits in patch chunks, but student autograd still
-  retains activations needed for backward; no activation checkpointing is used.
+- `softmax_deep`: use the same backbone features and shared binary overlap
+  masks as `raw_logits_deep`. Apply per-patch softmax to backbone features at
+  `region_temp`, average distributions within each region, and cross-distill
+  opposite crops. Four layer losses are averaged. No projection head is used
+  by this branch. The forward pass pools features in patch chunks, but autograd
+  still retains activations needed for backward; no activation checkpointing is
+  used.
 - `sinkhorn`: independently balance teacher and student selected patch logits
   using three Sinkhorn iterations at `region_temp`. Each side pools selected
   patches from both views and all ranks into one assignment problem, then

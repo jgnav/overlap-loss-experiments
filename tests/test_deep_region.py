@@ -1,7 +1,6 @@
 import unittest
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 from losses.region_loss import RegionLoss
@@ -70,12 +69,11 @@ class DeepRegionTest(unittest.TestCase):
     def test_streamed_softmax_matches_direct_patch_mean_and_gradient(self):
         torch.manual_seed(43)
         patches = torch.randn(2, 4, 3, requires_grad=True)
-        projection = nn.Linear(3, 5)
         weights = torch.tensor([[1., 0., 0., 1.], [0., 0., 1., 0.]])
         actual = MultiCropWrapper._pool_patch_softmax(
-            patches, weights, projection, 0.7, chunk_size=2
+            patches, weights, 0.7, chunk_size=2
         )
-        expected = ((projection(patches) / 0.7).softmax(-1)
+        expected = ((patches / 0.7).softmax(-1)
                     * weights[..., None]).sum(1) / weights.sum(1, keepdim=True)
         torch.testing.assert_close(actual.exp(), expected)
         actual.sum().backward()
@@ -106,10 +104,11 @@ class DeepRegionTest(unittest.TestCase):
             deep_region_weights=weights, deep_softmax_temperature=0.7,
         )
         for region in pooled.values():
-            self.assertEqual(region.shape, (4, 7))
+            self.assertEqual(region.shape, (4, 12))
             torch.testing.assert_close(region.exp().sum(-1), torch.ones(4))
-        expected_final = (patch_logits / 0.7).softmax(-1).mean(1)
-        torch.testing.assert_close(pooled[12].exp(), expected_final)
+        for depth in deep:
+            expected = (deep[depth] / 0.7).softmax(-1).mean(1)
+            torch.testing.assert_close(pooled[depth].exp(), expected)
 
     def test_deep_modes_require_binary_mean_pooling(self):
         for mode in ("raw_logits_deep", "softmax_deep"):

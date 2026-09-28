@@ -365,8 +365,8 @@ class MultiCropWrapper(nn.Module):
         self.head = nn.Identity() if head is None else head
 
     @staticmethod
-    def _pool_patch_softmax(patches, weights, project, temperature, chunk_size=16):
-        """Pool logits by patch chunk; student autograd still saves activations."""
+    def _pool_patch_softmax(patches, weights, temperature, chunk_size=16):
+        """Softmax intermediate backbone features per patch, then pool the region."""
         if weights.shape != patches.shape[:2]:
             raise ValueError("Deep region weights must match patch-token shape")
         weights = weights.float()
@@ -385,8 +385,8 @@ class MultiCropWrapper(nn.Module):
                 safe_weights[no_selected_patch, 0] = 1
             else:
                 safe_weights = chunk_weights
-            logits = project(patches[:, offset:offset + chunk_size])
-            logs = nn.functional.log_softmax(logits.float() / temperature, dim=-1)
+            features = patches[:, offset:offset + chunk_size]
+            logs = nn.functional.log_softmax(features.float() / temperature, dim=-1)
             chunk = torch.logsumexp(
                 logs + safe_weights.log().unsqueeze(-1), dim=1
             )
@@ -447,9 +447,8 @@ class MultiCropWrapper(nn.Module):
                 weights = torch.cat(deep_region_weights, dim=0)
                 deep_outputs = {
                     depth: self._pool_patch_softmax(
-                        projected_output[1] if depth == 12 else patches,
+                        patches,
                         weights,
-                        nn.Identity() if depth == 12 else self.head.forward_patches,
                         deep_softmax_temperature,
                     )
                     for depth, patches in deep_outputs.items()

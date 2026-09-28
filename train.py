@@ -192,6 +192,39 @@ def assign_run_output_directory(args):
     args.output_dir = str(output_root / run_id)
 
 
+def configure_slurm_requeue_resume(args):
+    """Resume the same run when Slurm restarts a fresh-launch batch script."""
+    if not os.environ.get("SLURM_JOB_ID") or int(os.environ.get("SLURM_RESTART_COUNT", "0")) <= 0:
+        return
+    if args.resume_checkpoint is not None:
+        return
+    checkpoint = Path(args.output_dir) / "checkpoint.pth"
+    if not checkpoint.is_file():
+        return
+    if args.wandb_mode != "disabled":
+        wandb_ids = {
+            path.name.rsplit("-", 1)[-1]
+            for path in (Path(args.output_dir) / "wandb").glob("run-*")
+            if path.is_dir()
+        }
+        if len(wandb_ids) != 1:
+            raise RuntimeError(
+                f"Cannot safely resume {args.run_id}: expected one original W&B ID, "
+                f"found {sorted(wandb_ids)}"
+            )
+        wandb_id = wandb_ids.pop()
+        if args.wandb_run_id is not None and args.wandb_run_id != wandb_id:
+            raise RuntimeError(f"Cannot safely resume {args.run_id}: W&B ID changed")
+        args.wandb_run_id = wandb_id
+        args.wandb_resume = "must"
+    args.resume_checkpoint = checkpoint.resolve()
+    args.reset_optimizer = False
+    print(
+        f"Slurm restart {os.environ['SLURM_RESTART_COUNT']}: full resume of "
+        f"{args.run_id} from {args.resume_checkpoint}", flush=True,
+    )
+
+
 def init_wandb(args):
     config = {
         key: str(value) if isinstance(value, Path) else value
@@ -922,6 +955,7 @@ def main():
     if args.online_probes_enabled:
         args.online_probe_datasets_root = str(validate_probe_data(args.online_probe_datasets_root))
     assign_run_output_directory(args)
+    configure_slurm_requeue_resume(args)
     output_checkpoint = Path(args.output_dir) / "checkpoint.pth"
     if (
         args.resume_checkpoint is None

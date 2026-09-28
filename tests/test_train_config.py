@@ -1,16 +1,54 @@
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 import yaml
 
 from losses import iBOTLoss
-from train import get_teacher_targets, load_config
+from train import configure_slurm_requeue_resume, get_teacher_targets, load_config
 from utils import training as utils
 
 
 class ContinuationConfigTest(unittest.TestCase):
+    def test_slurm_requeue_restores_checkpoint_and_original_wandb_id(self):
+        with TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "83657_21"
+            (run_dir / "wandb" / "run-20260927_123456-original8").mkdir(parents=True)
+            (run_dir / "checkpoint.pth").touch()
+            args = SimpleNamespace(
+                output_dir=str(run_dir), run_id="83657_21",
+                resume_checkpoint=None, reset_optimizer=True,
+                wandb_mode="online", wandb_run_id=None, wandb_resume=None,
+            )
+            with mock.patch.dict(
+                "os.environ", {"SLURM_JOB_ID": "83657", "SLURM_RESTART_COUNT": "1"}
+            ):
+                configure_slurm_requeue_resume(args)
+            self.assertEqual(args.resume_checkpoint, (run_dir / "checkpoint.pth").resolve())
+            self.assertFalse(args.reset_optimizer)
+            self.assertEqual(args.wandb_run_id, "original8")
+            self.assertEqual(args.wandb_resume, "must")
+
+    def test_first_slurm_start_does_not_resume_existing_checkpoint(self):
+        with TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "83657_21"
+            run_dir.mkdir()
+            (run_dir / "checkpoint.pth").touch()
+            args = SimpleNamespace(
+                output_dir=str(run_dir), run_id="83657_21",
+                resume_checkpoint=None, reset_optimizer=True,
+                wandb_mode="disabled", wandb_run_id=None, wandb_resume=None,
+            )
+            with mock.patch.dict(
+                "os.environ", {"SLURM_JOB_ID": "83657", "SLURM_RESTART_COUNT": "0"}
+            ):
+                configure_slurm_requeue_resume(args)
+            self.assertIsNone(args.resume_checkpoint)
+            self.assertTrue(args.reset_optimizer)
+
     def test_wandb_settings_come_from_yaml_instead_of_slurm_environment(self):
         path = Path(__file__).parents[1] / 'config' / 'train.yaml'
         values = yaml.safe_load(path.read_text())
