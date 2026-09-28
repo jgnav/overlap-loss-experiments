@@ -155,25 +155,12 @@ weighting is applied before aggregation.
 - `raw_logits`: L2-normalize each raw patch vector, average selected vectors,
   then use symmetric cosine distance between the means. These vectors can be
   signed, so probability cross-entropy does not apply. `region_temp` is unused.
-- `raw_logits_deep`: at blocks 3, 6, 9, and 12, average selected
-  patch features after parameter-free LayerNorm at intermediate depths (the
-  final block uses the ViT output norm). L2-normalize each regional mean,
-  match student against the opposite teacher crop with cosine distance, and
-  average the four layer losses. No projection head is used by this branch.
-- `softmax_deep`: use the same backbone features and shared binary overlap
-  masks as `raw_logits_deep`. Apply per-patch softmax to backbone features at
-  `region_temp`, average distributions within each region, and cross-distill
-  opposite crops. Four layer losses are averaged. No projection head is used
-  by this branch. The forward pass pools features in patch chunks, but autograd
-  still retains activations needed for backward; no activation checkpointing is
-  used.
 - `sinkhorn`: independently balance teacher and student selected patch logits
   using three Sinkhorn iterations at `region_temp`. Each side pools selected
   patches from both views and all ranks into one assignment problem, then
   averages assignments per region and uses symmetric cross-entropy. Gradients
   flow through student Sinkhorn, including its distributed normalization.
 
-Deep modes require a numeric patch threshold and `region_aggregation: mean`.
 The student uses masked global crops and the teacher uses unmasked crops.
 
 The teacher is detached in every mode. Only patches from valid pairs passing

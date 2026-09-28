@@ -87,10 +87,9 @@ def load_config(path):
         raise ValueError("region_temp must be finite and positive")
     if config["region_normalization"] not in (
         "centering", "softmax", "raw_logits", "sinkhorn",
-        "raw_logits_deep", "softmax_deep",
     ):
         raise ValueError(
-            "region_normalization must be centering, softmax, raw_logits, sinkhorn, raw_logits_deep, or softmax_deep"
+            "region_normalization must be centering, softmax, raw_logits, or sinkhorn"
         )
     # Validate the aggregation choice and its normalization combination before
     # loading checkpoints, datasets, or initializing distributed training.
@@ -788,37 +787,16 @@ def train_one_epoch(
             dtype=autocast_dtype,
             enabled=autocast_enabled,
         ):
-            deep_mode = ibot_loss.region_loss.normalization.endswith("_deep")
-            deep_softmax = ibot_loss.region_loss.normalization == "softmax_deep"
-            region_geometry = None
-            deep_weights = None
-            if deep_mode:
-                patch_count = masks[0].numel() // len(masks[0])
-                region_geometry = ibot_loss.region_loss.prepare_geometry(
-                    crop_boxes, patch_count
-                )
-                if deep_softmax:
-                    deep_weights = region_geometry["weights"].unbind(dim=1)
             with torch.no_grad():
                 diagnostic_batch = iteration < args.diagnostic_feature_batches
                 teacher_result = teacher(
                     images[: args.global_crops_number],
                     return_backbone_feat=diagnostic_batch,
-                    return_deep_patches=deep_mode,
-                    deep_region_weights=deep_weights,
-                    deep_softmax_temperature=args.region_temp if deep_softmax else None,
                 )
-                if deep_mode:
-                    if diagnostic_batch:
-                        backbone_features, teacher_output, teacher_deep = teacher_result
-                    else:
-                        teacher_output, teacher_deep = teacher_result
-                elif diagnostic_batch:
+                if diagnostic_batch:
                     backbone_features, teacher_output = teacher_result
-                    teacher_deep = None
                 else:
                     teacher_output = teacher_result
-                    teacher_deep = None
                 if diagnostic_batch:
                     register_count = teacher_without_ddp.backbone.num_register_tokens
                     feature_diagnostics.update(
@@ -831,21 +809,11 @@ def train_one_epoch(
                 images[: args.global_crops_number],
                 mask=masks[: args.global_crops_number],
                 return_backbone_feat=need_student_features,
-                return_deep_patches=deep_mode,
-                deep_region_weights=deep_weights,
-                deep_softmax_temperature=args.region_temp if deep_softmax else None,
             )
-            if deep_mode:
-                if need_student_features:
-                    student_backbone_features, student_output, student_deep = student_result
-                else:
-                    student_output, student_deep = student_result
+            if need_student_features:
+                student_backbone_features, student_output = student_result
             else:
-                if need_student_features:
-                    student_backbone_features, student_output = student_result
-                else:
-                    student_output = student_result
-                student_deep = None
+                student_output = student_result
             student_cls_features = (
                 student_backbone_features[:, 0] if need_student_features else None
             )
@@ -866,9 +834,6 @@ def train_one_epoch(
                 crop_boxes,
                 teacher_patch_logits=teacher_output[1],
                 student_cls_features=student_cls_features,
-                student_deep_regions=student_deep,
-                teacher_deep_regions=teacher_deep,
-                region_geometry=region_geometry,
             )
             loss = all_loss.pop("loss")
 
