@@ -65,7 +65,7 @@ class ImageNetVisualizationTest(unittest.TestCase):
             np.testing.assert_allclose(aligned[name], reference[name])
         self.assertEqual(len(record["component_permutation"]), 3)
 
-    def test_pca_uses_l2_normalized_unwhitened_patch_scores(self):
+    def test_pca_uses_raw_patch_features_and_whitening(self):
         base = np.array([[1., 2., 1.], [2., 1., 1.], [1., 1., 3.], [3., 1., 2.]])
         patches = {
             "original": base,
@@ -79,28 +79,16 @@ class ImageNetVisualizationTest(unittest.TestCase):
         projected = viz.pca_triplet(tokens)
         scores = np.concatenate([projected[name] for name in viz.VIEW_NAMES])
         features = np.concatenate([patches[name] for name in viz.VIEW_NAMES])
-        normalized = features / np.linalg.norm(features, axis=1, keepdims=True)
-        centered = normalized - normalized.mean(axis=0, keepdims=True)
-        np.testing.assert_allclose(scores.mean(axis=0), 0, atol=1e-6)
-        np.testing.assert_allclose(scores @ scores.T, centered @ centered.T, atol=1e-6)
+        expected = viz.PCA(n_components=3, whiten=True, svd_solver="full").fit_transform(features)
+        np.testing.assert_allclose(scores @ scores.T, expected @ expected.T, atol=1e-5)
 
-    def test_pca_rgb_uses_one_scale_for_models_views_and_channels(self):
+    def test_pca_rgb_uses_sigmoid_mapping(self):
         scores = np.array([[4., .4, .04], [-4., -.4, -.04],
                            [2., .2, .02], [-2., -.2, -.02]])
-        maps = {
-            "iBOT": {view: scores for view in viz.VIEW_NAMES},
-            "Ours": {view: 2 * scores for view in viz.VIEW_NAMES},
-        }
-        with (
-            mock.patch.object(viz, "PCA_COLOR_PERCENTILE", 100),
-            mock.patch.object(viz, "VIS_RESOLUTION", 2),
-        ):
-            scale = viz.pca_color_scale(maps)
-            rgb = np.asarray(viz.pca_to_rgb(scores, grid=2, scale=scale))
-        self.assertEqual(scale, 8)
-        channel_ranges = np.ptp(rgb.reshape(-1, 3).astype(int), axis=0)
-        self.assertGreater(channel_ranges[0], channel_ranges[1])
-        self.assertGreater(channel_ranges[1], channel_ranges[2])
+        with mock.patch.object(viz, "VIS_RESOLUTION", 2):
+            rgb = np.asarray(viz.pca_to_rgb(scores, grid=2))
+        expected = (255 / (1 + np.exp(-viz.PCA_SIGMOID_GAIN * scores)))
+        np.testing.assert_array_equal(rgb.reshape(-1, 3), expected.astype(np.uint8))
 
     def test_correspondences_use_overlap_and_shared_region_labels(self):
         grid = 4
