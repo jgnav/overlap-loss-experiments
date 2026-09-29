@@ -29,6 +29,13 @@ EVALUATIONS = (
     ("pascal_voc_2shot", "evaluation.utils.pascal_voc_2shot", None),
     ("pascal_voc_5shot", "evaluation.utils.pascal_voc_5shot", None),
     ("coco_multilabel", "evaluation.utils.coco_multilabel", None),
+    ("visual_genome_multilabel", "evaluation.utils.visual_genome_multilabel", None),
+    ("spair_correspondence", "evaluation.utils.spair_correspondence", None),
+    ("navi_correspondence", "evaluation.utils.navi_correspondence", None),
+    ("scannet_correspondence", "evaluation.utils.scannet_correspondence", None),
+    ("davis_vos", "evaluation.utils.davis_vos", None),
+    ("youtube_vos_vos", "evaluation.utils.youtube_vos_vos", None),
+    ("mose_vos", "evaluation.utils.mose_vos", None),
 )
 
 
@@ -75,7 +82,7 @@ def _result_table(results):
             "dataset": "ImageNet-1K 100%", "task": "multiclass_classification",
             "linear": results["imagenet_linear"]["metrics"],
         })
-    for name in ("pascal_voc_1shot", "pascal_voc_2shot", "pascal_voc_5shot", "pascal_voc_multilabel", "coco_multilabel"):
+    for name in ("pascal_voc_1shot", "pascal_voc_2shot", "pascal_voc_5shot", "pascal_voc_multilabel", "coco_multilabel", "visual_genome_multilabel"):
         if name in results:
             result = results[name]
             table.append({
@@ -83,6 +90,14 @@ def _result_table(results):
                 "regime": name.removeprefix("pascal_voc_") if name.endswith("shot") else "full",
                 "linear": result["metrics"],
             })
+    for name in ("spair_correspondence", "navi_correspondence", "scannet_correspondence"):
+        if name in results:
+            table.append({"dataset": results[name]["dataset"], "task": results[name]["task"],
+                          "correspondence": results[name]["metrics"]})
+    for name in ("davis_vos", "youtube_vos_vos", "mose_vos"):
+        if name in results:
+            table.append({"dataset": results[name]["dataset"], "task": "video_object_segmentation",
+                          "mask_propagation": results[name]["metrics"]})
     return table
 
 
@@ -154,3 +169,23 @@ def _preflight_classification(args, evaluations):
             )
             if shot_counts:
                 sample_few_shot_indices([row[1] for row in samples["train"]], max(shot_counts), args.seed)
+
+
+def _preflight_benchmark_datasets(args, evaluations):
+    """Check selected correspondence/video roots before long linear probes."""
+    names = {name for name, _, _ in evaluations}
+    choices = {
+        "spair_correspondence": ("SPair-71k",),
+        "navi_correspondence": ("navi_v1",),
+        "scannet_correspondence": ("scannet_test_1500",),
+        "davis_vos": ("davis2017", "DAVIS2017", "DAVIS"),
+        "youtube_vos_vos": ("youtube_vos_2019", "YouTubeVOS2019", "YouTube-VOS"),
+        "mose_vos": ("mose", "MOSE", "MOSEv1"),
+    }
+    for evaluation_name, directories in choices.items():
+        if evaluation_name in names and not any(
+            (args.datasets_root / directory).is_dir() for directory in directories
+        ):
+            raise FileNotFoundError(
+                f"{evaluation_name} needs one of {directories} under {args.datasets_root}"
+            )

@@ -1,0 +1,278 @@
+"""DINO-style, training-free video mask propagation for CRISP's VOS table."""
+
+import json
+import time
+from collections import deque
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+import cv2
+from torchvision import transforms as T
+
+from evaluation.utils.common import (
+    base_parser, evaluation_identity, load_backbone, prepare_paths, print_progress,
+    utc_now, write_json,
+)
+from evaluation.vendor.davis.metrics import db_eval_boundary, db_eval_iou
+
+
+INPUT_SIZE = 480
+N_LAST_FRAMES = 7
+NEIGHBORHOOD = 12
+TOP_K = 5
+TEMPERATURE = 0.1
+NORMALIZE = T.Normalize((0.485, 0.456, 0.406), (0.228, 0.224, 0.225))
+
+
+def _paths(root, dataset_name):
+    choices = {
+        "davis": ("davis2017", "DAVIS2017", "DAVIS"),
+        "youtube_vos": ("youtube_vos_2019", "YouTubeVOS2019", "YouTube-VOS"),
+        "mose": ("mose", "MOSE", "MOSEv1"),
+    }[dataset_name]
+    for name in choices:
+        candidate = root / name
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(f"{dataset_name} directory missing under {root}; tried {choices}")
+
+
+def _layout(root, dataset_name):
+    if dataset_name == "davis":
+        image_root, mask_root = root / "JPEGImages/480p", root / "Annotations/480p"
+        split_file = root / "ImageSets/2017/val.txt"
+    else:
+        bases = (root / "valid", root / "val", root)
+        candidate = next((base for base in bases if (base / "JPEGImages").is_dir()), None)
+        if candidate is None:
+            raise FileNotFoundError(f"Missing JPEGImages directory under {root}")
+        image_root, mask_root = candidate / "JPEGImages", candidate / "Annotations"
+        split_file = next((path for path in (
+            candidate / "ImageSets/val.txt", candidate / "ImageSets/valid.txt",
+            root / "ImageSets/val.txt", root / "ImageSets/valid.txt",
+        ) if path.is_file()), None)
+    if not image_root.is_dir() or not mask_root.is_dir():
+        raise FileNotFoundError(f"Missing video RGB/annotation directories: {image_root}, {mask_root}")
+    if split_file is not None and split_file.is_file():
+        names = [line.strip() for line in split_file.read_text().splitlines() if line.strip()]
+    elif dataset_name == "davis":
+        raise FileNotFoundError(f"Missing official DAVIS 2017 validation list: {split_file}")
+    else:
+        names = sorted(path.name for path in image_root.iterdir() if path.is_dir())
+    if not names or len(set(names)) != len(names):
+        raise ValueError(f"Empty or duplicate video split: {root}")
+    return image_root, mask_root, names, split_file
+
+
+def _frames(folder):
+    files = sorted(path for path in folder.iterdir() if path.suffix.lower() in (".jpg", ".jpeg", ".png"))
+    if len(files) < 2:
+        raise ValueError(f"Video needs at least two frames: {folder}")
+    return files
+
+
+def _annotation(path):
+    with Image.open(path) as source:
+        return np.asarray(source).copy()
+
+
+def _read_image(path):
+    bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise ValueError(f"Cannot read video frame: {path}")
+    original_size = (bgr.shape[1], bgr.shape[0])
+    rgb = cv2.cvtColor(cv2.resize(bgr, (INPUT_SIZE, INPUT_SIZE)), cv2.COLOR_BGR2RGB)
+    return NORMALIZE(T.ToTensor()(rgb)), original_size
+
+
+@torch.no_grad()
+def _features(backbone, image, patch_size, registers):
+    layers = backbone.get_intermediate_layers(image[None], n=4)
+    height, width = image.shape[-2] // patch_size, image.shape[-1] // patch_size
+    representations = []
+    for layer in layers:
+        tokens = layer[:, 1:].float()
+        if tokens.shape[1] != height * width:
+            raise ValueError("Video feature grid does not match input/patch size")
+        representations.append(tokens[0].T.reshape(-1, height, width))
+    return F.normalize(torch.stack(representations).mean(0).flatten(1).T, dim=1), (height, width)
+
+
+def _one_hot_mask(mask, object_ids, grid, device):
+    labels = torch.as_tensor(mask.astype(np.int64), device=device)[None, None].float()
+    # Nearest labels prevent fractional IDs; classes follow the initial mask.
+    labels = F.interpolate(labels, size=grid, mode="nearest")[0, 0].long()
+    return torch.stack([(labels == label).float() for label in (0, *object_ids)], dim=0).flatten(1)
+
+
+def propagate_labels(target, sources, source_masks, grid,
+                     radius=NEIGHBORHOOD, topk=TOP_K, temperature=TEMPERATURE):
+    """DINO local top-k affinity over first and preceding frames."""
+    height, width = grid
+    count = height * width
+    if len(sources) != len(source_masks) or not sources:
+        raise ValueError("Source features/masks must be nonempty and aligned")
+    source = torch.cat(sources, dim=0)
+    masks = torch.cat(source_masks, dim=1)
+    if source.shape[0] != masks.shape[1] or target.shape[0] != count:
+        raise ValueError("Video source/target patch dimensions differ")
+    # Compute per-target affinities without materializing a 4-D mask.
+    y, x = torch.meshgrid(torch.arange(height, device=target.device),
+                          torch.arange(width, device=target.device), indexing="ij")
+    coordinates = torch.stack((y.flatten(), x.flatten()), dim=1)
+    result = torch.empty((masks.shape[0], count), device=target.device)
+    for start in range(0, count, 128):
+        end = min(count, start + 128)
+        similarity = target[start:end] @ source.T / temperature
+        target_points = coordinates[start:end]
+        source_points = coordinates.repeat(len(sources), 1)
+        nearby = (target_points[:, None, :] - source_points[None]).abs().amax(2) <= radius
+        similarity.masked_fill_(~nearby, float("-inf"))
+        values, indices = similarity.topk(min(topk, nearby.shape[1]), dim=1)
+        weights = values.softmax(1)
+        result[:, start:end] = (masks[:, indices] * weights[None]).sum(-1)
+    return result.reshape(1, masks.shape[0], height, width)
+
+
+def _prediction(probabilities, original_size, object_ids):
+    upsampled = F.interpolate(probabilities, size=(INPUT_SIZE, INPUT_SIZE), mode="bilinear", align_corners=False)[0]
+    # Match DINO's per-channel min/max normalization before the argmax.
+    flat = upsampled.flatten(1)
+    minimum, maximum = flat.min(1).values[:, None, None], flat.max(1).values[:, None, None]
+    normalized = torch.where(maximum > minimum, (upsampled - minimum) / (maximum - minimum).clamp_min(1e-9), upsampled)
+    labels = normalized.argmax(0).byte().cpu().numpy()
+    mapping = np.asarray((0, *object_ids), dtype=np.uint8)
+    native = Image.fromarray(mapping[labels]).resize(original_size, Image.Resampling.NEAREST)
+    return np.asarray(native)
+
+
+def _score_frame(predicted, truth, object_ids):
+    if predicted.shape != truth.shape:
+        raise ValueError("Predicted mask and ground truth have different sizes")
+    valid = truth != 255
+    scores = []
+    for object_id in object_ids:
+        gt, estimate = truth == object_id, predicted == object_id
+        scores.append((float(db_eval_iou(gt, estimate, ~valid)),
+                       float(db_eval_boundary(gt, estimate, ~valid))))
+    return scores
+
+
+def _score_video(backbone, metadata, frames, mask_folder, device, dataset_name):
+    first_path = mask_folder / f"{frames[0].stem}.png"
+    if not first_path.is_file():
+        raise FileNotFoundError(f"Initial object mask missing: {first_path}")
+    first_mask = _annotation(first_path)
+    object_ids = tuple(int(value) for value in np.unique(first_mask) if value not in (0, 255))
+    if not object_ids:
+        raise ValueError(f"Initial mask has no foreground objects: {first_path}")
+    frame, _ = _read_image(frames[0])
+    first_features, grid = _features(backbone, frame.to(device), metadata["patch_size"], metadata["num_register_tokens"])
+    first_probabilities = _one_hot_mask(first_mask, object_ids, grid, device)
+    history = deque(maxlen=N_LAST_FRAMES)
+    scores = {object_id: [] for object_id in object_ids}
+    scored_frames, missing_annotations = 0, []
+    for index, frame_path in enumerate(frames[1:], start=1):
+        frame, original_size = _read_image(frame_path)
+        target_features, target_grid = _features(backbone, frame.to(device), metadata["patch_size"], metadata["num_register_tokens"])
+        if target_grid != grid:
+            raise ValueError("Video grid changed between frames")
+        references = [(first_features, first_probabilities), *history]
+        propagated = propagate_labels(target_features, [item[0] for item in references],
+                                      [item[1] for item in references], grid)
+        # YouTube-VOS may introduce new objects after frame zero. Their first
+        # provided mask is an allowed reference, not a scored prediction.
+        annotation_path = mask_folder / f"{frame_path.stem}.png"
+        truth = _annotation(annotation_path) if annotation_path.is_file() else None
+        if truth is not None and dataset_name != "youtube_vos":
+            unexpected = set(np.unique(truth).tolist()) - {0, 255, *object_ids}
+            if unexpected:
+                raise ValueError(f"Unexpected object IDs {sorted(unexpected)} in {annotation_path}")
+        introduced = ()
+        if dataset_name == "youtube_vos" and truth is not None:
+            introduced = tuple(int(value) for value in np.unique(truth)
+                               if value not in (0, 255, *object_ids))
+            if introduced:
+                pad = (0, 0, 0, len(introduced))
+                first_probabilities = F.pad(first_probabilities, (0, 0, 0, len(introduced)))
+                history = deque(((features, F.pad(probs, pad)) for features, probs in history),
+                                maxlen=N_LAST_FRAMES)
+                next_probabilities = F.pad(propagated[0].flatten(1), pad)
+                truth_at_grid = torch.as_tensor(truth.astype(np.int64), device=device)[None, None].float()
+                truth_at_grid = F.interpolate(truth_at_grid, size=grid, mode="nearest")[0, 0].long().flatten()
+                for channel, object_id in enumerate(introduced, start=len(object_ids) + 1):
+                    pixels = truth_at_grid == object_id
+                    next_probabilities[:, pixels] = 0
+                    next_probabilities[channel, pixels] = 1
+                    scores[object_id] = []
+                object_ids = (*object_ids, *introduced)
+                propagated = next_probabilities.reshape(1, len(object_ids) + 1, *grid)
+        predicted = _prediction(propagated, original_size, object_ids)
+        evaluate_frame = not (dataset_name == "davis" and index == len(frames) - 1)
+        if evaluate_frame:
+            if truth is not None:
+                frame_scores = _score_frame(predicted, truth, object_ids)
+                for object_id, value in zip(object_ids, frame_scores):
+                    if object_id not in introduced:
+                        scores[object_id].append(value)
+                scored_frames += 1
+            else:
+                missing_annotations.append(frame_path.name)
+        history.append((target_features, propagated[0].flatten(1)))
+    if not scored_frames:
+        raise ValueError(f"No scored mask frames in {mask_folder}")
+    if dataset_name in ("davis", "mose") and missing_annotations:
+        raise FileNotFoundError(f"Missing validation masks in {mask_folder}: {missing_annotations[:5]}")
+    if dataset_name == "youtube_vos" and missing_annotations and scored_frames < 2:
+        raise ValueError(f"Too few labeled YouTube-VOS frames in {mask_folder}")
+    object_scores = {str(object_id): {"j": float(np.mean([score[0] for score in values])),
+                                      "f": float(np.mean([score[1] for score in values]))}
+                     for object_id, values in scores.items() if values}
+    return object_scores, {"frames": len(frames), "scored_frames": scored_frames,
+                           "missing_annotations": missing_annotations, "objects": list(object_ids)}
+
+
+def main(dataset_name):
+    evaluation_name = f"{dataset_name}_vos"
+    args = prepare_paths(base_parser(f"DINO-style {dataset_name} mask propagation").parse_args(), evaluation_name)
+    if not torch.cuda.is_available():
+        raise RuntimeError("Video mask propagation requires an NVIDIA GPU")
+    started, start_time = utc_now(), time.monotonic()
+    dataset_root = _paths(args.datasets_root, dataset_name)
+    image_root, mask_root, names, split_file = _layout(dataset_root, dataset_name)
+    backbone, metadata = load_backbone(args.checkpoint, args.checkpoint_key, args.arch)
+    device = torch.device("cuda:0")
+    backbone.to(device).eval()
+    all_objects, per_video = [], {}
+    with torch.inference_mode():
+        for index, name in enumerate(names, start=1):
+            frames = _frames(image_root / name)
+            object_scores, details = _score_video(backbone, metadata, frames, mask_root / name, device, dataset_name)
+            all_objects.extend(object_scores.values())
+            per_video[name] = {"objects": object_scores, **details}
+            print_progress(f"{dataset_name} video", index, len(names))
+    if not all_objects:
+        raise ValueError(f"No annotated objects in {dataset_name} evaluation")
+    j = 100 * float(np.mean([score["j"] for score in all_objects]))
+    f = 100 * float(np.mean([score["f"] for score in all_objects]))
+    metrics = {"j_and_f": (j + f) / 2, "j_mean": j, "f_mean": f}
+    write_json(args.result_json, {
+        "evaluation": evaluation_name, "task": "video_object_segmentation",
+        "dataset": {"davis": "DAVIS 2017 val", "youtube_vos": "YouTube-VOS 2019 val", "mose": "MOSE val"}[dataset_name],
+        "status": "completed", "started_at": started, "finished_at": utc_now(),
+        "elapsed_seconds": time.monotonic() - start_time,
+        "model": metadata, "evaluation_identity": evaluation_identity(args),
+        "protocol": {"source": "CRISP Appendix A.2 and DINO video mask propagation",
+                     "input_size": [INPUT_SIZE, INPUT_SIZE], "feature": "mean of last four LayerNorm-normalized patch-token blocks",
+                     "reference": "first annotated frame plus preceding seven propagated frames",
+                     "topk": TOP_K, "neighborhood_radius_patches": NEIGHBORHOOD,
+                     "temperature": TEMPERATURE, "split_list": str(split_file) if split_file else None,
+                     "dataset_root": str(dataset_root), "object_average": "mean over frame scores per object, then objects",
+                     "first_frame_scored": False, "davis_last_frame_scored": False,
+                     "youtube_new_objects": "first annotated appearance used as reference, excluded from its own score"},
+        "videos": per_video, "metrics": metrics,
+    })
+    print(f"Completed {evaluation_name}: {metrics}", flush=True)

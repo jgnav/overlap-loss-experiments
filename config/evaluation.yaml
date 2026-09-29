@@ -36,11 +36,18 @@ evaluations:
   cityscapes_linear: true
   imagenet_knn: true
 
-  imagenet_knn_1pct: false
+  imagenet_knn_1pct: true
   imagenet_knn_100pct: true
-  imagenet_linear: false
+  imagenet_linear: true
   pascal_voc_1shot: true
   pascal_voc_2shot: true
   pascal_voc_5shot: true
   pascal_voc_multilabel: true
   coco_multilabel: true
+  visual_genome_multilabel: true
+  spair_correspondence: true
+  navi_correspondence: true
+  scannet_correspondence: true
+  davis_vos: true
+  youtube_vos_vos: true
+  mose_vos: true

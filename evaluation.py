@@ -13,7 +13,7 @@ from evaluation.utils.config import config_snapshot, load_config
 from evaluation.utils.runtime import worker_environment
 from utils.wandb_logging import init_wandb_run, log_evaluation
 from evaluation.utils.orchestrator import (
-    EVALUATIONS, _load_completed_result, _preflight_classification, _safe_name, _write_summary,
+    EVALUATIONS, _load_completed_result, _preflight_classification, _preflight_benchmark_datasets, _safe_name, _write_summary,
     evaluation_command,
 )
 
@@ -33,6 +33,7 @@ def run_evaluations(args):
     evaluations = [item for item in EVALUATIONS if item[0] in args.evaluations]
     args.classification_manifests = classification_manifest_root(args)
     _preflight_classification(args, evaluations)
+    _preflight_benchmark_datasets(args, evaluations)
     if args.output_dir is None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         args.output_dir = REPO_ROOT / "output" / "evaluation" / f"{_safe_name(args.checkpoint.stem)}-{timestamp}"

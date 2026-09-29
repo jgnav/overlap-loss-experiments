@@ -15,3 +15,8 @@ cuml-cu12==24.6.1
 
 # COCO instance masks for composition_visualization.py
 pycocotools>=2.0.7
+
+# Released Probe3D NAVI reader and DAVIS boundary metric
+albumentations>=1.4,<2
+opencv-python-headless>=4.8,<5
+scikit-image>=0.21

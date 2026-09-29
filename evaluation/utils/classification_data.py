@@ -14,6 +14,7 @@ from torch.utils.data import Dataset, Subset
 MULTILABEL_DATASETS = {
     "pascal_voc": {"display_name": "PASCAL VOC", "num_classes": 20, "epochs": 500},
     "coco": {"display_name": "MS-COCO", "num_classes": 80, "epochs": 200},
+    "visual_genome": {"display_name": "Visual Genome VG500", "num_classes": 500, "epochs": 200},
 }
 VOC_SHOT_EVALUATIONS = {f"pascal_voc_{shots}shot": shots for shots in (1, 2, 5)}
 
@@ -149,6 +150,18 @@ def read_multilabel_manifest(path, datasets_root, dataset_name, num_classes):
             if not is_file:
                 raise FileNotFoundError(f"Manifest image does not exist: {image}")
             labels = row.get("labels")
+            positive_indices = row.get("positive_indices")
+            if labels is None and positive_indices is not None:
+                if (not isinstance(positive_indices, list)
+                        or any(type(index) is not int or not 0 <= index < num_classes
+                               for index in positive_indices)
+                        or len(set(positive_indices)) != len(positive_indices)):
+                    raise ValueError(f"{path}: positive_indices must be unique class indices in [0, {num_classes})")
+                labels = [0] * num_classes
+                for index in positive_indices:
+                    labels[index] = 1
+            elif positive_indices is not None:
+                raise ValueError(f"{path}: supply either labels or positive_indices, not both")
             if (not isinstance(labels, list) or len(labels) != num_classes
                     or any(value is not None and (type(value) is not int or value not in (0, 1))
                            for value in labels)):

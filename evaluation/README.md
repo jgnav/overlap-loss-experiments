@@ -345,7 +345,7 @@ evaluation directory; configure those paths separately.
 ### Selecting tasks and resuming evaluation
 
 Each entry under `evaluations` is a YAML boolean. The supplied config enables
-all fifteen tasks. Set unwanted tasks to `false`; omitted tasks are also
+all 22 main-result tasks. Set unwanted tasks to `false`; omitted tasks are also
 disabled. For example, replace that section with the following to run only
 ImageNet 10% k-NN and VOC 1-shot classification:
 
@@ -385,3 +385,96 @@ tasks that remain enabled.
 - [iBOT linear evaluator](https://github.com/bytedance/ibot/blob/main/evaluation/eval_linear.py)
   and [architecture-specific launcher](https://github.com/bytedance/ibot/blob/main/run.sh),
   used only for the explicitly identified choices not specified by CG-SSL/CRISP.
+
+## Paper main-result tables
+
+`config/evaluation.yaml` enables the 22 evaluations needed for Tables 1–5 of the
+current Region Consistency draft. One launch reads exactly one `checkpoint`
+and one `checkpoint_key`; the resulting `full_evaluation.json` groups all
+selected task outputs for that checkpoint. The three ViT sizes require
+separate launches with the checkpoint path changed between launches.
+
+| Draft table | Evaluation names | Reported fields |
+| --- | --- | --- |
+| 1, segmentation | `ade20k_*`, `pascal_voc_knn`, `pascal_voc_linear`, `cityscapes_*` | `miou_percent` |
+| 2, multilabel | `pascal_voc_{1,2,5}shot`, `pascal_voc_multilabel`, `coco_multilabel`, `visual_genome_multilabel` | `map_percent` |
+| 3, ImageNet | `imagenet_knn_1pct`, `imagenet_knn`, `imagenet_knn_100pct`, `imagenet_linear` | `top1` |
+| 4, correspondence | `spair_correspondence`, `navi_correspondence`, `scannet_correspondence` | viewpoint `d0/d1/d2/all`, rotation bins |
+| 5, video segmentation | `davis_vos`, `youtube_vos_vos`, `mose_vos` | `j_and_f`, `j_mean`, `f_mean` |
+
+The paper's Tables 2–5 report ViT-S; Table 1 reports all three sizes. For
+ViT-B/L, enable only the six Table 1 segmentation evaluations in a copy of
+the YAML. Use a separate launch for each checkpoint. Source tables contain published baselines from other methods;
+this suite computes the selected checkpoint's row and does not rerun those
+external models.
+
+### Added data inputs
+
+Visual Genome uses the **VG500** 500-category benchmark. Supply
+`<datasets_root>/evaluation_manifests/visual_genome.json` with the same JSON
+schema as VOC/COCO manifests: `dataset: visual_genome`, a nonempty `source`,
+500 ordered `classes`, and `train`/`val` rows containing `image`, `id`, and
+either 500-entry `labels` vectors (`0`, `1`, or `null`) or sparse
+`positive_indices` lists (other classes are negative). The exact VG500 split and image labels used by CRISP were not released in
+its paper. A reproducible public choice is the SSGRL VisualGenome-500 release:
+its `train_list_500.txt`, `test_list_500.txt`, and
+`vg_category_500_labels_index.json` are available in SSGRL's `data/VG` folder.
+Place the original Visual Genome images under
+`<datasets_root>/visual_genome/VG_100K` and `VG_100K_2`, then run:
+
+```bash
+python -m evaluation.prepare_visual_genome_manifest \
+  --datasets-root /path/to/datasets \
+  --annotations-dir /path/to/SSGRL/data/VG
+```
+
+The preparer maps the public **test** list to the manifest's evaluation split,
+uses all 500 class indices in their released order, and hashes the three
+annotation files. It fails on missing images or train/test overlap. Reuse the
+same generated manifest for every checkpoint. The classifier uses the frozen
+224-pixel, 200-epoch, global-batch-1024 linear protocol of CRISP's COCO probe.
+This public split is a concrete baseline, not a claim that it reproduces
+CRISP's unpublished VG500 image lists exactly.
+
+Correspondence inputs use the released Probe3D layouts:
+
+```text
+<datasets_root>/SPair-71k/{PairAnnotation,ImageAnnotation,JPEGImages,Segmentation}
+<datasets_root>/navi_v1/<object>/{wild_set,multiview_*}/...
+<datasets_root>/scannet_test_1500/{test.npz,intrinsics.npz,<scene>/...}
+```
+
+The SPair test split uses 800-pixel images without bounding-box crop, final
+patch tokens, PCK@0.1, and at most 200 seeded pairs per category and viewpoint
+level. NAVI uses its in-the-wild test pairs, 512-pixel bbox crop, 1,000
+ratio-ranked correspondences, and 2-cm 3D recall in four rotation bins.
+ScanNet uses released test pairs at 480 x 640, 1,000 correspondences, and
+10-pixel reprojection recall on Probe3D's quarter-resolution geometry grid.
+All three results include split and threshold metadata. Probe3D's published
+10-pixel cutoff is measured on that quarter-resolution ScanNet grid; the
+current draft should state this if those numbers are used in Table 4.
+
+Video inputs use standard validation layouts:
+
+```text
+<datasets_root>/davis2017/{ImageSets/2017/val.txt,JPEGImages/480p,Annotations/480p}
+<datasets_root>/youtube_vos_2019/valid/{JPEGImages,Annotations}
+<datasets_root>/mose/{JPEGImages,Annotations,ImageSets/val.txt}
+```
+
+Alternate capitalization for the top-level video directory is accepted.
+YouTube-VOS may use `val/` instead of `valid/`; a released validation mask
+package must be installed for local J/F scoring. For YouTube-VOS and MOSE,
+provide a standard `ImageSets/val.txt` list when possible; otherwise all
+sequence directories are evaluated and the selected names are recorded.
+Video propagation uses 480 x 480 inputs, the mean of the last four normalized
+patch-token blocks, first-frame reference plus seven past frames, radius 12,
+cosine temperature 0.1 and top-5 affinity, consistent with CRISP's feature
+choice and DINO's released propagation defaults. The boundary/region metrics
+come from the official DAVIS evaluator. Initial masks and DAVIS final-frame
+masks are excluded from scoring; labeled YouTube-VOS/MOSE frames are scored.
+For YouTube-VOS, a new object’s first annotated appearance becomes an
+additional reference and is excluded from that object’s own score. CRISP does
+not publish its exact video split lists or this detail of new-object handling,
+so published-score reproduction is not guaranteed; retain the saved
+split/protocol metadata with comparisons.
