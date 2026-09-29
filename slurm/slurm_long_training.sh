@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Submit small runs (tasks 0 and 3) on 3090, A100, or RTX Pro 6000:
 #   sbatch --array=0,3 slurm/slurm_long_training.sh
-# Submit base and large runs (tasks 1 and 2) on the larger-memory GPUs:
-#   sbatch --array=1-2 --partition=a100,rtx_pro6000_risk slurm/slurm_long_training.sh
+# Submit base and large runs (tasks 1 and 2), including RTX 3090 GPUs:
+#   sbatch --array=1-2 --partition=3090,3090_risk,a100,rtx_pro6000_risk slurm/slurm_long_training.sh
 
 #SBATCH --job-name=ibot-long
 #SBATCH --array=0-3

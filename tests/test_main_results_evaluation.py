@@ -107,6 +107,36 @@ class MainResultsEvaluationTest(unittest.TestCase):
         result = vos.propagate_labels(features, [features], [masks], (2, 2), radius=1, topk=1)
         torch.testing.assert_close(result[0].flatten(1), masks)
 
+    def test_video_preflight_rejects_first_frame_only_validation_masks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            images = root / "youtube_vos_2019/valid/JPEGImages/example"
+            masks = root / "youtube_vos_2019/valid/Annotations/example"
+            images.mkdir(parents=True)
+            masks.mkdir(parents=True)
+            (images.parent.parent / "meta.json").write_text(json.dumps({"videos": {
+                "example": {"objects": {"1": {"category": "dog", "frames": [
+                    "00000", "00001", "00002"]}}}}}))
+            for index in range(4):
+                (images / f"{index:05d}.jpg").touch()
+            (masks / "00000.png").touch()
+            with self.assertRaisesRegex(FileNotFoundError, "scoring mask missing"):
+                vos.preflight_masks(root, "youtube_vos")
+            (masks / "00001.png").touch()
+            with self.assertRaisesRegex(FileNotFoundError, "scoring mask missing"):
+                vos.preflight_masks(root, "youtube_vos")
+            (masks / "00002.png").touch()
+            vos.preflight_masks(root, "youtube_vos")
+
+    def test_youtube_metrics_balance_seen_and_unseen_objects(self):
+        videos = {"a": {"objects": {"1": {"category": "dog"}, "2": {"category": "novel"}}}}
+        per_video = {"a": {"objects": {"1": {"j": 0.8, "f": 0.6},
+                                         "2": {"j": 0.2, "f": 0.4}}}}
+        metrics = vos._youtube_metrics(per_video, videos)
+        self.assertAlmostEqual(metrics["j_seen"], 80)
+        self.assertAlmostEqual(metrics["f_unseen"], 40)
+        self.assertAlmostEqual(metrics["j_and_f"], 50)
+
     def test_video_sequence_uses_initial_mask_and_scores_later_frames(self):
         class PositionBackbone:
             def get_intermediate_layers(self, images, n=4):

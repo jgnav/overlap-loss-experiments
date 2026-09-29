@@ -25,6 +25,13 @@ NEIGHBORHOOD = 12
 TOP_K = 5
 TEMPERATURE = 0.1
 NORMALIZE = T.Normalize((0.485, 0.456, 0.406), (0.228, 0.224, 0.225))
+# Official YouTube-VOS 2019 scoring_program_release.zip/categories_list_seen.txt.
+YOUTUBE_SEEN_CATEGORIES = frozenset("""airplane ape bear bike bird boat bucket bus camel cat cow crocodile
+deer dog dolphin duck eagle earless_seal elephant fish fox frisbee frog giant_panda
+giraffe hand hat hedgehog horse knife leopard lion lizard monkey motorbike mouse
+owl paddle parachute parrot penguin person plant rabbit raccoon sedan shark sheep
+sign skateboard snail snake snowboard squirrel surfboard tennis_racket tiger toilet
+train truck turtle umbrella whale zebra""".split())
 
 
 def _paths(root, dataset_name):
@@ -72,6 +79,58 @@ def _frames(folder):
     if len(files) < 2:
         raise ValueError(f"Video needs at least two frames: {folder}")
     return files
+
+
+def _youtube_metadata(image_root, names):
+    path = image_root.parent / "meta.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"Official YouTube-VOS validation metadata missing: {path}")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    videos = document.get("videos") if isinstance(document, dict) else None
+    if not isinstance(videos, dict):
+        raise ValueError(f"Invalid YouTube-VOS validation metadata: {path}")
+    for name in names:
+        video = videos.get(name)
+        if not isinstance(video, dict) or not isinstance(video.get("objects"), dict) or not video["objects"]:
+            raise ValueError(f"Missing YouTube-VOS object metadata for {name}")
+        for object_id, info in video["objects"].items():
+            frames = info.get("frames") if isinstance(info, dict) else None
+            if (not object_id.isdecimal() or not info.get("category")
+                    or not isinstance(frames, list) or len(frames) < 2
+                    or any(not isinstance(frame, str) for frame in frames)
+                    or len(frames) != len(set(frames))):
+                raise ValueError(f"Invalid YouTube-VOS object metadata for {name}/{object_id}")
+    return videos
+
+
+def preflight_masks(root, dataset_name):
+    """Reject incomplete validation masks before starting long probe runs."""
+    dataset_root = _paths(root, dataset_name)
+    image_root, mask_root, names, _ = _layout(dataset_root, dataset_name)
+    youtube_videos = _youtube_metadata(image_root, names) if dataset_name == "youtube_vos" else None
+    for name in names:
+        frames = _frames(image_root / name)
+        masks = mask_root / name
+        frame_stems = {frame.stem for frame in frames}
+        first = masks / f"{frames[0].stem}.png"
+        if not first.is_file():
+            raise FileNotFoundError(f"Initial validation mask missing: {first}")
+        if youtube_videos is not None:
+            for object_id, info in youtube_videos[name]["objects"].items():
+                for frame_id in info["frames"]:
+                    if frame_id not in frame_stems:
+                        raise FileNotFoundError(f"YouTube-VOS frame {frame_id} missing for {name}/{object_id}")
+                    if not (masks / f"{frame_id}.png").is_file():
+                        raise FileNotFoundError(f"YouTube-VOS scoring mask missing: {masks / f'{frame_id}.png'}")
+        scored = frames[1:-1] if dataset_name == "davis" else frames[1:]
+        available = sum((masks / f"{frame.stem}.png").is_file() for frame in scored)
+        missing = len(scored) - available
+        if available == 0:
+            raise FileNotFoundError(f"No scoring masks in {masks}; first-frame masks alone cannot be scored offline")
+        if dataset_name in ("davis", "mose") and missing:
+            raise FileNotFoundError(f"{missing} validation scoring masks missing in {masks}")
+        if dataset_name == "youtube_vos" and missing and available < 2:
+            raise FileNotFoundError(f"Too few labeled YouTube-VOS scoring frames in {masks}")
 
 
 def _annotation(path):
@@ -149,19 +208,30 @@ def _prediction(probabilities, original_size, object_ids):
     return np.asarray(native)
 
 
-def _score_frame(predicted, truth, object_ids):
+def _score_frame(predicted, truth, object_ids, youtube_official=False):
     if predicted.shape != truth.shape:
         raise ValueError("Predicted mask and ground truth have different sizes")
     valid = truth != 255
     scores = []
     for object_id in object_ids:
         gt, estimate = truth == object_id, predicted == object_id
-        scores.append((float(db_eval_iou(gt, estimate, ~valid)),
-                       float(db_eval_boundary(gt, estimate, ~valid))))
+        if youtube_official:
+            # Official scorer computes J at native size and F after resizing
+            # the short side to 360 pixels, with no DAVIS void-pixel mask.
+            height, width = truth.shape
+            scale = 360 / min(height, width)
+            size = (int(width * scale), int(height * scale))
+            gt_boundary = np.asarray(Image.fromarray(gt).resize(size, Image.Resampling.NEAREST))
+            estimate_boundary = np.asarray(Image.fromarray(estimate).resize(size, Image.Resampling.NEAREST))
+            scores.append((float(db_eval_iou(gt, estimate)),
+                           float(db_eval_boundary(gt_boundary, estimate_boundary))))
+        else:
+            scores.append((float(db_eval_iou(gt, estimate, ~valid)),
+                           float(db_eval_boundary(gt, estimate, ~valid))))
     return scores
 
 
-def _score_video(backbone, metadata, frames, mask_folder, device, dataset_name):
+def _score_video(backbone, metadata, frames, mask_folder, device, dataset_name, video_metadata=None):
     first_path = mask_folder / f"{frames[0].stem}.png"
     if not first_path.is_file():
         raise FileNotFoundError(f"Initial object mask missing: {first_path}")
@@ -214,8 +284,13 @@ def _score_video(backbone, metadata, frames, mask_folder, device, dataset_name):
         evaluate_frame = not (dataset_name == "davis" and index == len(frames) - 1)
         if evaluate_frame:
             if truth is not None:
-                frame_scores = _score_frame(predicted, truth, object_ids)
-                for object_id, value in zip(object_ids, frame_scores):
+                scored_ids = object_ids
+                if video_metadata is not None:
+                    scored_ids = tuple(object_id for object_id in object_ids
+                                       if frame_path.stem in video_metadata["objects"][str(object_id)]["frames"][1:])
+                frame_scores = _score_frame(predicted, truth, scored_ids,
+                                            youtube_official=video_metadata is not None)
+                for object_id, value in zip(scored_ids, frame_scores):
                     if object_id not in introduced:
                         scores[object_id].append(value)
                 scored_frames += 1
@@ -235,6 +310,25 @@ def _score_video(backbone, metadata, frames, mask_folder, device, dataset_name):
                            "missing_annotations": missing_annotations, "objects": list(object_ids)}
 
 
+def _youtube_metrics(per_video, videos):
+    groups = {"seen": [], "unseen": []}
+    for name, details in per_video.items():
+        for object_id, scores in details["objects"].items():
+            category = videos[name]["objects"][object_id]["category"]
+            group = "seen" if category in YOUTUBE_SEEN_CATEGORIES else "unseen"
+            groups[group].append(scores)
+    if not groups["seen"] or not groups["unseen"]:
+        raise ValueError("YouTube-VOS official scoring requires seen and unseen objects")
+    metrics = {}
+    for group, scores in groups.items():
+        metrics[f"j_{group}"] = 100 * float(np.mean([score["j"] for score in scores]))
+        metrics[f"f_{group}"] = 100 * float(np.mean([score["f"] for score in scores]))
+    metrics["j_mean"] = (metrics["j_seen"] + metrics["j_unseen"]) / 2
+    metrics["f_mean"] = (metrics["f_seen"] + metrics["f_unseen"]) / 2
+    metrics["j_and_f"] = (metrics["j_mean"] + metrics["f_mean"]) / 2
+    return metrics
+
+
 def main(dataset_name):
     evaluation_name = f"{dataset_name}_vos"
     args = prepare_paths(base_parser(f"DINO-style {dataset_name} mask propagation").parse_args(), evaluation_name)
@@ -243,6 +337,8 @@ def main(dataset_name):
     started, start_time = utc_now(), time.monotonic()
     dataset_root = _paths(args.datasets_root, dataset_name)
     image_root, mask_root, names, split_file = _layout(dataset_root, dataset_name)
+    preflight_masks(args.datasets_root, dataset_name)
+    youtube_videos = _youtube_metadata(image_root, names) if dataset_name == "youtube_vos" else None
     backbone, metadata = load_backbone(args.checkpoint, args.checkpoint_key, args.arch)
     device = torch.device("cuda:0")
     backbone.to(device).eval()
@@ -250,15 +346,19 @@ def main(dataset_name):
     with torch.inference_mode():
         for index, name in enumerate(names, start=1):
             frames = _frames(image_root / name)
-            object_scores, details = _score_video(backbone, metadata, frames, mask_root / name, device, dataset_name)
+            object_scores, details = _score_video(backbone, metadata, frames, mask_root / name, device,
+                                                  dataset_name, youtube_videos[name] if youtube_videos else None)
             all_objects.extend(object_scores.values())
             per_video[name] = {"objects": object_scores, **details}
             print_progress(f"{dataset_name} video", index, len(names))
     if not all_objects:
         raise ValueError(f"No annotated objects in {dataset_name} evaluation")
-    j = 100 * float(np.mean([score["j"] for score in all_objects]))
-    f = 100 * float(np.mean([score["f"] for score in all_objects]))
-    metrics = {"j_and_f": (j + f) / 2, "j_mean": j, "f_mean": f}
+    if youtube_videos is not None:
+        metrics = _youtube_metrics(per_video, youtube_videos)
+    else:
+        j = 100 * float(np.mean([score["j"] for score in all_objects]))
+        f = 100 * float(np.mean([score["f"] for score in all_objects]))
+        metrics = {"j_and_f": (j + f) / 2, "j_mean": j, "f_mean": f}
     write_json(args.result_json, {
         "evaluation": evaluation_name, "task": "video_object_segmentation",
         "dataset": {"davis": "DAVIS 2017 val", "youtube_vos": "YouTube-VOS 2019 val", "mose": "MOSE val"}[dataset_name],
@@ -272,7 +372,8 @@ def main(dataset_name):
                      "temperature": TEMPERATURE, "split_list": str(split_file) if split_file else None,
                      "dataset_root": str(dataset_root), "object_average": "mean over frame scores per object, then objects",
                      "first_frame_scored": False, "davis_last_frame_scored": False,
-                     "youtube_new_objects": "first annotated appearance used as reference, excluded from its own score"},
+                     "youtube_new_objects": "first annotated appearance used as reference, excluded from its own score",
+                     "youtube_scoring": "official meta.json object frames, 360-pixel boundary F, seen/unseen four-metric mean" if youtube_videos else None},
         "videos": per_video, "metrics": metrics,
     })
     print(f"Completed {evaluation_name}: {metrics}", flush=True)

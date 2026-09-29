@@ -408,6 +408,17 @@ the YAML. Use a separate launch for each checkpoint. Source tables contain publi
 this suite computes the selected checkpoint's row and does not rerun those
 external models.
 
+For a run using the inputs currently available without dataset access approval,
+use `config/evaluation_public.yaml` with `slurm/evaluation.sh`. It enables 19
+tasks, saves into a stable output directory for resume after Slurm's time
+limit, and leaves ScanNet, YouTube-VOS and MOSE disabled. The full
+`config/evaluation.yaml` keeps all 22 tasks selected; its video preflight checks
+that scoring masks exist before any long probe begins.
+`slurm/prepare_offline_evaluation_data.sh` fetches the public DAVIS, NAVI and
+Visual Genome inputs. `slurm/prepare_youtube_vos_data.sh` can fetch the official
+YouTube-VOS validation archive when Google Drive permits it, but its completion
+alone does not establish that the scoring masks are present.
+
 ### Added data inputs
 
 Visual Genome uses the **VG500** 500-category benchmark. Supply
@@ -444,6 +455,12 @@ Correspondence inputs use the released Probe3D layouts:
 <datasets_root>/scannet_test_1500/{test.npz,intrinsics.npz,<scene>/...}
 ```
 
+After extracting NAVI, run `python -m evaluation.prepare_navi
+<datasets_root>/navi_v1 --workers 8` (or `sbatch
+slurm/prepare_navi_downsampled.sh`). The released Probe3D reader requires
+`downsampled_` RGB/depth files made with its 1024-pixel resize recipe; the
+original NAVI archive has only the source files.
+
 The SPair test split uses 800-pixel images without bounding-box crop, final
 patch tokens, PCK@0.1, and at most 200 seeded pairs per category and viewpoint
 level. NAVI uses its in-the-wild test pairs, 512-pixel bbox crop, 1,000
@@ -463,8 +480,10 @@ Video inputs use standard validation layouts:
 ```
 
 Alternate capitalization for the top-level video directory is accepted.
-YouTube-VOS may use `val/` instead of `valid/`; a released validation mask
-package must be installed for local J/F scoring. For YouTube-VOS and MOSE,
+YouTube-VOS may use `val/` instead of `valid/`; its `meta.json` and complete
+validation scoring masks must be installed for offline J/F scoring. The
+preflight rejects the usual first-frame-only validation release. For
+YouTube-VOS and MOSE,
 provide a standard `ImageSets/val.txt` list when possible; otherwise all
 sequence directories are evaluated and the selected names are recorded.
 Video propagation uses 480 x 480 inputs, the mean of the last four normalized
@@ -474,7 +493,9 @@ choice and DINO's released propagation defaults. The boundary/region metrics
 come from the official DAVIS evaluator. Initial masks and DAVIS final-frame
 masks are excluded from scoring; labeled YouTube-VOS/MOSE frames are scored.
 For YouTube-VOS, a new object’s first annotated appearance becomes an
-additional reference and is excluded from that object’s own score. CRISP does
+additional reference and is excluded from that object’s own score. The
+YouTube-VOS score uses the official metadata's object frame lists, the
+360-pixel boundary protocol, and the mean of seen/unseen J/F groups. CRISP does
 not publish its exact video split lists or this detail of new-object handling,
 so published-score reproduction is not guaranteed; retain the saved
 split/protocol metadata with comparisons.

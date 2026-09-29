@@ -33,7 +33,7 @@ teacher_temp: 0.07
 teacher_patch_temp: 0.07
 
 # Fresh post-pretraining stage
-additional_epochs: 200
+additional_epochs: 50
 gpu_count: 8
 batch_size_per_gpu: 32
 seed: 0
@@ -74,6 +74,6 @@ online_probe_gpu: null
 wandb_mode: online
 wandb_project: ibot-imagenet1k
 wandb_entity: null
-wandb_run_name: ibot-200e-vit-large-region
+wandb_run_name: ibot-50e-vit-large-region
 wandb_run_id: null
 wandb_resume: null

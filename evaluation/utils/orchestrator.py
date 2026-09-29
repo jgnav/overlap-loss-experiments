@@ -172,7 +172,7 @@ def _preflight_classification(args, evaluations):
 
 
 def _preflight_benchmark_datasets(args, evaluations):
-    """Check selected correspondence/video roots before long linear probes."""
+    """Check selected correspondence/video inputs before long linear probes."""
     names = {name for name, _, _ in evaluations}
     choices = {
         "spair_correspondence": ("SPair-71k",),
@@ -189,3 +189,9 @@ def _preflight_benchmark_datasets(args, evaluations):
             raise FileNotFoundError(
                 f"{evaluation_name} needs one of {directories} under {args.datasets_root}"
             )
+    video_names = {"davis_vos": "davis", "youtube_vos_vos": "youtube_vos", "mose_vos": "mose"}
+    if names.intersection(video_names):
+        from evaluation.utils.video_segmentation import preflight_masks
+        for evaluation_name, dataset_name in video_names.items():
+            if evaluation_name in names:
+                preflight_masks(args.datasets_root, dataset_name)

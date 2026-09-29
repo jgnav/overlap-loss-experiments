@@ -1,3 +1,5 @@
+# Public-input subset of evaluation.yaml. The three disabled tasks require
+# unavailable validation ground truth or ScanNet access.
 # Paths are relative to this YAML file; absolute paths and ~ also work.
 checkpoint: ../output/ablation/83650_0/checkpoint.pth
 checkpoint_key: teacher  # teacher or student
@@ -5,10 +7,9 @@ arch: auto              # auto, vit_small, vit_base, vit_large
 datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
 classification_manifests: null  # null = datasets_root/evaluation_manifests
 
-# null creates output/evaluation/<checkpoint-name>-<timestamp>/ for each launch.
-# Keep null for independent evaluations to avoid overwriting another run.
-# Set an existing run directory to resume its compatible completed evaluations.
-output_dir: null
+# Stable directory lets a later Slurm allocation reuse compatible completed
+# tasks if the 10-hour job limit interrupts this 19-task run.
+output_dir: ../output/evaluation/public-83650-epoch50
 result_json: null  # null = output_dir/full_evaluation.json
 
 seed: 0
@@ -47,7 +48,7 @@ evaluations:
   visual_genome_multilabel: true
   spair_correspondence: true
   navi_correspondence: true
-  scannet_correspondence: true
+  scannet_correspondence: false
   davis_vos: true
-  youtube_vos_vos: true
-  mose_vos: true
+  youtube_vos_vos: false
+  mose_vos: false
