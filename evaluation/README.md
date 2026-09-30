@@ -400,7 +400,8 @@ separate launches with the checkpoint path changed between launches.
 | 2, multilabel | `pascal_voc_{1,2,5}shot`, `pascal_voc_multilabel`, `coco_multilabel`, `visual_genome_multilabel` | `map_percent` |
 | 3, ImageNet | `imagenet_knn_1pct`, `imagenet_knn`, `imagenet_knn_100pct`, `imagenet_linear` | `top1` |
 | 4, correspondence | `spair_correspondence`, `navi_correspondence`, `scannet_correspondence` | viewpoint `d0/d1/d2/all`, rotation bins |
-| 5, video segmentation | `davis_vos`, `youtube_vos_vos`, `mose_vos` | `j_and_f`, `j_mean`, `f_mean` |
+| 5, video segmentation | `davis_vos`, `youtube_vos_vos` | `j_and_f`, `j_mean`, `f_mean` |
+| MOSEv2 submission export | `mose_vos` | indexed PNG masks and submission ZIP; scores pending external evaluation |
 
 The paper's Tables 2–5 report ViT-S; Table 1 reports all three sizes. For
 ViT-B/L, enable only the six Table 1 segmentation evaluations in a copy of
@@ -409,11 +410,14 @@ this suite computes the selected checkpoint's row and does not rerun those
 external models.
 
 For a run using the inputs currently available without dataset access approval,
-use `config/evaluation_public.yaml` with `slurm/evaluation.sh`. It enables 19
+use `config/evaluation_public.yaml` with `slurm/evaluation.sh`. It enables 21
 tasks, saves into a stable output directory for resume after Slurm's time
-limit, and leaves ScanNet, YouTube-VOS and MOSE disabled. The full
-`config/evaluation.yaml` keeps all 22 tasks selected; its video preflight checks
-that scoring masks exist before any long probe begins.
+limit, and leaves ScanNet disabled until its prepared test-pair dataset is available.
+YouTube-VOS validation has full scoring annotations. MOSEv2 uses first-frame
+initialization masks and exports predictions for manual server submission.
+The full `config/evaluation.yaml` keeps all 22 tasks selected; its video preflight
+checks scoring masks for DAVIS/YouTube-VOS and initialization masks plus official
+video/frame metadata for MOSEv2 before any long probe begins.
 `slurm/prepare_offline_evaluation_data.sh` fetches the public DAVIS, NAVI and
 Visual Genome inputs. `slurm/prepare_youtube_vos_data.sh` can fetch the official
 YouTube-VOS validation archive when Google Drive permits it, but its completion
@@ -476,22 +480,38 @@ Video inputs use standard validation layouts:
 ```text
 <datasets_root>/davis2017/{ImageSets/2017/val.txt,JPEGImages/480p,Annotations/480p}
 <datasets_root>/youtube_vos_2019/valid/{JPEGImages,Annotations}
-<datasets_root>/mose/{JPEGImages,Annotations,ImageSets/val.txt}
+<datasets_root>/MOSEv2/valid/{JPEGImages,Annotations}
+<datasets_root>/MOSEv2/meta_valid.json
 ```
 
-Alternate capitalization for the top-level video directory is accepted.
+For the local YouTube-VOS 2019 and MOSEv2 archives in `datasets_root/raw`, run
+`sbatch slurm/prepare_downloaded_vos.sh`. This verifies the published MOSEv2
+SHA-256 checksums, extracts the nested YouTube-VOS releases, and joins the
+two-part all-frame archives before extraction. It writes YouTube-VOS to
+`youtube_vos_2019/` and MOSEv2 to `MOSEv2/`, retaining the original downloads.
+The all-frame YouTube-VOS RGB releases, released test ground truth, and scoring
+program are kept separately from the validation split. MOSEv2 sample predictions
+are never installed as ground truth. The preparation inventory is written to
+`downloads/prepared_vos/preparation_report.json`; its `offline_scoring_ready`
+field distinguishes extraction completeness from availability of scoring masks.
+MOSEv2 is kept separate from MOSEv1 and its results are labeled `MOSEv2 val`.
+The `mose_vos` worker now exports predictions instead of computing offline metrics.
+
+Alternate capitalization for the DAVIS/YouTube-VOS top-level directory is accepted.
 YouTube-VOS may use `val/` instead of `valid/`; its `meta.json` and complete
 validation scoring masks must be installed for offline J/F scoring. The
 preflight rejects the usual first-frame-only validation release. For
-YouTube-VOS and MOSE,
+YouTube-VOS,
 provide a standard `ImageSets/val.txt` list when possible; otherwise all
 sequence directories are evaluated and the selected names are recorded.
+MOSEv2 requires the complete validation RGB split listed in `meta_valid.json`
+and its first-frame masks. Later masks are not required or used as ground truth.
 Video propagation uses 480 x 480 inputs, the mean of the last four normalized
 patch-token blocks, first-frame reference plus seven past frames, radius 12,
 cosine temperature 0.1 and top-5 affinity, consistent with CRISP's feature
 choice and DINO's released propagation defaults. The boundary/region metrics
 come from the official DAVIS evaluator. Initial masks and DAVIS final-frame
-masks are excluded from scoring; labeled YouTube-VOS/MOSE frames are scored.
+masks are excluded from scoring; labeled YouTube-VOS frames are scored.
 For YouTube-VOS, a new object’s first annotated appearance becomes an
 additional reference and is excluded from that object’s own score. The
 YouTube-VOS score uses the official metadata's object frame lists, the
@@ -499,3 +519,17 @@ YouTube-VOS score uses the official metadata's object frame lists, the
 not publish its exact video split lists or this detail of new-object handling,
 so published-score reproduction is not guaranteed; retain the saved
 split/protocol metadata with comparisons.
+
+For MOSEv2, each run writes native-resolution, palette-indexed PNG masks to
+`<evaluation-output>/mose_vos/Annotations/<video>/<frame>.png`. Object IDs and
+the initialization palette are preserved. The initialization mask is included
+as frame zero, followed by predictions for every RGB frame, including the last.
+The worker also creates
+`<evaluation-output>/mose_vos/mosev2_valid_submission.zip`, containing
+`<video>/<frame>.png` directly at the ZIP root, matching the official sample
+submission. Upload this ZIP manually to the
+[MOSEv2 evaluation server](https://www.codabench.org/competitions/10062/).
+The result JSON records export paths/counts and
+`metrics_status: pending_external_evaluation`; J/F entries are `null` until
+scored externally. A completed export is reused only while its submission ZIP
+still exists. Submission is not automatic.

@@ -50,4 +50,4 @@ evaluations:
   scannet_correspondence: true
   davis_vos: true
   youtube_vos_vos: true
-  mose_vos: true
+  mose_vos: true  # MOSEv2 prediction export; scores come from the evaluation server.

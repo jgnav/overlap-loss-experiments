@@ -3,6 +3,7 @@
 import json
 import re
 import sys
+from pathlib import Path
 
 from evaluation.utils.common import (
     checkpoint_fingerprint,
@@ -147,6 +148,12 @@ def _load_completed_result(path, args, evaluation_name):
         or result.get("evaluation_identity") != evaluation_identity(args)
     ):
         return None
+    if evaluation_name == "mose_vos":
+        export = result.get("prediction_export") or {}
+        if (result.get("dataset") != "MOSEv2 val"
+                or result.get("metrics_status") != "pending_external_evaluation"
+                or not export.get("archive") or not Path(export["archive"]).is_file()):
+            return None
     return result
 
 
@@ -180,7 +187,7 @@ def _preflight_benchmark_datasets(args, evaluations):
         "scannet_correspondence": ("scannet_test_1500",),
         "davis_vos": ("davis2017", "DAVIS2017", "DAVIS"),
         "youtube_vos_vos": ("youtube_vos_2019", "YouTubeVOS2019", "YouTube-VOS"),
-        "mose_vos": ("mose", "MOSE", "MOSEv1"),
+        "mose_vos": ("MOSEv2",),
     }
     for evaluation_name, directories in choices.items():
         if evaluation_name in names and not any(

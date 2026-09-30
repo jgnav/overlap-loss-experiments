@@ -1,5 +1,5 @@
-# Public-input subset of evaluation.yaml. The three disabled tasks require
-# unavailable validation ground truth or ScanNet access.
+# Public-input subset of evaluation.yaml. ScanNet is disabled until its
+# prepared test-pair dataset is available. MOSEv2 exports masks for submission.
 # Paths are relative to this YAML file; absolute paths and ~ also work.
 checkpoint: ../output/ablation/83650_0/checkpoint.pth
 checkpoint_key: teacher  # teacher or student
@@ -8,7 +8,7 @@ datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
 classification_manifests: null  # null = datasets_root/evaluation_manifests
 
 # Stable directory lets a later Slurm allocation reuse compatible completed
-# tasks if the 10-hour job limit interrupts this 19-task run.
+# tasks if the 10-hour job limit interrupts this 21-task run.
 output_dir: ../output/evaluation/public-83650-epoch50
 result_json: null  # null = output_dir/full_evaluation.json
 
@@ -50,5 +50,5 @@ evaluations:
   navi_correspondence: true
   scannet_correspondence: false
   davis_vos: true
-  youtube_vos_vos: false
-  mose_vos: false
+  youtube_vos_vos: true
+  mose_vos: true  # MOSEv2 prediction export; no offline J/F scores.
