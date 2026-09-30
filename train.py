@@ -22,6 +22,7 @@ from data import DataAugmentationiBOT, ImageFolderMask
 from losses import iBOTLoss
 from losses.region_loss import RegionLoss
 from losses.local_region_loss import validate_local_region_settings
+from losses.region_ordering_loss import validate_loss_modality
 from model import create_model, iBOTHead
 from utils import training as utils
 from utils.checkpoint import (
@@ -109,6 +110,9 @@ def load_config(path):
     validate_local_region_settings(
         config["include_local_crops"], config["region_aggregation"], config["region_normalization"]
     )
+    validate_loss_modality(config["loss_modality"], config["region_aggregation"],
+                           config["region_normalization"], threshold,
+                           config["global_crops_number"], config["local_crops_number"])
     if config["include_local_crops"] and (
         config["global_crops_number"] != 2 or config["local_crops_number"] <= 0
     ):
@@ -364,7 +368,7 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
         args.local_crops_number,
         args.global_crop_size,
         args.local_crop_size,
-        include_local_crops=args.include_local_crops,
+        include_local_crops=args.include_local_crops or args.loss_modality == "within_image",
     )
     dataset = ImageFolderMask(
         args.data_path,
@@ -476,6 +480,8 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
         mim_start_epoch=args.pred_start_epoch,
         region_depths=region_depths,
         include_local_crops=args.include_local_crops,
+        loss_modality=args.loss_modality,
+        ordering_seed=args.seed,
     ).cuda()
 
     writer = None
@@ -932,7 +938,7 @@ def train_one_epoch(
             student_local_cls = student_local_output[0] if student_local_output is not None else None
             student_local_patch_logits = (
                 student_local_output[1]
-                if student_local_output is not None and ibot_loss.include_local_crops and ibot_loss.lambda3 != 0
+                if student_local_output is not None and ibot_loss.needs_local_patch_logits and ibot_loss.lambda3 != 0
                 else None
             )
             del student_local_output

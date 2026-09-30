@@ -1,11 +1,11 @@
 #!/bin/bash
 # Submit from the repository root in two stages:
 #   first=$(sbatch --parsable --job-name=ablation-core --array=0-8 slurm/slurm_ablation.sh)
-#   sbatch --job-name=ablation-rest --array=9-23 --dependency="after:${first}" slurm/slurm_ablation.sh
+#   sbatch --job-name=ablation-rest --array=9-25 --dependency="after:${first}" slurm/slurm_ablation.sh
 # The second array becomes eligible when all first-stage tasks have started.
 
 #SBATCH --job-name=ablation
-#SBATCH --array=0-23
+#SBATCH --array=0-25
 #SBATCH --partition=3090_risk,a100,rtx_pro6000_risk
 #SBATCH --exclude=aisurrey37
 #SBATCH --nodes=1
@@ -51,6 +51,8 @@ configs=(
     shared_head_false
     region_normalization_deep
     include_local_crops_true
+    loss_modality_cross_image
+    loss_modality_within_image
 )
 
 if (( SLURM_ARRAY_TASK_ID < 0 || SLURM_ARRAY_TASK_ID >= ${#configs[@]} )); then

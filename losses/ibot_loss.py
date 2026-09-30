@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from .region_loss import RegionLoss
 from .local_region_loss import global_local_region_loss, validate_local_region_settings
 from .koleo_loss import KoLeoLoss
+from .region_ordering_loss import RegionOrderingLoss, ORDERING_WEIGHT, validate_loss_modality
 
 
 class iBOTLoss(nn.Module):
@@ -38,6 +39,8 @@ class iBOTLoss(nn.Module):
         region_aggregation="mean",
         region_depths=(),
         include_local_crops=False,
+        loss_modality="standard",
+        ordering_seed=0,
     ):
         super().__init__()
         self.student_temp = student_temp
@@ -55,6 +58,12 @@ class iBOTLoss(nn.Module):
         if include_local_crops and (ngcrops != 2 or nlcrops <= 0):
             raise ValueError("include_local_crops requires two global crops and at least one local crop")
         self.include_local_crops = include_local_crops
+        validate_loss_modality(loss_modality, region_aggregation, region_normalization,
+                               region_patch_threshold, ngcrops, nlcrops)
+        self.loss_modality = loss_modality
+        self.ordering_loss = (RegionOrderingLoss(loss_modality, student_temp, ordering_seed, region_min_area)
+                              if loss_modality != "standard" else None)
+        self.needs_local_patch_logits = include_local_crops or loss_modality == "within_image"
         self.region_depths = tuple(region_depths)
         self.deep_region = region_normalization == "deep"
         if self.deep_region:
@@ -381,6 +390,21 @@ class iBOTLoss(nn.Module):
             region_active = zero.new_ones(())
             objective = total_loss1 + total_loss2 + total_loss3
 
+        ordering_stats = None
+        ordering_raw = zero
+        ordering = zero
+        if self.ordering_loss is not None and self.lambda3 != 0:
+            if self.loss_modality == "within_image" and student_local_patch_logits is None:
+                raise ValueError("Ordering loss_modality requires student local patch logits")
+            ordering_stats = self.ordering_loss(
+                (raw_student_patch_c + student_local_patch_logits.chunk(self.nlcrops)
+                 if self.loss_modality == "within_image" else raw_student_patch_c),
+                teacher_patch_c, crop_boxes,
+            )
+            ordering_raw = ordering_stats["loss"]
+            ordering = ORDERING_WEIGHT * ordering_raw
+            objective = objective + ordering
+
         if self.koleo_regularizer:
             if (
                 student_cls_features is None
@@ -447,6 +471,16 @@ class iBOTLoss(nn.Module):
                 for name in ("global_global_loss", "global_local_loss",
                              "global_local_valid_ratio", "global_local_pairs_per_image")
             })
+        if self.ordering_loss is not None:
+            total_loss.update({
+                "region_ordering": ordering,
+                "region_ordering_raw": ordering_raw,
+                "region_ordering_weight": zero.new_tensor(ORDERING_WEIGHT),
+                "region_ordering_active": zero.new_tensor(float(ordering_stats is not None)),
+            })
+            if ordering_stats is not None:
+                total_loss.update({f"region_ordering_{name}": value.detach()
+                                   for name, value in ordering_stats.items() if name != "loss"})
         return total_loss
 
     @torch.no_grad()

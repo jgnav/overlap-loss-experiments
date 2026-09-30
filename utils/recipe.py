@@ -22,6 +22,7 @@ COMMON_IBOT_RECIPE = {
     "region_normalization": "softmax",
     "region_aggregation": "mean",
     "include_local_crops": False,
+    "loss_modality": "standard",
     "ibot_plus_plus": False,
     "koleo_regularizer": False,
     "register_warmup_epochs": 0,

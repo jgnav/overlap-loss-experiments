@@ -171,6 +171,80 @@ Logs include `region_global_global_loss`, `region_global_local_loss`,
 `region_global_local_valid_ratio` and `region_global_local_pairs_per_image`.
 Changing this flag requires a new continuation rather than exact resume.
 
+`loss_modality: standard` preserves the existing objective. The two ordering
+ablations change this selector and set `batch_size_per_gpu: 48` from `config/train.yaml`:
+
+- `config/ablations/loss_modality_cross_image.yaml`: add ordering against teacher
+  global/global overlap regions from other images in the distributed minibatch,
+  with exactly one physical region per eligible image.
+- `config/ablations/loss_modality_within_image.yaml`: add ordering against every
+  other distinct eligible teacher region from the query image.
+
+Both keep DINO, ordinary iBOT and the original regional loss unchanged, including
+`lambda3: 0.4`, the source checkpoint, seed and 50-epoch continuation protocol.
+Their objective is `L_DINO + L_iBOT + 0.4 L_region + 0.1 L_ordering`; the auxiliary
+coefficient is fixed in code. Ordering requires mean aggregation, centering,
+`region_patch_threshold: 1.0`, and two globals. Within-image ordering additionally
+requires at least two locals. Teacher patch
+probabilities reuse the ordinary centered iBOT targets; student patches use
+their ordinary `student_temp` softmax, without teacher centering. The separate
+`include_local_crops` flag keeps controlling the original regional CE branch;
+within-image ordering automatically records all crop boxes and uses the existing
+student local patch outputs, without changing that flag or adding backbone passes.
+Cross-image ordering uses only global patch outputs and global geometry.
+
+Cross-image ordering constructs only the intersection of the two global crops,
+as in the standard region loss, and retains `region_min_area`. Each eligible
+image supplies two cross-view queries and one detached teacher reference,
+using the covering global with the most fully contained patches (ties choose
+global 0). Both global grids must contain at least four selected patches.
+Each query uses the one region from every other eligible image across all GPUs,
+in a seeded shuffled order. Thus a minibatch with B eligible images provides
+B - 1 references per query; with fewer than two references, skip ordering.
+Local crops cannot change its regions, reference bank or ordering loss.
+
+Within-image ordering enumerates global/global, global/local and local/local intersections in original
+image coordinates, including flips. Deduplicate references by their exact
+physical rectangle. A region must be fully covered by a global teacher crop
+and have at least four fully contained patches in the teacher and both crop
+views that define it. Small ordering regions use this patch-count criterion,
+not `region_min_area`; the original regional loss retains its existing filter.
+For each reference, use the covering global teacher with the most selected
+patches (ties choose global 0). Global/global gives both cross-view directions;
+global/local uses the paired teacher-global to student-local (keeping both
+global teacher contexts when they cover the same region); local/local uses the best
+covering global teacher to each participating student local. Duplicate physical
+region/direction queries are counted once, with GG, then GL, then LL precedence.
+Regions outside both global teachers are excluded; no local teacher pass is used.
+
+For a within-image query with M other distinct regions, use all M references
+within that image and skip if M < 2. It does not depend on external images and
+can run with a single image in the minibatch. The two modalities now have
+different query sets and reference counts by design. Teacher/student queries share the
+same reference identities and input order. Teacher queries and references are
+detached; cosine comparisons retain the complete prototype distribution.
+
+The indexed bitonic sorter matches the NeCo-pinned `diffsort==0.2.0`, including
+arbitrary sequence lengths, with teacher/student steepness 100. It uses that
+released implementation's default Cauchy interpolation (the paper appendix
+instead names logistic-phi). Cross-entropy sums over reference identities and
+averages over ranks of the full M-by-M permutation matrices. This follows the
+[released NeCo sorting and loss code](https://github.com/vpariza/NeCo/blob/main/src/neco.py)
+and [diffsort implementation](https://github.com/Felix-Petersen/diffsort/tree/main/diffsort).
+There is no new runtime dependency; the upstream MIT notice is preserved in
+`third_party/diffsort_LICENSE`. Activation checkpointing bounds the stored
+sorting intermediates and avoids retaining a separate prototype bank per query.
+
+Average valid queries separately for GG/GL/LL over all GPUs, then combine these
+means with fixed weights 0.5/0.25/0.25, renormalizing for absent families.
+Cross-image ordering has only GG queries, so it uses that family's full mean.
+Logs include `region_ordering`, `region_ordering_raw`, query/reference counts,
+mean references per query, and each family's loss and query count. Disabling
+`lambda3` also disables ordering. A separate seeded sampler leaves augmentation
+and mask randomness untouched; its step is restored on exact checkpoint resume,
+alongside the existing teacher centers. Changing modalities requires a new
+continuation, not an exact resume. Slurm array indices 24 and 25 run the new modes.
+
 `region_normalization` selects the overlap representation:
 
 - `centering`: reuse the ordinary iBOT teacher patch targets after subtracting

@@ -28,6 +28,7 @@ region_normalization: softmax
 # mean_centered_swd, mean_normalized_swd. Selection/area weights apply first.
 region_aggregation: mean
 include_local_crops: false
+loss_modality: standard
 region_temp: 0.07
 momentum_teacher: 0.9995
 teacher_temp: 0.07

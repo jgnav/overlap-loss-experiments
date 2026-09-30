@@ -45,6 +45,7 @@ RESUME_COMPATIBILITY_KEYS = (
     "region_normalization",
     "region_aggregation",
     "include_local_crops",
+    "loss_modality",
     "ibot_plus_plus",
     "koleo_regularizer",
     "momentum_teacher",
@@ -186,6 +187,8 @@ def _validate_resume_compatibility(checkpoint, args):
             saved_value = False
         if key == "register_warmup_epochs" and saved_value is None:
             saved_value = 0
+        if key == "loss_modality" and saved_value is None:
+            saved_value = "standard"
         if key == "region_aggregation" and saved_value is None:
             saved_value = "mean"
         if key == "region_normalization" and saved_value is None:
@@ -393,6 +396,10 @@ def load_pretrained_state(
     center_state = {
         key: checkpoint["ibot_loss"][key] for key in ("center", "center2")
     }
+    if getattr(ibot_loss, "ordering_loss", None) is not None:
+        step_key = "ordering_loss.sampling_step"
+        if step_key in checkpoint["ibot_loss"]:
+            center_state[step_key] = checkpoint["ibot_loss"][step_key]
     if hasattr(ibot_loss, "region_centers"):
         if "region_centers" in checkpoint["ibot_loss"]:
             center_state["region_centers"] = checkpoint["ibot_loss"]["region_centers"]
@@ -426,6 +433,17 @@ def load_resume_state(
     optimizer,
     fp16_scaler,
 ):
+    if getattr(ibot_loss, "loss_modality", "standard") == "cross_image" and (
+        not bool(checkpoint["ibot_loss"].get("ordering_loss.single_global_overlap", False))
+    ):
+        raise ValueError(
+            "Cross-image resume checkpoint predates single-global-overlap ordering; "
+            "use initial_checkpoint with resume_checkpoint: null for a new continuation"
+        )
+    if getattr(ibot_loss, "ordering_loss", None) is not None and (
+        "ordering_loss.sampling_step" not in checkpoint["ibot_loss"]
+    ):
+        raise ValueError("Ordering resume checkpoint is missing ordering_loss.sampling_step")
     load_pretrained_state(
         checkpoint,
         student,

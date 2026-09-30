@@ -17,7 +17,7 @@ shared_head: true
 # Loss and teacher
 lambda1: 1.0
 lambda2: 1.0
-lambda3: 0.8
+lambda3: 0.4
 ibot_plus_plus: false
 koleo_regularizer: false
 region_min_area: 0.1
@@ -28,7 +28,7 @@ region_normalization: centering
 # mean_centered_swd, mean_normalized_swd. Selection/area weights apply first.
 region_aggregation: mean
 include_local_crops: false
-loss_modality: standard
+loss_modality: cross_image
 region_temp: 0.07
 momentum_teacher: 0.9995
 teacher_temp: 0.07
@@ -37,7 +37,7 @@ teacher_patch_temp: 0.07
 # Fresh post-pretraining stage
 additional_epochs: 50
 gpu_count: 4
-batch_size_per_gpu: 64
+batch_size_per_gpu: 48
 seed: 0
 # Choose bf16 for supported GPUs, or fp16 to use a GradScaler.
 precision: fp16
