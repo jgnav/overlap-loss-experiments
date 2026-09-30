@@ -2,6 +2,7 @@ import datetime
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -12,6 +13,7 @@ import torch.nn.functional as F
 from losses.region_loss import RegionLoss, intersection_patch_fractions
 from losses.sinkhorn import sinkhorn_log_probabilities
 from tests.test_region_loss import boxes_full, boxes_disjoint
+from utils.checkpoint import _validate_resume_compatibility
 
 
 def reference_sk(logits, temperature):
@@ -22,7 +24,8 @@ def reference_sk(logits, temperature):
     return q
 
 
-def reference_loss(student, teacher, boxes, mode, temperature=.2, patch_threshold=.51):
+def reference_loss(student, teacher, boxes, mode, temperature=.2, patch_threshold=.51,
+                   student_temperature=.1):
     fractions, valid, _ = intersection_patch_fractions(boxes, 4, 0.)
     selected = fractions > 0 if patch_threshold == 'weighted' else fractions >= patch_threshold
     valid = valid & selected.any(-1).all(-1)
@@ -31,12 +34,14 @@ def reference_loss(student, teacher, boxes, mode, temperature=.2, patch_threshol
     if not valid.any():
         return student.sum() * 0
     regions = []
-    for x in (student, teacher.detach()):
-        if mode == 'sinkhorn':
+    for index, x in enumerate((student, teacher.detach())):
+        if mode == 'sinkhorn' and index == 1:
             normalized = torch.zeros_like(x)
             normalized[selected] = reference_sk(x[selected], temperature)
+        elif mode == 'sinkhorn':
+            normalized = (x / student_temperature).softmax(-1)
         elif mode == 'softmax':
-            normalized = (x / temperature).softmax(-1)
+            normalized = (x / (student_temperature if index == 0 else temperature)).softmax(-1)
         else:
             normalized = x / x.norm(dim=-1, keepdim=True).clamp_min(1e-12)
         regions.append((normalized * weights[..., None]).sum(2)[valid]
@@ -167,6 +172,29 @@ class RegionNormalizationTest(unittest.TestCase):
                 self.boxes,
             )
 
+    def test_plain_softmax_holds_student_temperature_fixed(self):
+        loss = RegionLoss(normalization='softmax', temperature=.07,
+                          student_temperature=.3, patch_threshold=.51)
+        result = loss(tuple(self.student.unbind(1)), tuple(self.teacher.unbind(1)), self.boxes)
+        expected = reference_loss(self.student, self.teacher, self.boxes, 'softmax',
+                                  temperature=.07, student_temperature=.3)
+        expected_grad = torch.autograd.grad(expected, self.student)[0]
+        result['loss'].backward()
+        torch.testing.assert_close(result['loss'], expected)
+        torch.testing.assert_close(self.student.grad, expected_grad)
+        self.assertIsNone(self.teacher.grad)
+
+    def test_old_softmax_checkpoints_cannot_resume_with_changed_student_temperature(self):
+        args = SimpleNamespace(lambda3=.4, region_normalization='softmax')
+        checkpoint = {'args': vars(args), 'ibot_loss': {}}
+        with self.assertRaisesRegex(ValueError, 'ordinary student_temp'):
+            _validate_resume_compatibility(checkpoint, args)
+        checkpoint['ibot_loss'] = {
+            'region_loss.' + key: value
+            for key, value in RegionLoss(normalization='softmax').state_dict().items()
+        }
+        _validate_resume_compatibility(checkpoint, args)
+
     def test_raw_vectors_invariant_to_positive_patch_scaling_and_temperature(self):
         loss = RegionLoss(normalization='raw_logits')
         original = loss(tuple(self.student.unbind(1)), tuple(self.teacher.unbind(1)), self.boxes)['loss']
@@ -190,12 +218,57 @@ class RegionNormalizationTest(unittest.TestCase):
         result['loss'].backward()
         self.assertEqual(self.student.grad[~selected].count_nonzero(), 0)
 
+    def test_sinkhorn_is_called_once_on_detached_selected_teacher_logits(self):
+        self.boxes[1] = boxes_disjoint()[0]
+        loss = RegionLoss(patch_threshold=.51, temperature=.07,
+                          student_temperature=.3, normalization='sinkhorn')
+        with mock.patch('losses.region_loss.sinkhorn_log_probabilities',
+                        wraps=sinkhorn_log_probabilities) as sk:
+            result = loss(tuple(self.student.unbind(1)), tuple(self.teacher.unbind(1)), self.boxes)
+        sk.assert_called_once()
+        logits, temperature = sk.call_args.args
+        torch.testing.assert_close(logits, self.teacher[result['patch_mask']])
+        self.assertFalse(logits.requires_grad)
+        self.assertEqual(temperature, .07)
+        expected = reference_loss(self.student, self.teacher, self.boxes, 'sinkhorn',
+                                  temperature=.07, student_temperature=.3)
+        torch.testing.assert_close(result['loss'], expected)
+        result['loss'].backward()
+        self.assertIsNone(self.teacher.grad)
+
+    def test_student_changes_do_not_couple_region_gradients_across_samples(self):
+        loss = RegionLoss(normalization='sinkhorn', temperature=.2)
+        first = self.student.detach().clone().requires_grad_()
+        second = first.detach().clone()
+        second[1] *= 100
+        second.requires_grad_()
+        gradients = []
+        for student in (first, second):
+            value = loss(tuple(student.unbind(1)), tuple(self.teacher.unbind(1)), self.boxes)['loss']
+            gradients.append(torch.autograd.grad(value, student)[0])
+        torch.testing.assert_close(gradients[0][0], gradients[1][0])
+
     def test_sinkhorn_balances_prototype_bias_and_is_numerically_stable(self):
         logits = torch.tensor([[10000., -10000., 4000.]]).repeat(8, 1).requires_grad_()
         logs = sinkhorn_log_probabilities(logits, .1)
         torch.testing.assert_close(logs.exp(), torch.full_like(logits, 1 / 3))
-        logs.square().mean().backward()
-        self.assertTrue(torch.isfinite(logits.grad).all())
+        self.assertFalse(logs.requires_grad)
+        self.assertTrue(torch.isfinite(logs).all())
+        self.assertIsNone(logits.grad)
+
+    def test_student_sinkhorn_checkpoints_cannot_silently_resume_teacher_only_loss(self):
+        args = SimpleNamespace(lambda3=.4, region_normalization='sinkhorn')
+        old = {'args': vars(args), 'ibot_loss': {}}
+        with self.assertRaisesRegex(ValueError, 'teacher-only'):
+            _validate_resume_compatibility(old, args)
+        restored = {'args': vars(args), 'ibot_loss': {
+            'region_loss.' + key: value
+            for key, value in RegionLoss(normalization='sinkhorn').state_dict().items()
+        }}
+        _validate_resume_compatibility(restored, args)
+        # A zero-weight region branch has unchanged pure-iBOT semantics.
+        args.lambda3 = 0
+        _validate_resume_compatibility(old, args)
 
     def test_empty_pairs_skip_sinkhorn_and_keep_zero_student_gradients(self):
         for mode in ('centering', 'softmax', 'raw_logits', 'sinkhorn'):

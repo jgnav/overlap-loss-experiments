@@ -19,11 +19,11 @@ def boxes_disjoint(batch=1):
     return torch.tensor([[[0., 0., .4, 1., 0.], [.6, 0., 1., 1., 0.]]] * batch)
 
 
-def reference_ce(student, teacher, selected, temperature):
+def reference_ce(student, teacher, selected, temperature, student_temperature=.1):
     # Deliberately use direct softmax -> arithmetic mean, independently of the
     # implementation's numerically stable log-space aggregation.
     s = [x[0, selected[v]].softmax(-1).mean(0) for v, x in
-         enumerate([x / temperature for x in student])]
+         enumerate([x / student_temperature for x in student])]
     t = [x[0, selected[v]].detach().softmax(-1).mean(0) for v, x in
          enumerate([x / temperature for x in teacher])]
     return -.5 * ((t[0] * s[1].log()).sum() + (t[1] * s[0].log()).sum())

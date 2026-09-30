@@ -51,6 +51,8 @@ class iBOTLoss(nn.Module):
         if type(ibot_plus_plus) is not bool:
             raise ValueError("ibot_plus_plus must be a boolean")
         self.ibot_plus_plus = ibot_plus_plus
+        if ibot_plus_plus:
+            self.register_buffer("ibot_plus_plus_all_tokens", torch.tensor(True))
         if type(koleo_regularizer) is not bool:
             raise ValueError("koleo_regularizer must be a boolean")
         self.koleo_regularizer = koleo_regularizer
@@ -253,11 +255,10 @@ class iBOTLoss(nn.Module):
                             loss2 * visible.float(), dim=-1
                         ) / visible.sum(dim=-1).clamp(min=1.0)
                         total_visible_patch_loss += visible_loss2.mean()
-                        # iBOT++ extends the same-view patch distillation to
-                        # every patch, while retaining the original masked
-                        # signal. The two terms are normalized independently
-                        # so adding visible tokens does not dilute masking.
-                        total_loss2 += masked_loss2.mean() + visible_loss2.mean()
+                        # One uniformly weighted average over all patches,
+                        # as in iBOT++ Eq. (3). Separate masked/visible means
+                        # above are diagnostics, not independent loss terms.
+                        total_loss2 += loss2.mean()
                     else:
                         total_loss2 += masked_loss2.mean()
                     n_loss_terms2 += 1

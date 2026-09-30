@@ -48,6 +48,8 @@ Teacher targets are detached. The same selected patch distributions are used
 for moments under softmax, centering, and Sinkhorn. With `raw_logits`, the
 extensions operate on signed L2-normalized patch vectors and retain cosine
 distance for the mean term. They are vector-distribution ablations in that case.
+In Sinkhorn mode, teacher moments use detached overlap-patch assignments and
+student moments use ordinary softmax at `student_temp`, as does the mean term.
 
 The global DINO and iBOT/iBOT++ patch objectives are unaffected. Empty region
 pairs remain excluded; distributed losses retain global valid-region

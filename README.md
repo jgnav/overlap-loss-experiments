@@ -111,8 +111,8 @@ normalization selector.
 masked patches are distilled. Set it to `true` to add the same-view visible
 patches to that objective, as in TIPSv2 iBOT++; the teacher remains detached and
 centered, and the student uses the existing temperature-scaled log-softmax.
-The masked and visible terms are normalized separately and summed, preserving
-the original masked-patch signal. The result also reports `patch_masked`,
+The objective averages the cross-entropy uniformly over all patches. Separate
+masked and visible means are diagnostics only. The result also reports `patch_masked`,
 `patch_visible`, and `patch_all` metrics.
 
 `koleo_regularizer: false` leaves the original objective unchanged. With
@@ -150,16 +150,20 @@ weighting is applied before aggregation.
   the ordinary `student_temp` softmax. The branch averages selected patch
   distributions and applies symmetric cross-entropy. No centered targets are
   recomputed, and `region_temp` is unused.
-- `softmax` (default): per-patch softmax at `region_temp`, then region pooling
-  with the configured patch weights and symmetric cross-entropy.
+- `softmax`: uncentered teacher per-patch softmax at `region_temp` and ordinary
+  student softmax at `student_temp`, then region pooling with the configured
+  patch weights and symmetric cross-entropy. This holds the student temperature
+  fixed when comparing with centered teacher targets.
 - `raw_logits`: L2-normalize each raw patch vector, average selected vectors,
   then use symmetric cosine distance between the means. These vectors can be
   signed, so probability cross-entropy does not apply. `region_temp` is unused.
-- `sinkhorn`: independently balance teacher and student selected patch logits
-  using three Sinkhorn iterations at `region_temp`. Each side pools selected
-  patches from both views and all ranks into one assignment problem, then
-  averages assignments per region and uses symmetric cross-entropy. Gradients
-  flow through student Sinkhorn, including its distributed normalization.
+- `sinkhorn`: balance only the detached teacher logits of selected overlap
+  patches using three Sinkhorn iterations at `region_temp`. Both views and
+  all ranks share one teacher assignment problem. Student patches use the
+  ordinary `student_temp` softmax. Pool each side with the configured patch
+  weights, then apply symmetric cross-entropy. Unselected patches do not enter
+  Sinkhorn. This restores the earlier teacher-only normalization; checkpoints
+  from the student-Sinkhorn objective cannot be resumed under this loss.
 
 The student uses masked global crops and the teacher uses unmasked crops.
 

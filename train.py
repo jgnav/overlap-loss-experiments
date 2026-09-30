@@ -208,13 +208,15 @@ def configure_slurm_requeue_resume(args):
             for path in (Path(args.output_dir) / "wandb").glob("run-*")
             if path.is_dir()
         }
-        if len(wandb_ids) != 1:
-            raise RuntimeError(
-                f"Cannot safely resume {args.run_id}: expected one original W&B ID, "
-                f"found {sorted(wandb_ids)}"
-            )
-        wandb_id = wandb_ids.pop()
-        if args.wandb_run_id is not None and args.wandb_run_id != wandb_id:
+        wandb_id = args.wandb_run_id
+        if wandb_id is None:
+            if len(wandb_ids) != 1:
+                raise RuntimeError(
+                    f"Cannot safely resume {args.run_id}: expected one original W&B ID, "
+                    f"found {sorted(wandb_ids)}"
+                )
+            wandb_id = next(iter(wandb_ids))
+        elif wandb_id not in wandb_ids:
             raise RuntimeError(f"Cannot safely resume {args.run_id}: W&B ID changed")
         args.wandb_run_id = wandb_id
         args.wandb_resume = "must"

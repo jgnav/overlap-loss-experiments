@@ -39,13 +39,15 @@ class WeightedRegionTest(unittest.TestCase):
                     for index, logits in enumerate((student[0], teacher[0].detach())):
                         if mode == 'raw_logits':
                             probabilities = F.normalize(logits, dim=-1)
-                        elif mode == 'sinkhorn':
+                        elif mode == 'sinkhorn' and index == 1:
                             probabilities = torch.zeros_like(logits)
                             probabilities[weights > 0] = reference_sk(logits[weights > 0], .2)
+                        elif mode == 'sinkhorn':
+                            probabilities = (logits / .1).softmax(-1)
                         elif mode == 'centering':
                             probabilities = (logits / .1).softmax(-1) if index == 0 else teacher_targets[0].detach()
                         else:
-                            probabilities = (logits / .2).softmax(-1)
+                            probabilities = (logits / (.1 if index == 0 else .2)).softmax(-1)
                         regions.append((probabilities * weights[..., None]).sum(1) / weights.sum(1, keepdim=True))
                     s, t = regions
                     if mode == 'raw_logits':

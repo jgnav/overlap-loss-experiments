@@ -107,6 +107,11 @@ class RegionLoss(nn.Module):
         self.temperature = temperature
         self.student_temperature = student_temperature
         self.normalization = normalization
+        if normalization == "sinkhorn":
+            # Persist the objective semantics without adding a YAML setting.
+            self.register_buffer("sinkhorn_teacher_only", torch.tensor(True))
+        elif normalization == "softmax":
+            self.register_buffer("softmax_ordinary_student_temperature", torch.tensor(True))
         self.aggregation = RegionAggregation(aggregation)
         if aggregation == "hellinger" and normalization == "raw_logits":
             raise ValueError("hellinger aggregation requires probability distributions, not raw_logits")
@@ -135,13 +140,14 @@ class RegionLoss(nn.Module):
         patches = F.normalize(logits, p=2, dim=-1)
         return (patches * weights[..., None]).sum(dim=1) / weights.sum(dim=1, keepdim=True)
 
-    def _sinkhorn_patches(self, logits, selected):
-        # One assignment problem over both views and all valid selected patches,
-        # independently for student and teacher. Keep the student graph intact.
+    @torch.no_grad()
+    def _sinkhorn_teacher_patches(self, logits, selected):
+        # One detached teacher assignment problem over both views and all
+        # valid selected overlap patches, jointly across ranks.
         logits = torch.stack(logits, dim=1)
         assignments = sinkhorn_log_probabilities(logits[selected], self.temperature)
         dense = logits.new_full(logits.shape, -torch.inf, dtype=torch.float32)
-        return dense.masked_scatter(selected[..., None], assignments), assignments
+        return dense.masked_scatter(selected[..., None], assignments)
 
     def _pool_log_probabilities(self, log_probabilities, weights):
         if self.aggregation.method == "hellinger":
@@ -213,21 +219,18 @@ class RegionLoss(nn.Module):
             dist.all_reduce(global_valid_count)
             world_size = dist.get_world_size()
 
-        student_assignments = None
         if self.normalization == "sinkhorn" and global_valid_count.item() > 0:
-            student_patches, student_assignments = self._sinkhorn_patches(
-                student_patch_logits, selected
+            teacher_patches = self._sinkhorn_teacher_patches(
+                teacher_patch_logits, selected
             )
-            with torch.no_grad():
-                teacher_patches, _ = self._sinkhorn_patches(
-                    tuple(x.detach() for x in teacher_patch_logits), selected
-                )
 
         if valid.any():
             if self.normalization == "sinkhorn":
                 student_regions = [
-                    self._pool_log_probabilities(student_patches[valid, v], weights[valid, v])
-                    for v in range(2)
+                    self._region_log_distribution(
+                        x[valid], weights[valid, view], self.student_temperature
+                    )
+                    for view, x in enumerate(student_patch_logits)
                 ]
                 teacher_regions = [
                     self._pool_log_probabilities(teacher_patches[valid, v], weights[valid, v]).exp()
@@ -247,16 +250,24 @@ class RegionLoss(nn.Module):
                         )
                         for view, target in enumerate(teacher_patch_targets)
                     ]
-            else:
-                transform = (self._region_raw_vector if self.normalization == "raw_logits"
-                             else self._region_log_distribution)
-                student_regions = [transform(x[valid], weights[valid, v])
-                                   for v, x in enumerate(student_patch_logits)]
+            elif self.normalization == "softmax":
+                student_regions = [
+                    self._region_log_distribution(
+                        x[valid], weights[valid, view], self.student_temperature
+                    )
+                    for view, x in enumerate(student_patch_logits)
+                ]
                 with torch.no_grad():
-                    teacher_regions = [transform(x.detach()[valid], weights[valid, v])
-                                       for v, x in enumerate(teacher_patch_logits)]
-                    if self.normalization == "softmax":
-                        teacher_regions = [x.exp() for x in teacher_regions]
+                    teacher_regions = [
+                        self._region_log_distribution(x[valid], weights[valid, view]).exp()
+                        for view, x in enumerate(teacher_patch_logits)
+                    ]
+            else:
+                student_regions = [self._region_raw_vector(x[valid], weights[valid, view])
+                                   for view, x in enumerate(student_patch_logits)]
+                with torch.no_grad():
+                    teacher_regions = [self._region_raw_vector(x[valid], weights[valid, view])
+                                       for view, x in enumerate(teacher_patch_logits)]
             if self.normalization == "raw_logits":
                 loss_ab = 1 - F.cosine_similarity(teacher_regions[0], student_regions[1], dim=-1)
                 loss_ba = 1 - F.cosine_similarity(teacher_regions[1], student_regions[0], dim=-1)
@@ -266,16 +277,15 @@ class RegionLoss(nn.Module):
             if self.aggregation.method not in ("mean", "hellinger"):
                 # Coverage weights precede all statistics/distribution matching.
                 def patch_values(logits, view, teacher=False):
-                    if self.normalization == "sinkhorn":
-                        bank = teacher_patches if teacher else student_patches
-                        return bank[valid, view].exp()
+                    if teacher and self.normalization == "sinkhorn":
+                        return teacher_patches[valid, view].exp()
                     if teacher and self.normalization == "centering":
                         return teacher_patch_targets[view].detach()[valid].float()
                     x = logits.detach() if teacher else logits
                     x = x[valid].float().masked_fill(~selected[valid, view, :, None], 0)
                     if self.normalization == "raw_logits":
                         return F.normalize(x, dim=-1)
-                    temp = self.student_temperature if self.normalization == "centering" else self.temperature
+                    temp = self.temperature if teacher else self.student_temperature
                     return (x / temp).softmax(-1)
 
                 sp = [patch_values(x, v) for v, x in enumerate(student_patch_logits)]
@@ -290,9 +300,6 @@ class RegionLoss(nn.Module):
         else:
             # Empty ranks must still participate in DDP backward with zero grads.
             local_loss_sum = sum(logits.float().sum() * 0.0 for logits in student_patch_logits)
-            if student_assignments is not None:
-                # Empty ranks still join the differentiable SK all-reduces.
-                local_loss_sum = local_loss_sum + student_assignments.sum() * 0.0
 
         loss = local_loss_sum * world_size / global_valid_count.clamp_min(1.0)
         return {

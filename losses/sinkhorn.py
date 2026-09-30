@@ -1,16 +1,16 @@
-"""Log-space Sinkhorn with student gradients through global normalization."""
+"""Stable, detached Sinkhorn assignments for selected teacher patches."""
 
 import torch
 import torch.distributed as dist
-from torch.distributed.nn.functional import all_reduce
 
 
+@torch.no_grad()
 def sinkhorn_log_probabilities(logits, temperature, iterations=3):
     """Joint assignments for [selected patches, prototypes] across all ranks.
 
     Alternate global prototype balancing and per-patch normalization. Return
-    log probabilities with each patch summing to one. The student path is
-    differentiable, including cross-rank sums; callers detach teacher inputs.
+    log probabilities with each patch summing to one. Callers select the
+    overlapping teacher patches before normalization; students use softmax.
     Every rank must participate, including ranks with no selected patches.
     """
     distributed = dist.is_available() and dist.is_initialized()
@@ -28,10 +28,7 @@ def sinkhorn_log_probabilities(logits, temperature, iterations=3):
             dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
         total = (log_q - maximum).exp().sum(dim=0)
         if distributed:
-            if total.requires_grad:
-                total = all_reduce(total)
-            else:
-                dist.all_reduce(total)
+            dist.all_reduce(total)
         log_q = log_q - (maximum + total.log())
         log_q = log_q - torch.logsumexp(log_q, dim=1, keepdim=True)
     return log_q

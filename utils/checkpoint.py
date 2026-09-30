@@ -135,6 +135,26 @@ def _checkpoint_argument(checkpoint, name):
 
 
 def _validate_resume_compatibility(checkpoint, args):
+    required_markers = []
+    if getattr(args, "lambda3", 0) != 0:
+        normalization = getattr(args, "region_normalization", None)
+        if normalization == "sinkhorn":
+            required_markers.append(("region_loss.sinkhorn_teacher_only",
+                                     "teacher-only region_normalization='sinkhorn'"))
+        elif normalization == "softmax":
+            required_markers.append(("region_loss.softmax_ordinary_student_temperature",
+                                     "region_normalization='softmax' with ordinary student_temp"))
+    if getattr(args, "ibot_plus_plus", False):
+        required_markers.append(("ibot_plus_plus_all_tokens", "uniform all-token ibot_plus_plus"))
+    for key, description in required_markers:
+        marker = checkpoint.get("ibot_loss", {}).get(key)
+        if not (isinstance(marker, torch.Tensor) and marker.numel() == 1
+                and marker.item() is True):
+            raise ValueError(
+                f"Resume checkpoint predates {description}; "
+                "start a new continuation instead of resuming a different loss objective"
+            )
+
     saved_effective_batch_size = _checkpoint_argument(
         checkpoint, "effective_batch_size"
     )

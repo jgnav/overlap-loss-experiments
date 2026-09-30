@@ -37,12 +37,19 @@ if (( SLURM_ARRAY_TASK_ID < 0 || SLURM_ARRAY_TASK_ID >= ${#configs[@]} )); then
     exit 2
 fi
 config_path="config/long_training/${configs[$SLURM_ARRAY_TASK_ID]}.yaml"
+if [[ -n "${IBOT_RETRY_ORIGINAL_ARRAY_ID:-}" ]]; then
+    [[ "$IBOT_RETRY_ORIGINAL_ARRAY_ID" =~ ^[0-9]+$ ]] || {
+        echo "IBOT_RETRY_ORIGINAL_ARRAY_ID must be numeric" >&2
+        exit 2
+    }
+    config_path="output/long_${configs[$SLURM_ARRAY_TASK_ID]}/${IBOT_RETRY_ORIGINAL_ARRAY_ID}_${SLURM_ARRAY_TASK_ID}/retry_config.yaml"
+fi
 if [[ ! -f "$config_path" ]]; then
     echo "Training configuration not found: $config_path" >&2
     exit 2
 fi
 
-export IBOT_RUN_ID="${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
+export IBOT_RUN_ID="${IBOT_RETRY_ORIGINAL_ARRAY_ID:-$SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1
 export IBOT_SYNC_PROBES=1
 

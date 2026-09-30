@@ -46,6 +46,32 @@ class ContinuationConfigTest(unittest.TestCase):
             self.assertEqual(args.wandb_run_id, "original8")
             self.assertEqual(args.wandb_resume, "must")
 
+    def test_slurm_requeue_requires_current_id_when_old_wandb_runs_remain(self):
+        with TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "86234_1"
+            for wandb_id in ("deleted8", "current8"):
+                (run_dir / "wandb" / f"run-20260930_123456-{wandb_id}").mkdir(parents=True)
+            (run_dir / "checkpoint.pth").touch()
+            for configured_id in ("current8", None, "unknown8"):
+                with self.subTest(configured_id=configured_id):
+                    args = SimpleNamespace(
+                        output_dir=str(run_dir), run_id="86234_1",
+                        resume_checkpoint=None, reset_optimizer=True,
+                        wandb_mode="online", wandb_run_id=configured_id, wandb_resume=None,
+                    )
+                    with mock.patch.dict(
+                        "os.environ", {"SLURM_JOB_ID": "86614", "SLURM_RESTART_COUNT": "1"}
+                    ):
+                        if configured_id != "current8":
+                            with self.assertRaises(RuntimeError):
+                                configure_slurm_requeue_resume(args)
+                            continue
+                        configure_slurm_requeue_resume(args)
+                    self.assertEqual(args.wandb_run_id, "current8")
+                    self.assertEqual(args.wandb_resume, "must")
+                    self.assertEqual(args.resume_checkpoint, (run_dir / "checkpoint.pth").resolve())
+                    self.assertFalse(args.reset_optimizer)
+
     def test_first_slurm_start_does_not_resume_existing_checkpoint(self):
         with TemporaryDirectory() as directory:
             run_dir = Path(directory) / "83657_21"

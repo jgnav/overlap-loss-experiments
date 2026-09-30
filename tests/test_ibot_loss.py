@@ -1,11 +1,13 @@
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from losses import iBOTLoss
+from utils.checkpoint import _validate_resume_compatibility
 
 
 def make_loss(**overrides):
@@ -246,7 +248,7 @@ class PureIBOTAndDiagnosticsTest(unittest.TestCase):
                 disabled = loss(student, targets, None, masks, None)
             torch.testing.assert_close(disabled["loss"], expected["loss"])
 
-    def test_ibot_plus_plus_adds_visible_patch_distillation(self):
+    def test_ibot_plus_plus_uniform_all_patch_loss_and_gradients(self):
         student, teacher, masks, _ = self._inputs()
         masks[0][0, 0, 0] = False
         masks[1][1, 1, 1] = False
@@ -260,17 +262,37 @@ class PureIBOTAndDiagnosticsTest(unittest.TestCase):
             ce = -(teacher_patch[q] * F.log_softmax(
                 student_patch[q] / .1, dim=-1
             )).sum(dim=-1)
-            mask = masks[q].flatten(1)
-            masked = (ce * mask).sum(-1) / mask.sum(-1).clamp_min(1)
-            visible = (ce * (~mask)).sum(-1) / (~mask).sum(-1).clamp_min(1)
-            expected_all.append(masked.mean() + visible.mean())
-        torch.testing.assert_close(result["patch"], torch.stack(expected_all).mean())
+            expected_all.append(ce.mean())
+        expected = torch.stack(expected_all).mean()
+        torch.testing.assert_close(result["patch"], expected)
+        expected_grad = torch.autograd.grad(expected, student[1], retain_graph=True)[0]
+        actual_grad = torch.autograd.grad(result["patch"], student[1])[0]
+        torch.testing.assert_close(actual_grad, expected_grad)
         self.assertGreater(result["patch_visible"].item(), 0.0)
         self.assertEqual(result["ibot_plus_plus"].item(), 1.0)
 
         baseline = make_loss(lambda3=0)
         baseline_result = baseline(student, targets, None, masks, None)
         self.assertFalse(torch.allclose(result["patch"], baseline_result["patch"]))
+
+        # Fixed model outputs must give the same all-token loss under different
+        # masks, including samples with no masked tokens or no visible tokens.
+        for fraction in (0, 1, 3, 4):
+            changed_masks = [torch.zeros_like(mask) for mask in masks]
+            for mask in changed_masks:
+                mask.flatten(1)[:, :fraction] = True
+            changed = plus(student, targets, None, changed_masks, None)
+            torch.testing.assert_close(changed['patch'], expected)
+            self.assertTrue(torch.isfinite(changed['patch_masked']))
+            self.assertTrue(torch.isfinite(changed['patch_visible']))
+
+    def test_ibot_plus_plus_rejects_resume_from_balanced_group_loss(self):
+        args = SimpleNamespace(lambda3=0, ibot_plus_plus=True)
+        checkpoint = {'args': vars(args), 'ibot_loss': {}}
+        with self.assertRaisesRegex(ValueError, 'uniform all-token'):
+            _validate_resume_compatibility(checkpoint, args)
+        checkpoint['ibot_loss'] = make_loss(lambda3=0, ibot_plus_plus=True).state_dict()
+        _validate_resume_compatibility(checkpoint, args)
 
 
 if __name__ == "__main__":
