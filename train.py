@@ -33,6 +33,12 @@ from utils.checkpoint import (
     source_equivalent_epoch,
 )
 from utils.recipe import get_ibot_recipe
+from utils.register_warmup import (
+    clear_non_register_gradients,
+    completed_normal_training_epochs,
+    prepend_register_warmup,
+    teacher_ema_pairs,
+)
 from utils.collapse_diagnostics import FeatureCollapseDiagnostics, prototype_geometry_metrics
 from utils.wandb_logging import configure_wandb, init_wandb_run
 from evaluation.online_probes import OnlineProbeRunner, probe_due, validate_probe_data
@@ -80,6 +86,10 @@ def load_config(path):
         raise ValueError("koleo_regularizer must be a boolean")
     if type(config["register"]) is not int or config["register"] < 0:
         raise ValueError("register must be an integer >= 0")
+    if type(config["register_warmup_epochs"]) is not int or config["register_warmup_epochs"] < 0:
+        raise ValueError("register_warmup_epochs must be an integer >= 0")
+    if config["register_warmup_epochs"] and not config["register"]:
+        raise ValueError("register_warmup_epochs requires register > 0")
     threshold = config["region_patch_threshold"]
     if threshold != "weighted" and not (
         type(threshold) in (int, float) and 0 < threshold <= 1
@@ -115,6 +125,9 @@ def load_config(path):
         config["additional_epochs"] = user_config["epochs"]
     else:
         raise ValueError("The configuration must define additional_epochs")
+    if config["register_warmup_epochs"] >= config["epochs"]:
+        raise ValueError("register_warmup_epochs must leave at least one normal training epoch")
+    config["normal_training_epochs"] = config["epochs"] - config["register_warmup_epochs"]
     if config.get("warmup_epochs", 0) != 0:
         raise ValueError(
             "Continuation training must not restart the iBOT learning-rate warm-up; "
@@ -210,16 +223,22 @@ def configure_slurm_requeue_resume(args):
         }
         wandb_id = args.wandb_run_id
         if wandb_id is None:
-            if len(wandb_ids) != 1:
+            if not wandb_ids and getattr(args, "register_warmup_epochs", 0):
+                # A requeue during register adaptation has no W&B session yet.
+                # Resume the checkpoint and create the session after warmup.
+                args.wandb_resume = None
+            elif len(wandb_ids) != 1:
                 raise RuntimeError(
                     f"Cannot safely resume {args.run_id}: expected one original W&B ID, "
                     f"found {sorted(wandb_ids)}"
                 )
-            wandb_id = next(iter(wandb_ids))
+            else:
+                wandb_id = next(iter(wandb_ids))
         elif wandb_id not in wandb_ids:
             raise RuntimeError(f"Cannot safely resume {args.run_id}: W&B ID changed")
         args.wandb_run_id = wandb_id
-        args.wandb_resume = "must"
+        if wandb_id is not None:
+            args.wandb_resume = "must"
     args.resume_checkpoint = checkpoint.resolve()
     args.reset_optimizer = False
     print(
@@ -233,6 +252,10 @@ def init_wandb(args):
         key: str(value) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
+    if args.register_warmup_epochs:
+        config["total_stage_epochs"] = args.epochs
+        config["epochs"] = args.normal_training_epochs
+        config["additional_epochs"] = args.normal_training_epochs
     run = init_wandb_run(args, config, "pretraining-continuation")
     if run is not None:
         run.define_metric("train/online_probe_epoch")
@@ -243,6 +266,48 @@ def init_wandb(args):
             "train/online_*", step_metric="train/online_probe_epoch", step_sync=False
         )
     return run
+
+
+def ensure_training_wandb(args, epoch, start_epoch, run, initialize):
+    """Start tracking only normal training, retaining the existing run on resume."""
+    if run is None and initialize is not None and epoch >= args.register_warmup_epochs:
+        run = initialize()
+    if run is not None:
+        run.config.update(
+            {
+                "effective_batch_size": args.effective_batch_size,
+                "continuation_start_epoch": completed_normal_training_epochs(
+                    start_epoch, args.register_warmup_epochs
+                ),
+                "additional_epochs": args.normal_training_epochs,
+                "source_checkpoint_epoch": args.source_checkpoint_epoch,
+                "source_equivalent_final_epoch": args.source_equivalent_final_epoch,
+                "total_stage_epochs": args.epochs,
+            },
+            allow_val_change=True,
+        )
+    return run
+
+
+def log_training_epoch_to_wandb(run, train_stats, args, epoch, iterations_per_epoch):
+    if run is None or epoch < args.register_warmup_epochs:
+        return
+    normal_epoch = epoch - args.register_warmup_epochs
+    # Existing ablations retain their axis; register continuation starts at zero.
+    logged_epoch = normal_epoch if args.register_warmup_epochs else epoch + 1
+    run.log({
+        "epoch": logged_epoch,
+        "state/continuation_epoch": normal_epoch + 1,
+        "state/normal_training_epoch": normal_epoch + 1,
+        "state/register_warmup_active": 0,
+        "state/total_stage_epoch": epoch + 1,
+        "state/source_checkpoint_epoch": args.source_checkpoint_epoch,
+        "state/source_equivalent_epoch": source_equivalent_epoch(
+            args.source_checkpoint_epoch, epoch + 1
+        ),
+        "state/global_step": (normal_epoch + 1) * iterations_per_epoch,
+        **{f"train/{key}": value for key, value in train_stats.items()},
+    })
 
 
 def log_online_probe_records(runner, output_dir, writer, wandb_run):
@@ -262,7 +327,7 @@ def log_online_probe_records(runner, output_dir, writer, wandb_run):
             })
 
 
-def train_ibot(args, wandb_run=None):
+def train_ibot(args, wandb_run=None, wandb_initializer=None):
     utils.init_distributed_mode(args)
     if args.precision == "bf16" and not torch.cuda.is_bf16_supported():
         raise RuntimeError("BF16 training is not supported by the allocated GPU")
@@ -277,16 +342,9 @@ def train_ibot(args, wandb_run=None):
     args.source_equivalent_final_epoch = source_equivalent_epoch(
         args.source_checkpoint_epoch, args.epochs
     )
-    if wandb_run is not None:
-        wandb_run.config.update(
-            {
-                "effective_batch_size": args.effective_batch_size,
-                "continuation_start_epoch": start_epoch,
-                "additional_epochs": args.epochs,
-                "source_checkpoint_epoch": args.source_checkpoint_epoch,
-                "source_equivalent_final_epoch": args.source_equivalent_final_epoch,
-            },
-            allow_val_change=True,
+    if utils.is_main_process():
+        wandb_run = ensure_training_wandb(
+            args, start_epoch, start_epoch, wandb_run, wandb_initializer
         )
     print("\n".join(f"{key}: {value}" for key, value in sorted(vars(args).items())))
     cudnn.benchmark = True
@@ -514,18 +572,22 @@ def train_ibot(args, wandb_run=None):
         * (args.batch_size_per_gpu * utils.get_world_size())
         / args.reference_batch_size,
         args.min_lr,
-        args.epochs,
+        args.normal_training_epochs,
         len(data_loader),
         warmup_epochs=0,
     )
     wd_schedule = utils.cosine_scheduler(
         args.weight_decay,
         args.weight_decay_end,
-        args.epochs,
+        args.normal_training_epochs,
         len(data_loader),
     )
     momentum_schedule = utils.cosine_scheduler(
-        args.momentum_teacher, 1, args.epochs, len(data_loader)
+        args.momentum_teacher, 1, args.normal_training_epochs, len(data_loader)
+    )
+    lr_schedule, wd_schedule, momentum_schedule = (
+        prepend_register_warmup(schedule, args.register_warmup_epochs, len(data_loader))
+        for schedule in (lr_schedule, wd_schedule, momentum_schedule)
     )
     if start_epoch < args.epochs:
         first_schedule_iteration = start_epoch * len(data_loader)
@@ -568,6 +630,22 @@ def train_ibot(args, wandb_run=None):
         log_online_probe_records(probe_runner, args.output_dir, writer, wandb_run)
     start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
+        register_only = epoch < args.register_warmup_epochs
+        if (not register_only and wandb_run is None and wandb_initializer is not None
+                and args.wandb_mode != "disabled" and utils.is_main_process()):
+            wandb_run = ensure_training_wandb(
+                args, epoch, start_epoch, wandb_run, wandb_initializer
+            )
+        if args.register_warmup_epochs:
+            # Eval mode also freezes normalization buffers during adaptation.
+            student.train(not register_only)
+            teacher.train(not register_only)
+            print(
+                f"Register warmup {epoch + 1}/{args.register_warmup_epochs}: only register tokens update"
+                if register_only else
+                f"Normal training {epoch - args.register_warmup_epochs + 1}/{args.normal_training_epochs}: all student weights update",
+                flush=True,
+            )
         data_epoch = source_equivalent_epoch(args.source_checkpoint_epoch, epoch)
         if data_epoch is None:
             data_epoch = epoch
@@ -595,6 +673,9 @@ def train_ibot(args, wandb_run=None):
         ))
 
         completed_continuation_epoch = epoch + 1
+        completed_training_epoch = completed_normal_training_epochs(
+            completed_continuation_epoch, args.register_warmup_epochs
+        )
         completed_source_epoch = source_equivalent_epoch(
             args.source_checkpoint_epoch, completed_continuation_epoch
         )
@@ -610,19 +691,22 @@ def train_ibot(args, wandb_run=None):
             ),
             "args": args,
             "ibot_loss": ibot_loss.state_dict(),
+            "register_warmup_epochs": args.register_warmup_epochs,
+            "normal_training_epoch": completed_training_epoch,
         }
         if fp16_scaler is not None:
             save_dict["fp16_scaler"] = fp16_scaler.state_dict()
         utils.save_on_master(
             save_dict, os.path.join(args.output_dir, "checkpoint.pth")
         )
-        if probe_runner is not None and not sync_probes:
+        if probe_runner is not None and not sync_probes and completed_training_epoch > 0:
             # The runner copies the completed checkpoint before spawning a worker;
             # no probe ever reads the path that the next epoch may overwrite.
-            probe_runner.submit(completed_continuation_epoch, output_checkpoint)
+            probe_runner.submit(completed_training_epoch, output_checkpoint)
         if (
             args.saveckp_freq
-            and completed_continuation_epoch % args.saveckp_freq == 0
+            and completed_training_epoch > 0
+            and completed_training_epoch % args.saveckp_freq == 0
         ):
             utils.save_on_master(
                 save_dict,
@@ -638,6 +722,8 @@ def train_ibot(args, wandb_run=None):
             **{f"train_{key}": value for key, value in train_stats.items()},
             "epoch": epoch,
             "continuation_epoch": completed_continuation_epoch,
+            "normal_training_epoch": completed_training_epoch,
+            "register_warmup_active": register_only,
             "additional_epochs": args.epochs,
             "source_checkpoint_epoch": args.source_checkpoint_epoch,
             "source_equivalent_epoch": completed_source_epoch,
@@ -647,24 +733,12 @@ def train_ibot(args, wandb_run=None):
                 handle.write(json.dumps(log_stats) + "\n")
             for key, value in train_stats.items():
                 writer.add_scalar(key, value, epoch)
-            if wandb_run is not None:
-                wandb_run.log(
-                    {
-                        "epoch": completed_continuation_epoch,
-                        "state/continuation_epoch": completed_continuation_epoch,
-                        "state/source_checkpoint_epoch": args.source_checkpoint_epoch,
-                        "state/source_equivalent_epoch": completed_source_epoch,
-                        "state/global_step": completed_continuation_epoch
-                        * len(data_loader),
-                        **{
-                            f"train/{key}": value
-                            for key, value in train_stats.items()
-                        },
-                    },
-                )
+            log_training_epoch_to_wandb(
+                wandb_run, train_stats, args, epoch, len(data_loader)
+            )
 
-        if sync_probes and args.online_probes_enabled and probe_due(
-            completed_continuation_epoch, args.online_probe_frequency
+        if sync_probes and args.online_probes_enabled and completed_training_epoch > 0 and probe_due(
+            completed_training_epoch, args.online_probe_frequency
         ):
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -673,7 +747,7 @@ def train_ibot(args, wandb_run=None):
             if probe_runner is not None:
                 free_bytes, total_bytes = torch.cuda.mem_get_info()
                 print(
-                    f"Online probes at epoch {completed_continuation_epoch}: "
+                    f"Online probes at normal training epoch {completed_training_epoch}: "
                     f"{free_bytes / 2**30:.2f}/{total_bytes / 2**30:.2f} GiB free "
                     "after releasing CUDA cache",
                     flush=True,
@@ -682,7 +756,7 @@ def train_ibot(args, wandb_run=None):
                 student.eval()
                 teacher.eval()
                 try:
-                    probe_runner.submit(completed_continuation_epoch, output_checkpoint)
+                    probe_runner.submit(completed_training_epoch, output_checkpoint)
                     probe_runner.close(wait=True)
                     log_online_probe_records(probe_runner, args.output_dir, writer, wandb_run)
                 finally:
@@ -700,7 +774,9 @@ def train_ibot(args, wandb_run=None):
     total_time = time.time() - start_time
     total_time_string = str(datetime.timedelta(seconds=int(total_time)))
     if wandb_run is not None:
-        wandb_run.summary["state/final_continuation_epoch"] = args.epochs
+        wandb_run.summary["state/final_continuation_epoch"] = args.normal_training_epochs
+        wandb_run.summary["state/final_total_stage_epoch"] = args.epochs
+        wandb_run.summary["state/final_normal_training_epoch"] = args.normal_training_epochs
         wandb_run.summary["state/final_source_equivalent_epoch"] = (
             args.source_equivalent_final_epoch
         )
@@ -755,24 +831,8 @@ def train_one_epoch(
         f"Source-equivalent epoch: [{source_epoch}/{source_final}]"
     )
 
-    names_q, params_q, names_k, params_k = [], [], [], []
-    for name_q, param_q in student.module.named_parameters():
-        names_q.append(name_q)
-        params_q.append(param_q)
-    for name_k, param_k in teacher_without_ddp.named_parameters():
-        names_k.append(name_k)
-        params_k.append(param_k)
-    names_common = list(set(names_q) & set(names_k))
-    params_q = [
-        param_q
-        for name_q, param_q in zip(names_q, params_q)
-        if name_q in names_common
-    ]
-    params_k = [
-        param_k
-        for name_k, param_k in zip(names_k, params_k)
-        if name_k in names_common
-    ]
+    register_only = epoch < args.register_warmup_epochs
+    ema_pairs = teacher_ema_pairs(student.module, teacher_without_ddp, register_only)
 
     for iteration, (images, _labels, masks, crop_boxes) in enumerate(
         metric_logger.log_every(data_loader, args.print_freq, header)
@@ -877,6 +937,8 @@ def train_one_epoch(
         optimizer_updated = True
         if fp16_scaler is None:
             loss.backward()
+            if register_only:
+                clear_non_register_gradients(student.module)
             if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
             utils.cancel_gradients_last_layer(
@@ -887,6 +949,8 @@ def train_one_epoch(
             optimizer.step()
         else:
             fp16_scaler.scale(loss).backward()
+            if register_only:
+                clear_non_register_gradients(student.module)
             if args.clip_grad:
                 fp16_scaler.unscale_(optimizer)
                 utils.clip_gradients(student, args.clip_grad)
@@ -904,7 +968,7 @@ def train_one_epoch(
         if optimizer_updated:
             with torch.no_grad():
                 momentum = momentum_schedule[schedule_iteration]
-                for param_q, param_k in zip(params_q, params_k):
+                for param_q, param_k in ema_pairs:
                     param_k.data.mul_(momentum).add_(
                         (1 - momentum) * param_q.detach().data
                     )
@@ -940,11 +1004,17 @@ def main():
         raise ValueError("The output checkpoint must not overwrite the input checkpoint")
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     wandb_run = None
-    if int(os.environ.get("RANK", "0")) == 0:
+
+    def initialize_wandb():
+        nonlocal wandb_run
         wandb_run = init_wandb(args)
+        return wandb_run
+
+    if int(os.environ.get("RANK", "0")) == 0 and not args.register_warmup_epochs:
+        initialize_wandb()
     exit_code = 0
     try:
-        train_ibot(args, wandb_run)
+        train_ibot(args, wandb_run, wandb_initializer=initialize_wandb)
     except BaseException:
         exit_code = 1
         raise

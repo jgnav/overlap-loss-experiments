@@ -9,6 +9,7 @@ RESUME_COMPATIBILITY_KEYS = (
     "arch",
     "patch_size",
     "register",
+    "register_warmup_epochs",
     "out_dim",
     "patch_out_dim",
     "shared_head",
@@ -182,6 +183,8 @@ def _validate_resume_compatibility(checkpoint, args):
         saved_value = _checkpoint_argument(checkpoint, key)
         if key == "koleo_regularizer" and saved_value is None:
             saved_value = False
+        if key == "register_warmup_epochs" and saved_value is None:
+            saved_value = 0
         if key == "region_aggregation" and saved_value is None:
             saved_value = "mean"
         if key == "region_normalization" and saved_value is None:

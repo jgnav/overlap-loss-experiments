@@ -23,6 +23,7 @@ COMMON_IBOT_RECIPE = {
     "region_aggregation": "mean",
     "ibot_plus_plus": False,
     "koleo_regularizer": False,
+    "register_warmup_epochs": 0,
     "center_momentum": 0.9,
     "center_momentum2": 0.9,
     # A pretrained iBOT checkpoint has already completed temperature warmup.
