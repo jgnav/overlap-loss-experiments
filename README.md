@@ -143,6 +143,34 @@ available moment/distribution ablations and their fixed settings, see
 [region aggregation](docs/region_aggregation.md). Patch thresholding or area
 weighting is applied before aggregation.
 
+`include_local_crops: false` preserves the global-only regional objective.
+Set it to `true` for the independent mean-pooling context ablation in
+`config/ablations/include_local_crops_true.yaml` (the only changed setting).
+The recipe still uses two 224-pixel global crops and ten 96-pixel local crops.
+The teacher processes only globals; the student processes all crops, using
+unmasked local forwards already required by DINO. For every global/local pair,
+map their original-image intersection to their respective patch grids,
+including horizontal flips. Pool only fully contained patches with an
+unweighted arithmetic mean. A local pair is valid when its intersection has
+positive area and both views contain at least one complete patch; the existing
+`region_min_area` and `region_patch_threshold` filters still govern global/global.
+Reuse the selected normalization and temperatures (ordinary iBOT teacher
+targets for `centering`) and apply teacher-global to student-local CE.
+
+Within **each image**, average valid global/local pair losses separately from
+the symmetric global/global loss. Combine the two means with fixed weights
+0.75 and 0.25; if only one group is valid, use its full loss. Exclude images
+with neither group from the mean across images/GPUs. `lambda3` remains 0.4 in
+the ablation YAML; DINO, ordinary iBOT and all other settings stay unchanged.
+The option requires `region_aggregation: mean` and a probability normalization
+(`centering`, `softmax` or `sinkhorn`); it is separate from the deep and moment
+ablations. Sinkhorn balances unique teacher patches participating in valid
+local intersections jointly across views/GPUs, then reuses their assignments
+for every local pair. The existing global/global Sinkhorn problem is unchanged.
+Logs include `region_global_global_loss`, `region_global_local_loss`,
+`region_global_local_valid_ratio` and `region_global_local_pairs_per_image`.
+Changing this flag requires a new continuation rather than exact resume.
+
 `region_normalization` selects the overlap representation:
 
 - `centering`: reuse the ordinary iBOT teacher patch targets after subtracting

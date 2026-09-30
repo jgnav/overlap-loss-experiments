@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .region_loss import RegionLoss
+from .local_region_loss import global_local_region_loss, validate_local_region_settings
 from .koleo_loss import KoLeoLoss
 
 
@@ -36,6 +37,7 @@ class iBOTLoss(nn.Module):
         mim_start_epoch=0,
         region_aggregation="mean",
         region_depths=(),
+        include_local_crops=False,
     ):
         super().__init__()
         self.student_temp = student_temp
@@ -49,6 +51,10 @@ class iBOTLoss(nn.Module):
         self.lambda1 = lambda1
         self.lambda2 = lambda2
         self.lambda3 = lambda3
+        validate_local_region_settings(include_local_crops, region_aggregation, region_normalization)
+        if include_local_crops and (ngcrops != 2 or nlcrops <= 0):
+            raise ValueError("include_local_crops requires two global crops and at least one local crop")
+        self.include_local_crops = include_local_crops
         self.region_depths = tuple(region_depths)
         self.deep_region = region_normalization == "deep"
         if self.deep_region:
@@ -243,6 +249,7 @@ class iBOTLoss(nn.Module):
         student_region_logits=None,
         teacher_region_logits=None,
         teacher_region_targets=None,
+        student_local_patch_logits=None,
     ):
         """Compute baseline centered DINO/iBOT plus region composition."""
         student_cls, student_patch = student_output
@@ -346,9 +353,19 @@ class iBOTLoss(nn.Module):
                 region_stats = self.region_loss(
                     raw_student_patch_c,
                     teacher_patch_logits.detach().chunk(self.ngcrops),
-                    crop_boxes,
+                    crop_boxes[:, :self.ngcrops],
                     teacher_patch_targets=teacher_patch_c,
+                    return_per_image=self.include_local_crops,
                 )
+                if self.include_local_crops:
+                    if student_local_patch_logits is None:
+                        raise ValueError("include_local_crops requires student local patch logits")
+                    region_stats = global_local_region_loss(
+                        self.region_loss, region_stats,
+                        student_local_patch_logits.chunk(self.nlcrops),
+                        teacher_patch_logits.detach().chunk(self.ngcrops),
+                        crop_boxes, teacher_patch_targets=teacher_patch_c,
+                    )
             region_raw = region_stats["loss"]
             total_loss3 = region_raw * region_weight
             region_valid_ratio = region_stats["valid_ratio"]
@@ -423,6 +440,12 @@ class iBOTLoss(nn.Module):
             total_loss.update({
                 f"region_depth_{depth}": stats["loss"].detach()
                 for depth, stats in zip(self.region_depths, layer_stats)
+            })
+        if self.include_local_crops and self.lambda3 != 0:
+            total_loss.update({
+                f"region_{name}": region_stats[name].detach()
+                for name in ("global_global_loss", "global_local_loss",
+                             "global_local_valid_ratio", "global_local_pairs_per_image")
             })
         return total_loss
 

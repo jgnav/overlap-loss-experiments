@@ -15,6 +15,7 @@ class DataAugmentationiBOT:
         local_crops_number,
         global_crop_size,
         local_crop_size,
+        include_local_crops=False,
     ):
         color_jitter = transforms.Compose(
             [
@@ -61,6 +62,7 @@ class DataAugmentationiBOT:
             ]
         )
         self.local_crops_number = local_crops_number
+        self.include_local_crops = include_local_crops
         self.local_crops_scale = local_crops_scale
         self.local_crop_size = local_crop_size
         self.local_transfo = transforms.Compose(
@@ -114,12 +116,12 @@ class DataAugmentationiBOT:
         return transform(crop), crop_box
 
     def _local_crop(self, image):
-        crop, _ = self._spatial_transform(
+        crop, crop_box = self._spatial_transform(
             image,
             self.local_crop_size,
             self.local_crops_scale,
         )
-        return self.local_transfo(crop)
+        return self.local_transfo(crop), crop_box
 
     def __call__(self, image):
         first_crop, first_box = self._global_crop(image, self.global_transfo1)
@@ -130,5 +132,8 @@ class DataAugmentationiBOT:
             crops.append(crop)
             global_crop_boxes.append(crop_box)
         for _ in range(self.local_crops_number):
-            crops.append(self._local_crop(image))
+            crop, crop_box = self._local_crop(image)
+            crops.append(crop)
+            if self.include_local_crops:
+                global_crop_boxes.append(crop_box)
         return crops, torch.stack(global_crop_boxes)

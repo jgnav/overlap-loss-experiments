@@ -21,6 +21,13 @@ def intersection_patch_fractions(crop_boxes, patch_count, min_area):
             f"{tuple(crop_boxes.shape)}"
         )
 
+    if isinstance(patch_count, tuple):
+        # Global/local views have different patch grids. Reuse the same
+        # geometry/flip mapping independently at each view's resolution.
+        first, valid, area = intersection_patch_fractions(crop_boxes, patch_count[0], min_area)
+        second, _, _ = intersection_patch_fractions(crop_boxes, patch_count[1], min_area)
+        return (first[:, 0], second[:, 1]), valid, area
+
     grid_size = math.isqrt(patch_count)
     if patch_count <= 0 or grid_size * grid_size != patch_count:
         raise ValueError(
@@ -191,6 +198,7 @@ class RegionLoss(nn.Module):
         crop_boxes,
         *,
         teacher_patch_targets=None,
+        return_per_image=False,
     ):
         if len(student_patch_logits) != 2 or len(teacher_patch_logits) != 2:
             raise ValueError("Region loss requires exactly two global crops")
@@ -302,7 +310,7 @@ class RegionLoss(nn.Module):
             local_loss_sum = sum(logits.float().sum() * 0.0 for logits in student_patch_logits)
 
         loss = local_loss_sum * world_size / global_valid_count.clamp_min(1.0)
-        return {
+        result = {
             "loss": loss,
             "valid_ratio": valid.float().mean(),
             "intersection_area": intersection_area.mean(),
@@ -310,3 +318,12 @@ class RegionLoss(nn.Module):
             "patch_weights": weights,
             "valid": valid,
         }
+        if return_per_image:
+            # Keep per-image values only for the local-crop ablation.
+            per_image_loss = sum(logits.float().sum((1, 2)) * 0.0 for logits in student_patch_logits)
+            if valid.any():
+                per_image_loss = per_image_loss.index_copy(
+                    0, valid.nonzero().flatten(), 0.5 * (loss_ab + loss_ba)
+                )
+            result["per_image_loss"] = per_image_loss
+        return result

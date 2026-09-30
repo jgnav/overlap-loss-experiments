@@ -44,6 +44,7 @@ RESUME_COMPATIBILITY_KEYS = (
     "region_temp",
     "region_normalization",
     "region_aggregation",
+    "include_local_crops",
     "ibot_plus_plus",
     "koleo_regularizer",
     "momentum_teacher",
@@ -181,7 +182,7 @@ def _validate_resume_compatibility(checkpoint, args):
     mismatches = []
     for key in RESUME_COMPATIBILITY_KEYS:
         saved_value = _checkpoint_argument(checkpoint, key)
-        if key == "koleo_regularizer" and saved_value is None:
+        if key in ("koleo_regularizer", "include_local_crops") and saved_value is None:
             saved_value = False
         if key == "register_warmup_epochs" and saved_value is None:
             saved_value = 0

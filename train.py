@@ -21,6 +21,7 @@ from tensorboardX import SummaryWriter
 from data import DataAugmentationiBOT, ImageFolderMask
 from losses import iBOTLoss
 from losses.region_loss import RegionLoss
+from losses.local_region_loss import validate_local_region_settings
 from model import create_model, iBOTHead
 from utils import training as utils
 from utils.checkpoint import (
@@ -105,6 +106,13 @@ def load_config(path):
         )
     # Validate the aggregation choice and its normalization combination before
     # loading checkpoints, datasets, or initializing distributed training.
+    validate_local_region_settings(
+        config["include_local_crops"], config["region_aggregation"], config["region_normalization"]
+    )
+    if config["include_local_crops"] and (
+        config["global_crops_number"] != 2 or config["local_crops_number"] <= 0
+    ):
+        raise ValueError("include_local_crops requires two global crops and at least one local crop")
     RegionLoss(
         min_area=config["region_min_area"],
         patch_threshold=threshold,
@@ -356,6 +364,7 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
         args.local_crops_number,
         args.global_crop_size,
         args.local_crop_size,
+        include_local_crops=args.include_local_crops,
     )
     dataset = ImageFolderMask(
         args.data_path,
@@ -466,6 +475,7 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
         koleo_regularizer=args.koleo_regularizer,
         mim_start_epoch=args.pred_start_epoch,
         region_depths=region_depths,
+        include_local_crops=args.include_local_crops,
     ).cuda()
 
     writer = None
@@ -913,12 +923,19 @@ def train_one_epoch(
             )
 
             student.module.backbone.masked_im_modeling = False
-            student_local_cls = (
-                student(images[args.global_crops_number :])[0]
+            student_local_output = (
+                student(images[args.global_crops_number :])
                 if len(images) > args.global_crops_number
                 else None
             )
             student.module.backbone.masked_im_modeling = args.use_masked_im_modeling
+            student_local_cls = student_local_output[0] if student_local_output is not None else None
+            student_local_patch_logits = (
+                student_local_output[1]
+                if student_local_output is not None and ibot_loss.include_local_crops and ibot_loss.lambda3 != 0
+                else None
+            )
+            del student_local_output
 
             all_loss = ibot_loss(
                 student_output,
@@ -931,6 +948,7 @@ def train_one_epoch(
                 student_region_logits=student_region_logits,
                 teacher_region_logits=teacher_region_logits,
                 teacher_region_targets=teacher_region_targets,
+                student_local_patch_logits=student_local_patch_logits,
             )
             loss = all_loss.pop("loss")
 
