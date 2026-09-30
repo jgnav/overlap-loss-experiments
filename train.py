@@ -98,10 +98,10 @@ def load_config(path):
     if not math.isfinite(config["region_temp"]) or config["region_temp"] <= 0:
         raise ValueError("region_temp must be finite and positive")
     if config["region_normalization"] not in (
-        "centering", "softmax", "raw_logits", "sinkhorn",
+        "centering", "softmax", "raw_logits", "sinkhorn", "deep",
     ):
         raise ValueError(
-            "region_normalization must be centering, softmax, raw_logits, or sinkhorn"
+            "region_normalization must be centering, softmax, raw_logits, sinkhorn, or deep"
         )
     # Validate the aggregation choice and its normalization combination before
     # loading checkpoints, datasets, or initializing distributed training.
@@ -109,7 +109,7 @@ def load_config(path):
         min_area=config["region_min_area"],
         patch_threshold=threshold,
         temperature=config["region_temp"],
-        normalization=config["region_normalization"],
+        normalization="centering" if config["region_normalization"] == "deep" else config["region_normalization"],
         student_temperature=config["student_temp"],
         aggregation=config["region_aggregation"],
     )
@@ -395,6 +395,8 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
         num_register_tokens=args.register,
     )
     embed_dim = student.embed_dim
+    region_depths = tuple(len(student.blocks) * i // 4 for i in range(1, 5)) if args.region_normalization == "deep" else ()
+    deep_region = args.region_normalization == "deep" and args.lambda3 != 0
 
     student = utils.MultiCropWrapper(
         student,
@@ -407,6 +409,7 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
             norm_last_layer=args.norm_last_layer,
             shared_head=args.shared_head,
         ),
+        deep_region=deep_region,
     )
     teacher = utils.MultiCropWrapper(
         teacher,
@@ -418,6 +421,7 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
             act=args.act_in_head,
             shared_head=args.shared_head,
         ),
+        deep_region=deep_region,
     )
     student, teacher = student.cuda(), teacher.cuda()
     if utils.has_batchnorms(student):
@@ -461,6 +465,7 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
         ibot_plus_plus=args.ibot_plus_plus,
         koleo_regularizer=args.koleo_regularizer,
         mim_start_epoch=args.pred_start_epoch,
+        region_depths=region_depths,
     ).cuda()
 
     writer = None
@@ -863,7 +868,14 @@ def train_one_epoch(
                 teacher_result = teacher(
                     images[: args.global_crops_number],
                     return_backbone_feat=diagnostic_batch,
+                    return_region_logits=ibot_loss.deep_region and ibot_loss.lambda3 != 0,
                 )
+                teacher_region_logits = None
+                teacher_region_targets = None
+                if ibot_loss.deep_region and ibot_loss.lambda3 != 0:
+                    *teacher_result, teacher_region_logits = teacher_result
+                    if not diagnostic_batch:
+                        teacher_result = teacher_result[0]
                 if diagnostic_batch:
                     backbone_features, teacher_output = teacher_result
                 else:
@@ -875,12 +887,23 @@ def train_one_epoch(
                     )
                     del backbone_features
                 teacher_targets = get_teacher_targets(teacher_output, ibot_loss, epoch)
+                if teacher_region_logits is not None:
+                    teacher_region_targets = ibot_loss.deep_teacher_targets(
+                        teacher_region_logits, teacher_targets[1],
+                        ibot_loss.teacher_temp2_schedule[epoch],
+                    )
             need_student_features = ibot_loss.koleo_regularizer
             student_result = student(
                 images[: args.global_crops_number],
                 mask=masks[: args.global_crops_number],
                 return_backbone_feat=need_student_features,
+                return_region_logits=ibot_loss.deep_region and ibot_loss.lambda3 != 0,
             )
+            student_region_logits = None
+            if ibot_loss.deep_region and ibot_loss.lambda3 != 0:
+                *student_result, student_region_logits = student_result
+                if not need_student_features:
+                    student_result = student_result[0]
             if need_student_features:
                 student_backbone_features, student_output = student_result
             else:
@@ -905,6 +928,9 @@ def train_one_epoch(
                 crop_boxes,
                 teacher_patch_logits=teacher_output[1],
                 student_cls_features=student_cls_features,
+                student_region_logits=student_region_logits,
+                teacher_region_logits=teacher_region_logits,
+                teacher_region_targets=teacher_region_targets,
             )
             loss = all_loss.pop("loss")
 

@@ -164,6 +164,29 @@ weighting is applied before aggregation.
   weights, then apply symmetric cross-entropy. Unselected patches do not enter
   Sinkhorn. This restores the earlier teacher-only normalization; checkpoints
   from the student-Sinkhorn objective cannot be resumed under this loss.
+- `deep`: apply the centered region objective at four evenly spaced backbone
+  depths (3/6/9/12 for ViT-S/B, 6/12/18/24 for ViT-L). Each intermediate depth
+  has an independent copy of the complete iBOT patch projection/prototype head
+  and its own teacher center. The final depth uses the ordinary iBOT patch head
+  and center, reusing its teacher softmax targets. Every depth applies per-patch
+  softmax before aggregation: centered teacher targets at `teacher_patch_temp`
+  and student probabilities at `student_temp`; `region_temp` is unused.
+  Apply the configured patch
+  selection/weighting and aggregation at each depth, then average the four
+  region losses before multiplying by `lambda3`. Only global crops use these
+  heads. The CLS and ordinary iBOT losses still use the final-layer outputs.
+
+The `deep` depth schedule follows the intermediate outputs in
+[V-JEPA 2.1](https://github.com/facebookresearch/vjepa2/blob/main/app/vjepa_2_1/models/vision_transformer.py).
+Our projection heads and centered region cross-entropy use this repository's
+iBOT formulation. Start with
+`config/ablations/region_normalization_deep.yaml`, which changes only the
+normalization selector from `config/train.yaml`. A new continuation copies
+each intermediate head and center from the pretrained patch head and `center2`;
+exact resume restores their independently trained weights, EMA teacher heads,
+centers and optimizer state. Per-depth raw losses are logged as
+`region_depth_<block>`. The former `raw_logits_deep` and `softmax_deep` selectors
+are not accepted.
 
 The student uses masked global crops and the teacher uses unmasked crops.
 

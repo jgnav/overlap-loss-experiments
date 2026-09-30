@@ -358,13 +358,27 @@ def init_distributed_mode(args):
 class MultiCropWrapper(nn.Module):
     """The multi-resolution forward wrapper from DINO/iBOT."""
 
-    def __init__(self, backbone, head=None):
+    def __init__(self, backbone, head=None, deep_region=False):
         super().__init__()
         backbone.fc, backbone.head = nn.Identity(), nn.Identity()
         self.backbone = backbone
         self.head = nn.Identity() if head is None else head
+        # Four evenly spaced depths, including the ordinary final output.
+        self.region_layers = tuple(
+            len(backbone.blocks) * i // 4 for i in range(1, 5)
+        ) if deep_region else ()
+        if deep_region:
+            if len(set(self.region_layers)) != 4 or self.region_layers[0] == 0:
+                raise ValueError('Deep region supervision requires at least four backbone blocks')
+            self.region_heads = nn.ModuleDict({
+                str(depth): self.head.make_patch_head()
+                for depth in self.region_layers[:-1]
+            })
 
-    def forward(self, inputs, mask=None, return_backbone_feat=False, **kwargs):
+    def forward(self, inputs, mask=None, return_backbone_feat=False,
+                return_region_logits=False, **kwargs):
+        if return_region_logits and not self.region_layers:
+            raise ValueError('Deep region heads were not enabled for this model')
         if not isinstance(inputs, list):
             inputs = [inputs]
             mask = [mask] if mask is not None else None
@@ -377,12 +391,19 @@ class MultiCropWrapper(nn.Module):
         )
         start_index = 0
         outputs = []
+        intermediates = []
         for end_index in crop_boundaries:
             input_batch = torch.cat(inputs[start_index:end_index])
             if mask is not None:
                 input_mask = torch.cat(mask[start_index:end_index])
                 kwargs.update(mask=input_mask)
-            current_output = self.backbone(input_batch, **kwargs)
+            if return_region_logits:
+                current_output, intermediate = self.backbone(
+                    input_batch, region_layers=self.region_layers[:-1], **kwargs
+                )
+                intermediates.append(intermediate)
+            else:
+                current_output = self.backbone(input_batch, **kwargs)
             outputs.append(current_output)
             start_index = end_index
         output = torch.cat(outputs)
@@ -391,6 +412,16 @@ class MultiCropWrapper(nn.Module):
             (output[:, :1], output[:, 1 + register_count:]), dim=1
         )
         projected_output = self.head(head_input)
+        if return_region_logits:
+            region_logits = tuple(
+                self.region_heads[str(depth)](torch.cat([
+                    group[index][:, 1 + register_count:] for group in intermediates
+                ]))
+                for index, depth in enumerate(self.region_layers[:-1])
+            ) + (projected_output[1],)
+            if return_backbone_feat:
+                return output, projected_output, region_logits
+            return projected_output, region_logits
         if return_backbone_feat:
             return output, projected_output
         return projected_output

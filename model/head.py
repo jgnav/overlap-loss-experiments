@@ -171,6 +171,13 @@ class iBOTHead(DINOHead):
         )
 
         self.shared_head = shared_head
+        self.patch_head_config = dict(
+            in_dim=args[0] if args else kwargs['in_dim'],
+            out_dim=(args[1] if len(args) > 1 else kwargs['out_dim']) if shared_head else patch_out_dim,
+            norm=norm, act=act, last_norm=last_norm, nlayers=nlayers,
+            hidden_dim=hidden_dim, bottleneck_dim=bottleneck_dim,
+            norm_last_layer=norm_last_layer,
+        )
         if not shared_head:
             # Duplicate the complete projection path, not only its prototypes.
             self.patch_mlp = deepcopy(self.mlp if bottleneck_dim > 0 else (
@@ -197,6 +204,29 @@ class iBOTHead(DINOHead):
                 self.mlp2 = self.mlp[-1] if isinstance(self.mlp, nn.Sequential) else self.mlp
                 self.last_layer2 = None
             self.last_norm2 = self.last_norm
+
+    def patch_head_source_name(self, name):
+        """Map a standalone patch head state/parameter name to this head."""
+        if self.shared_head:
+            return name
+        if name.startswith('last_norm.'):
+            return name.replace('last_norm.', 'last_norm2.', 1)
+        if self.last_layer2 is not None:
+            return name.replace('mlp.', 'patch_mlp.', 1).replace('last_layer.', 'last_layer2.', 1)
+        final = f'mlp.{len(self.mlp) - 1}.' if isinstance(self.mlp, nn.Sequential) else 'mlp.'
+        if name.startswith(final):
+            return 'mlp2.' + name[len(final):]
+        return name.replace('mlp.', 'patch_mlp.', 1)
+
+    def make_patch_head(self):
+        """Independent copy of the complete patch projection/prototype path."""
+        head = DINOHead(**self.patch_head_config)
+        source = self.state_dict()
+        head.load_state_dict({
+            name: source[self.patch_head_source_name(name)].clone()
+            for name in head.state_dict()
+        })
+        return head
 
     def forward(self, x):
         if len(x.shape) == 2:

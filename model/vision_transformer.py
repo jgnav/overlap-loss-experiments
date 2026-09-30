@@ -236,7 +236,7 @@ class VisionTransformer(nn.Module):
 
         return self.pos_drop(x)
 
-    def forward(self, x, return_all_tokens=None, mask=None):
+    def forward(self, x, return_all_tokens=None, mask=None, region_layers=()):
         # mim
         if self.masked_im_modeling:
             assert mask is not None
@@ -244,8 +244,11 @@ class VisionTransformer(nn.Module):
         else:
             x = self.prepare_tokens(x)
 
-        for blk in self.blocks:
+        intermediate = []
+        for depth, blk in enumerate(self.blocks, start=1):
             x = blk(x)
+            if depth in region_layers:
+                intermediate.append(self.norm(x))
 
         x = self.norm(x)
         if self.fc_norm is not None:
@@ -256,7 +259,7 @@ class VisionTransformer(nn.Module):
         return_all_tokens = self.return_all_tokens if \
             return_all_tokens is None else return_all_tokens
         result = x if return_all_tokens else x[:, 0]
-        return result
+        return (result, tuple(intermediate)) if region_layers else result
 
     def get_last_selfattention(self, x):
         x = self.prepare_tokens(x)

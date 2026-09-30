@@ -35,6 +35,7 @@ class iBOTLoss(nn.Module):
         koleo_regularizer=False,
         mim_start_epoch=0,
         region_aggregation="mean",
+        region_depths=(),
     ):
         super().__init__()
         self.student_temp = student_temp
@@ -48,6 +49,12 @@ class iBOTLoss(nn.Module):
         self.lambda1 = lambda1
         self.lambda2 = lambda2
         self.lambda3 = lambda3
+        self.region_depths = tuple(region_depths)
+        self.deep_region = region_normalization == "deep"
+        if self.deep_region:
+            if len(self.region_depths) != 4 or tuple(sorted(set(self.region_depths))) != self.region_depths:
+                raise ValueError("Deep region loss requires four ordered, distinct region_depths")
+            self.register_buffer("region_centers", torch.zeros(3, 1, 1, patch_out_dim))
         if type(ibot_plus_plus) is not bool:
             raise ValueError("ibot_plus_plus must be a boolean")
         self.ibot_plus_plus = ibot_plus_plus
@@ -61,7 +68,7 @@ class iBOTLoss(nn.Module):
             region_min_area,
             region_patch_threshold,
             region_temp,
-            region_normalization,
+            "centering" if self.deep_region else region_normalization,
             student_temperature=student_temp,
             aggregation=region_aggregation,
         )
@@ -128,6 +135,26 @@ class iBOTLoss(nn.Module):
             self.softmax_center_teacher_cls(teacher_cls, teacher_temp),
             self.softmax_center_teacher_patch(teacher_patch, teacher_patch_temp),
         )
+
+    @torch.no_grad()
+    def deep_teacher_targets(self, region_logits, final_targets, teacher_temp):
+        """Independent intermediate centers; reuse the final iBOT softmax."""
+        if not self.deep_region or len(region_logits) != len(self.region_depths):
+            raise ValueError("Deep teacher targets require logits from every region depth")
+        targets = []
+        for index, logits in enumerate(region_logits[:-1]):
+            targets.append(F.softmax(
+                (logits.float() - self.region_centers[index]) / teacher_temp, dim=-1
+            ))
+            center = logits.detach().float().mean(1).sum(0, keepdim=True)
+            count = center.new_tensor(len(logits))
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(center)
+                dist.all_reduce(count)
+            self.region_centers[index].mul_(self.center_momentum2).add_(
+                center / count, alpha=1 - self.center_momentum2
+            )
+        return tuple(targets) + (final_targets,)
 
     @staticmethod
     @torch.no_grad()
@@ -213,6 +240,9 @@ class iBOTLoss(nn.Module):
         *,
         teacher_patch_logits=None,
         student_cls_features=None,
+        student_region_logits=None,
+        teacher_region_logits=None,
+        teacher_region_targets=None,
     ):
         """Compute baseline centered DINO/iBOT plus region composition."""
         student_cls, student_patch = student_output
@@ -294,14 +324,31 @@ class iBOTLoss(nn.Module):
             region_active = zero
             objective = total_loss1 + total_loss2
         else:
-            if teacher_patch_logits is None:
+            if teacher_patch_logits is None and not self.deep_region:
                 raise ValueError("Active region loss requires raw teacher_patch_logits")
-            region_stats = self.region_loss(
-                raw_student_patch_c,
-                teacher_patch_logits.detach().chunk(self.ngcrops),
-                crop_boxes,
-                teacher_patch_targets=teacher_patch_c,
-            )
+            if self.deep_region:
+                levels = (student_region_logits, teacher_region_logits, teacher_region_targets)
+                if any(level is None or len(level) != len(self.region_depths) for level in levels):
+                    raise ValueError("Deep region loss requires student logits, teacher logits and targets at every depth")
+                layer_stats = [
+                    self.region_loss(
+                        student_logits.chunk(self.ngcrops),
+                        teacher_logits.detach().chunk(self.ngcrops),
+                        crop_boxes,
+                        teacher_patch_targets=targets.detach().chunk(self.ngcrops),
+                    )
+                    for student_logits, teacher_logits, targets in zip(*levels)
+                ]
+                region_stats = {**layer_stats[-1], "loss": torch.stack([
+                    stats["loss"] for stats in layer_stats
+                ]).mean()}
+            else:
+                region_stats = self.region_loss(
+                    raw_student_patch_c,
+                    teacher_patch_logits.detach().chunk(self.ngcrops),
+                    crop_boxes,
+                    teacher_patch_targets=teacher_patch_c,
+                )
             region_raw = region_stats["loss"]
             total_loss3 = region_raw * region_weight
             region_valid_ratio = region_stats["valid_ratio"]
@@ -372,6 +419,11 @@ class iBOTLoss(nn.Module):
             "region_intersection_area": region_intersection_area,
             "loss": objective,
         }
+        if self.deep_region and self.lambda3 != 0:
+            total_loss.update({
+                f"region_depth_{depth}": stats["loss"].detach()
+                for depth, stats in zip(self.region_depths, layer_stats)
+            })
         return total_loss
 
     @torch.no_grad()

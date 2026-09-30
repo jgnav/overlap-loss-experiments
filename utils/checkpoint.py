@@ -247,10 +247,18 @@ def read_resume_checkpoint(args):
     return checkpoint
 
 
-def _source_parameter_name(name, source_state):
+def _source_parameter_name(name, source_state, model=None):
     if name in source_state:
         return name
     parts = name.split(".")
+    if model is not None and "region_heads" in parts:
+        index = parts.index("region_heads")
+        wrapper = model.module if hasattr(model, "module") else model
+        suffix = wrapper.head.patch_head_source_name(".".join(parts[index + 2:]))
+        name = ".".join(parts[:index] + ["head", suffix])
+        if name in source_state:
+            return name
+        parts = name.split(".")
     replacements = {"patch_mlp": "mlp", "last_layer2": "last_layer", "last_norm2": "last_norm"}
     candidate = ".".join(replacements.get(part, part) for part in parts)
     return candidate if candidate in source_state else name
@@ -286,7 +294,7 @@ def _load_optimizer_with_head_copies(checkpoint, student, optimizer):
         saved["param_groups"], current["param_groups"], optimizer.param_groups
     ):
         names = [parameter_names[id(p)] for p in live_group["params"]]
-        mapped = [canonical.get(_source_parameter_name(name, source)) for name in names]
+        mapped = [canonical.get(_source_parameter_name(name, source, student)) for name in names]
         missing_names = [name for name, source_name in zip(names, mapped) if source_name is None]
         if any(not name.endswith("backbone.register_tokens") for name in missing_names):
             raise ValueError("Cannot expand optimizer: missing source parameter")
@@ -322,6 +330,7 @@ def load_pretrained_state(
     teacher,
     ibot_loss,
     allow_new_register_tokens=False,
+    allow_new_region_heads=False,
 ):
     objects = {
         "student": student,
@@ -330,8 +339,12 @@ def load_pretrained_state(
     for key, value in objects.items():
         source = checkpoint[key]
         state = dict(source)
+        has_region_heads = any("region_heads." in name for name in source)
         for name in value.state_dict():
-            source_name = _source_parameter_name(name, source)
+            copy_region_head = allow_new_region_heads and not has_region_heads
+            if "region_heads." in name and not copy_region_head:
+                continue
+            source_name = _source_parameter_name(name, source, value)
             if name not in state and source_name in source:
                 state[name] = source[source_name].clone()
         incompatible = value.load_state_dict(state, strict=False)
@@ -379,6 +392,17 @@ def load_pretrained_state(
     center_state = {
         key: checkpoint["ibot_loss"][key] for key in ("center", "center2")
     }
+    if hasattr(ibot_loss, "region_centers"):
+        if "region_centers" in checkpoint["ibot_loss"]:
+            center_state["region_centers"] = checkpoint["ibot_loss"]["region_centers"]
+        elif allow_new_region_heads and not any(
+            "region_heads." in name for name in checkpoint["teacher"]
+        ):
+            center_state["region_centers"] = center_state["center2"].expand_as(
+                ibot_loss.region_centers
+            ).clone()
+        else:
+            raise ValueError("Deep region checkpoint is missing independent region_centers")
     incompatible = ibot_loss.load_state_dict(center_state, strict=False)
     missing = [
         key
@@ -436,6 +460,7 @@ def load_continuation_state(
         teacher,
         ibot_loss,
         allow_new_register_tokens=True,
+        allow_new_region_heads=True,
     )
     optimizer_restored = "optimizer" in checkpoint and not reset_optimizer
     if optimizer_restored:
