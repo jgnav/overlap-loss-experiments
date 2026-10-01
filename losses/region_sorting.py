@@ -38,6 +38,19 @@ def _bitonic_stages(size, device):
     return stages
 
 
+@lru_cache(maxsize=128)
+def _bitonic_wires(size, device):
+    """Each stage is a full wire permutation, so no scatter/copies are needed."""
+    wires = []
+    for first, second, low, high in _bitonic_stages(size, device):
+        partner = torch.arange(size, device=device)
+        partner[first], partner[second] = second, first
+        orientation = torch.zeros(size, device=device)
+        orientation[low], orientation[high] = 1., -1.
+        wires.append((partner, orientation))
+    return wires
+
+
 def bitonic_permutation(vectors):
     """Return sorted values and the complete soft permutation (no padding ranks)."""
     if vectors.ndim != 2 or vectors.shape[1] < 2:
@@ -47,15 +60,12 @@ def bitonic_permutation(vectors):
     permutation = torch.eye(size, device=values.device, dtype=values.dtype).expand(
         len(values), -1, -1
     )
-    for first, second, low, high in _bitonic_stages(size, str(values.device)):
-        a, b = values[:, first], values[:, second]
-        alpha = torch.atan(100.0 * (b - a)) / math.pi + .5
-        a_id, b_id = permutation[:, :, first], permutation[:, :, second]
-        weight = alpha[:, None]
-        permutation = permutation.index_copy(2, low, weight * a_id + (1 - weight) * b_id)
-        permutation = permutation.index_copy(2, high, (1 - weight) * a_id + weight * b_id)
-        values = values.index_copy(1, low, alpha * a + (1 - alpha) * b)
-        values = values.index_copy(1, high, (1 - alpha) * a + alpha * b)
+    for partner, orientation in _bitonic_wires(size, str(values.device)):
+        other = values.index_select(1, partner)
+        keep = torch.atan(100.0 * (other - values) * orientation) / math.pi + .5
+        weight = keep[:, None]
+        permutation = weight * permutation + (1 - weight) * permutation.index_select(2, partner)
+        values = keep * values + (1 - keep) * other
     return values, permutation
 
 
@@ -63,5 +73,12 @@ def permutation_cross_entropy(student_similarities, teacher_similarities):
     """Teacher-to-student CE: sum identities, average ranks, one value/query."""
     with torch.no_grad():
         _, target = bitonic_permutation(teacher_similarities.detach())
+    return permutation_target_cross_entropy(student_similarities, target)
+
+
+def permutation_target_cross_entropy(student_similarities, target, query_indices=None):
+    """A precomputed detached teacher target avoids teacher backward recomputation."""
     _, prediction = bitonic_permutation(student_similarities)
-    return -(target * prediction.clamp_min(1e-12).log()).sum(1).mean(1)
+    if query_indices is not None:
+        prediction = prediction.index_select(0, query_indices)
+    return -(target.detach() * prediction.clamp_min(1e-12).log()).sum(1).mean(1)

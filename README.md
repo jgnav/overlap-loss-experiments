@@ -232,8 +232,21 @@ averages over ranks of the full M-by-M permutation matrices. This follows the
 [released NeCo sorting and loss code](https://github.com/vpariza/NeCo/blob/main/src/neco.py)
 and [diffsort implementation](https://github.com/Felix-Petersen/diffsort/tree/main/diffsort).
 There is no new runtime dependency; the upstream MIT notice is preserved in
-`third_party/diffsort_LICENSE`. Activation checkpointing bounds the stored
-sorting intermediates and avoids retaining a separate prototype bank per query.
+`third_party/diffsort_LICENSE`. Cosines use shared matrix multiplication for
+cross-image banks and batched matrix multiplication for within-image banks,
+as in NeCo. Gather reference identities only after computing scalar cosines;
+never replicate the full prototype bank per query. Batch region pooling across
+images, with 64 MiB softmax tiles and a single gradient allocation per crop view.
+The tiled pooling recomputes softmax in backward and supports first-order
+training gradients. Reuse duplicate student/teacher sorting queries; retain
+detached teacher permutations and checkpoint only the student sorter. Group
+matching grid sizes for geometry, and group query lengths without padding
+reference identities/ranks. These are implementation optimizations: the
+selected regions, reference order, full-dimensional predictions, sorter
+parameters, coefficients and DDP reductions are unchanged. The CPU benchmark
+`benchmarks/benchmark_region_ordering.py` measures forward/backward of the loss
+without running a backbone or GPU; `--reference-source` can compare a saved
+directory containing the previous ordering/sorting Python files.
 
 Average valid queries separately for GG/GL/LL over all GPUs, then combine these
 means with fixed weights 0.5/0.25/0.25, renormalizing for absent families.

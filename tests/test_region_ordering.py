@@ -6,6 +6,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+from itertools import combinations
 
 import torch
 import torch.distributed as dist
@@ -14,9 +15,11 @@ import torch.nn.functional as F
 
 from losses.region_ordering_loss import (
     ORDERING_WEIGHT, RegionOrderingLoss, collect_overlap_regions,
-    sample_external_references, _compare_queries,
+    sample_external_references, _compare_queries, _contained_patch_masks,
 )
 from losses.region_sorting import bitonic_permutation, permutation_cross_entropy
+from losses.region_pooling import region_probability_mean
+from losses.region_loss import intersection_patch_fractions
 from tests.test_ibot_loss import make_loss
 from train import load_config
 from utils.checkpoint import _validate_resume_compatibility, load_pretrained_state, load_resume_state
@@ -156,10 +159,111 @@ def distributed_worker(rank, rendezvous):
 
 
 class RegionalOrderingTest(unittest.TestCase):
+    def test_grouped_geometry_matches_original_fraction_masks(self):
+        torch.manual_seed(517)
+        crops = torch.rand(5, 12, 5)
+        crops[..., :2] *= .6
+        crops[..., 2:4] = (crops[..., :2] + .2 + crops[..., 2:4] * .4).clamp_max(1)
+        crops[..., 4] = torch.randint(2, (5, 12)).float()
+        pairs = list(combinations(range(12), 2))
+        first, second = zip(*pairs)
+        coordinates = torch.cat((torch.maximum(crops[:, first, :2], crops[:, second, :2]),
+                                 torch.minimum(crops[:, first, 2:4], crops[:, second, 2:4])), -1)
+        region_boxes = torch.cat((coordinates, torch.zeros_like(coordinates[..., :1])), -1)
+        counts = [196, 196] + [36] * 10
+        actual = _contained_patch_masks(crops, coordinates, counts)
+        for view, patches in enumerate(counts):
+            paired = torch.stack((crops[:, view, None].expand_as(region_boxes), region_boxes), 2)
+            fractions, _, _ = intersection_patch_fractions(paired.reshape(-1, 2, 5), patches, 0)
+            expected = (fractions[:, 0] >= 1).reshape(5, len(pairs), patches)
+            torch.testing.assert_close(actual[view], expected)
+
+    def test_tiled_pooling_matches_autograd_for_probabilities_and_mixed_precision_gradients(self):
+        torch.manual_seed(156)
+        for dtype in (torch.float32, torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                logits = (torch.randn(4, 16, 13) * .05).to(dtype).requires_grad_()
+                images = torch.tensor([0, 2, 3])
+                weights = torch.randint(2, (3, 4, 16)).float()
+                weights[1, 2] = 0  # Padded region, with zero contribution/gradient.
+                probabilities = (logits.index_select(0, images).float() / .1).softmax(-1)
+                expected = weights @ probabilities / weights.sum(-1, keepdim=True).clamp_min(1)
+                actual = region_probability_mean(logits, images, weights, .1, 16 * 13 * 4)
+                torch.testing.assert_close(actual, expected)
+                incoming = torch.randn_like(expected)
+                gradient, = torch.autograd.grad((expected * incoming).sum(), logits)
+                reference, = torch.autograd.grad((actual * incoming).sum(), logits)
+                torch.testing.assert_close(reference, gradient, atol=2e-5 if dtype == torch.float32 else 2e-3, rtol=2e-3)
+                self.assertEqual(reference[1].count_nonzero(), 0)
+
+    def test_cross_cosines_do_not_save_per_query_reference_vectors(self):
+        torch.manual_seed(982)
+        students = torch.randn(32, 64, requires_grad=True)
+        teachers = torch.randn(32, 64, requires_grad=True)
+        bank = F.normalize(torch.randn(48, 64), dim=-1)
+        indices = torch.stack([torch.randperm(48)[:31] for _ in range(32)])
+        shapes = []
+        def save(value):
+            shapes.append(tuple(value.shape))
+            return value
+        with torch.autograd.graph.saved_tensors_hooks(save, lambda value: value):
+            student_cosines, teacher_cosines = _compare_queries(students, teachers, bank, indices)
+        expected = torch.einsum("qd,qmd->qm", F.normalize(students, dim=-1), bank[indices])
+        torch.testing.assert_close(student_cosines, expected)
+        gradient, = torch.autograd.grad(expected.square().sum(), students)
+        actual, = torch.autograd.grad(student_cosines.square().sum(), students)
+        torch.testing.assert_close(actual, gradient, atol=2e-6, rtol=2e-5)
+        self.assertNotIn((32, 31, 64), shapes)
+        self.assertFalse(teacher_cosines.requires_grad)
+        self.assertIsNone(teachers.grad)
+
+    def test_teacher_sort_is_reused_and_never_recomputed_in_backward(self):
+        student, teacher, targets, boxes = fixture(3)
+        with mock.patch("losses.region_ordering_loss.bitonic_permutation", wraps=bitonic_permutation) as sorting:
+            result = RegionOrderingLoss("within_image")(student, targets, boxes)
+            calls = sorting.call_count
+            self.assertLess(sum(call.args[0].shape[0] for call in sorting.call_args_list), result["query_count"].item())
+            result["loss"].backward()
+            self.assertEqual(sorting.call_count, calls)
+        self.assertTrue(all(view.grad is None for view in teacher))
+
+    def test_ragged_batched_pooling_and_query_groups_match_brute_force(self):
+        student, _, targets, boxes = fixture(4)
+        boxes[1, 2:, :4] = torch.tensor([0., 0., .5, .5])
+        boxes[2, 2, :4] = torch.tensor([.01, .01, .02, .02])
+        invalidate_geometry(boxes[3:])
+        regions, masks = collect_overlap_regions(boxes, [64, 64, 16, 16, 16])
+        families = [[], [], []]
+        zero = sum(view.reshape(-1)[:1].sum() * 0 for view in student)
+        for image, physical_regions in enumerate(regions):
+            if len(physical_regions) < 3:
+                continue
+            reference_regions = torch.stack([
+                targets[region.teacher_view][image, masks[region.teacher_view][image, region.row]].detach().mean(0)
+                for region in physical_regions
+            ])
+            for index, region in enumerate(physical_regions):
+                references = F.normalize(reference_regions[[other for other in range(len(physical_regions)) if other != index]], dim=-1)
+                for (teacher_view, student_view), family in region.queries.items():
+                    teacher_query = targets[teacher_view][image, masks[teacher_view][image, region.row]].detach().mean(0)
+                    student_query = (student[student_view][image, masks[student_view][image, region.row]] / .1).softmax(-1).mean(0)
+                    families[family].append(permutation_cross_entropy(
+                        (F.normalize(student_query, dim=0) @ references.T)[None],
+                        (F.normalize(teacher_query, dim=0) @ references.T)[None],
+                    ).squeeze())
+        expected = zero + sum(weight * torch.stack(family).mean()
+                              for weight, family in zip((.5, .25, .25), families))
+        gradient = torch.autograd.grad(expected, student)
+        result = RegionOrderingLoss("within_image")(student, targets, boxes)
+        torch.testing.assert_close(result["loss"], expected)
+        result["loss"].backward()
+        for actual, reference in zip(student, gradient):
+            torch.testing.assert_close(actual.grad, reference, atol=3e-5, rtol=3e-4)
+
     @unittest.skipUnless(importlib.util.find_spec("diffsort"), "Optional upstream parity check")
     def test_sorter_values_permutations_and_gradients_match_neco_dependency(self):
         from diffsort import DiffSortNet
-        for size in (2, 3, 4, 5, 7, 8, 17, 49, 65):
+        for size in (2, 3, 4, 5, 7, 8, 17, 49, 65, 191):
             with self.subTest(size=size):
                 torch.manual_seed(size)
                 similarities = torch.randn(3, size, requires_grad=True)
