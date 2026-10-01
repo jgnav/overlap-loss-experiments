@@ -171,6 +171,43 @@ Logs include `region_global_global_loss`, `region_global_local_loss`,
 `region_global_local_valid_ratio` and `region_global_local_pairs_per_image`.
 Changing this flag requires a new continuation rather than exact resume.
 
+`loss_modality: patch_rank_distribution` adds patch-wise neighborhood ranking
+supervision alongside the existing centered-softmax regional mean loss. Its
+ablation is `config/ablations/loss_modality_patch_rank_distribution.yaml`: the
+same 50-epoch continuation, checkpoint and seed, with batch size 48 per GPU.
+Only the loss selector and batch size differ from `config/train.yaml`.
+
+Use final backbone patch features before the projection head, excluding CLS
+and registers. The teacher sees unmasked globals; the student keeps its normal
+global masking and local-crop training. Define one global/global intersection
+per image, honoring `region_min_area`, flips and fully contained patches;
+require at least four selected patches in each global view. Each eligible image
+supplies one detached teacher reference from the global with the most selected
+patches (ties choose global 0). Normalize each teacher patch feature, average
+inside that reference region, then normalize the mean.
+
+Sample up to 49 distinct references from other eligible images across all GPUs,
+excluding the query image. This fixed cap follows NeCo's 7x7 reference count and
+bounds the quadratic cost of sorting every patch. Fewer than two external
+references skips this auxiliary loss. Teacher and student use exactly the same
+reference identities/order, shared by both cross-view directions. For every
+selected patch, compute cosine similarities and the existing steepness-100
+bitonic soft permutation. Average these full identity-by-rank matrices within
+each view's overlap, then apply teacher-to-student permutation cross-entropy
+(sum identities, mean ranks). Teacher/reference features are detached; gradients
+reach the student backbone directly, with no new head or trainable module.
+Different numbers of selected patches are supported by separate means.
+
+The objective is `L_DINO + L_iBOT + 0.4 L_region + 0.1 L_patch_rank_distribution`.
+The original CLS, iBOT, centering/center updates, regional mean and EMA behavior
+are unchanged. The fixed auxiliary coefficient is not a YAML parameter. Logs
+reuse `region_ordering`, `region_ordering_raw`, query/reference counts and weight.
+The sampler step is checkpointed for exact resume; changing `loss_modality`
+requires a fresh continuation. Patch matrices are streamed in bounded tiles,
+with only student sorting recomputed for first-order backward; teacher sorting
+is computed once. See `benchmarks/benchmark_patch_rank_distribution.py` for a
+CPU-only full loss forward/backward benchmark.
+
 `loss_modality: standard` preserves the existing objective. The two ordering
 ablations change this selector and set `batch_size_per_gpu: 48` from `config/train.yaml`:
 

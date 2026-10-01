@@ -881,23 +881,29 @@ def train_one_epoch(
         ):
             with torch.no_grad():
                 diagnostic_batch = iteration < args.diagnostic_feature_batches
+                need_rank_features = ibot_loss.needs_patch_rank_features and ibot_loss.lambda3 != 0
+                need_teacher_features = diagnostic_batch or need_rank_features
                 teacher_result = teacher(
                     images[: args.global_crops_number],
-                    return_backbone_feat=diagnostic_batch,
+                    return_backbone_feat=need_teacher_features,
                     return_region_logits=ibot_loss.deep_region and ibot_loss.lambda3 != 0,
                 )
                 teacher_region_logits = None
                 teacher_region_targets = None
                 if ibot_loss.deep_region and ibot_loss.lambda3 != 0:
                     *teacher_result, teacher_region_logits = teacher_result
-                    if not diagnostic_batch:
+                    if not need_teacher_features:
                         teacher_result = teacher_result[0]
-                if diagnostic_batch:
+                if need_teacher_features:
                     backbone_features, teacher_output = teacher_result
                 else:
                     teacher_output = teacher_result
-                if diagnostic_batch:
+                teacher_patch_features = None
+                if need_teacher_features:
                     register_count = teacher_without_ddp.backbone.num_register_tokens
+                    if need_rank_features:
+                        teacher_patch_features = backbone_features[:, 1 + register_count:]
+                if diagnostic_batch:
                     feature_diagnostics.update(
                         backbone_features[:, 1 + register_count:]
                     )
@@ -908,7 +914,7 @@ def train_one_epoch(
                         teacher_region_logits, teacher_targets[1],
                         ibot_loss.teacher_temp2_schedule[epoch],
                     )
-            need_student_features = ibot_loss.koleo_regularizer
+            need_student_features = ibot_loss.koleo_regularizer or need_rank_features
             student_result = student(
                 images[: args.global_crops_number],
                 mask=masks[: args.global_crops_number],
@@ -926,6 +932,11 @@ def train_one_epoch(
                 student_output = student_result
             student_cls_features = (
                 student_backbone_features[:, 0] if need_student_features else None
+            )
+
+            student_patch_features = (
+                student_backbone_features[:, 1 + student.module.backbone.num_register_tokens:]
+                if need_rank_features else None
             )
 
             student.module.backbone.masked_im_modeling = False
@@ -955,6 +966,8 @@ def train_one_epoch(
                 teacher_region_logits=teacher_region_logits,
                 teacher_region_targets=teacher_region_targets,
                 student_local_patch_logits=student_local_patch_logits,
+                student_patch_features=student_patch_features,
+                teacher_patch_features=teacher_patch_features,
             )
             loss = all_loss.pop("loss")
 

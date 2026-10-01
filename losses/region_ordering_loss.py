@@ -25,8 +25,8 @@ SORT_PERMUTATION_ELEMENTS = 4 * 1024 * 1024
 
 
 def validate_loss_modality(modality, aggregation, normalization, threshold, ngcrops, nlcrops):
-    if modality not in ("standard", "cross_image", "within_image"):
-        raise ValueError("loss_modality must be standard, cross_image, or within_image")
+    if modality not in ("standard", "cross_image", "within_image", "patch_rank_distribution"):
+        raise ValueError("loss_modality must be standard, cross_image, within_image, or patch_rank_distribution")
     if modality != "standard" and (
         aggregation != "mean" or normalization != "centering" or threshold != 1.0
         or ngcrops != 2 or (modality == "within_image" and nlcrops < 2)

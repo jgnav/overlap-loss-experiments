@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from .region_loss import RegionLoss
 from .local_region_loss import global_local_region_loss, validate_local_region_settings
 from .koleo_loss import KoLeoLoss
+from .patch_rank_distribution_loss import PatchRankDistributionLoss
 from .region_ordering_loss import RegionOrderingLoss, ORDERING_WEIGHT, validate_loss_modality
 
 
@@ -61,8 +62,13 @@ class iBOTLoss(nn.Module):
         validate_loss_modality(loss_modality, region_aggregation, region_normalization,
                                region_patch_threshold, ngcrops, nlcrops)
         self.loss_modality = loss_modality
-        self.ordering_loss = (RegionOrderingLoss(loss_modality, student_temp, ordering_seed, region_min_area)
-                              if loss_modality != "standard" else None)
+        self.needs_patch_rank_features = loss_modality == "patch_rank_distribution"
+        if self.needs_patch_rank_features:
+            self.ordering_loss = PatchRankDistributionLoss(ordering_seed, region_min_area)
+        elif loss_modality != "standard":
+            self.ordering_loss = RegionOrderingLoss(loss_modality, student_temp, ordering_seed, region_min_area)
+        else:
+            self.ordering_loss = None
         self.needs_local_patch_logits = include_local_crops or loss_modality == "within_image"
         self.region_depths = tuple(region_depths)
         self.deep_region = region_normalization == "deep"
@@ -259,6 +265,8 @@ class iBOTLoss(nn.Module):
         teacher_region_logits=None,
         teacher_region_targets=None,
         student_local_patch_logits=None,
+        student_patch_features=None,
+        teacher_patch_features=None,
     ):
         """Compute baseline centered DINO/iBOT plus region composition."""
         student_cls, student_patch = student_output
@@ -396,11 +404,22 @@ class iBOTLoss(nn.Module):
         if self.ordering_loss is not None and self.lambda3 != 0:
             if self.loss_modality == "within_image" and student_local_patch_logits is None:
                 raise ValueError("Ordering loss_modality requires student local patch logits")
-            ordering_stats = self.ordering_loss(
-                (raw_student_patch_c + student_local_patch_logits.chunk(self.nlcrops)
-                 if self.loss_modality == "within_image" else raw_student_patch_c),
-                teacher_patch_c, crop_boxes,
-            )
+            if self.needs_patch_rank_features:
+                if student_patch_features is None or teacher_patch_features is None:
+                    raise ValueError("patch_rank_distribution requires pre-head teacher/student patch features")
+                if (student_patch_features.shape[:2] != student_output[1].shape[:2]
+                        or teacher_patch_features.shape[:2] != teacher_targets[1].shape[:2]):
+                    raise ValueError("Backbone patch features must exclude CLS/register tokens and match logits")
+                ordering_stats = self.ordering_loss(
+                    student_patch_features.chunk(self.ngcrops),
+                    teacher_patch_features.detach().chunk(self.ngcrops), crop_boxes,
+                )
+            else:
+                ordering_stats = self.ordering_loss(
+                    (raw_student_patch_c + student_local_patch_logits.chunk(self.nlcrops)
+                     if self.loss_modality == "within_image" else raw_student_patch_c),
+                    teacher_patch_c, crop_boxes,
+                )
             ordering_raw = ordering_stats["loss"]
             ordering = ORDERING_WEIGHT * ordering_raw
             objective = objective + ordering

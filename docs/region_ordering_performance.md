@@ -65,3 +65,27 @@ CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 python benchmarks/benchmark_region_ord
 
 Omit `--reference-source` to measure just the current implementation. Add
 `--profile` for CPU operator counts. The script never launches a GPU or backbone.
+
+## Patch-wise regional rank distribution
+
+The third modality, `patch_rank_distribution`, retains the optimized geometry
+and bitonic wiring. Its continuous backbone feature bank uses shared matrix
+multiplication, gathers only scalar similarities and samples at most 49 external
+regions. Patch permutation matrices are reduced into regional means in tiles
+of at most 128 patches (also bounded by the permutation-element budget). Only
+scalar cosine vectors and patch-to-region indices are retained for student
+backward; the sorter is recomputed one tile at a time. Teacher sorting is
+performed once without gradients. This gives exact first-order gradients for
+the mean-of-matrices objective without retaining every patch's sorting stages.
+
+A single-thread CPU benchmark at batch size 48, feature dimension 384, native
+14x14 grids, two global views, four simulated reference-bank ranks and 49
+references measured **5.763 seconds** for one forward/backward step after a
+warmup, with finite gradients. This is a loss-only CPU measurement, excludes
+communication/backbone/optimizer, and does not predict GPU epoch time. Sorting
+every patch is inherently more work than sorting one mean per region.
+
+```bash
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 python benchmarks/benchmark_patch_rank_distribution.py \
+  --batch-size 48 --features 384 --iterations 1
+```
