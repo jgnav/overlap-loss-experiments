@@ -31,7 +31,7 @@ if [[ ! -f "$config_path" ]]; then
     exit 2
 fi
 
-export IBOT_RUN_ID="$SLURM_JOB_ID"
+export IBOT_RUN_ID="${IBOT_RUN_ID:-$SLURM_JOB_ID}"
 export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
 

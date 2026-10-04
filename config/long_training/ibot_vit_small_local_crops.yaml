@@ -5,7 +5,7 @@
 # Paths
 data_path: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets/imagenet/train
 initial_checkpoint: checkpoints/ibot_vit_small.pth
-output_dir: output/ablation
+output_dir: output/long_ibot_vit_small_local_crops
 resume_checkpoint: null
 reset_optimizer: true
 
@@ -22,12 +22,12 @@ ibot_plus_plus: false
 koleo_regularizer: false
 region_min_area: 0.1
 region_patch_threshold: 1.0
-region_normalization: deep
+region_normalization: centering
 # mean, mean_scalar_variance, mean_variance, mean_covariance,
 # mean_projected_variance, mean_projected_covariance, swd,
 # mean_centered_swd, mean_normalized_swd. Selection/area weights apply first.
 region_aggregation: mean
-include_local_crops: false
+include_local_crops: true
 loss_modality: standard
 region_temp: 0.07
 momentum_teacher: 0.9995
@@ -35,9 +35,9 @@ teacher_temp: 0.07
 teacher_patch_temp: 0.07
 
 # Fresh post-pretraining stage
-additional_epochs: 50
+additional_epochs: 200
 gpu_count: 4
-batch_size_per_gpu: 32
+batch_size_per_gpu: 64
 seed: 0
 # Choose bf16 for supported GPUs, or fp16 to use a GradScaler.
 precision: fp16
@@ -53,7 +53,7 @@ weight_decay_end: 0.5
 saveckp_freq: 50
 
 # Data loading
-num_workers: 10
+num_workers: 6
 
 # Diagnostics
 diagnostic_feature_batches: 1
@@ -69,12 +69,13 @@ online_probe_batch_size: 128
 online_probe_num_workers: 0
 online_probe_max_concurrent_jobs: 1
 online_probe_wait_at_exit: true
+online_probe_cleanup_completed_snapshots: true
 online_probe_gpu: null
 
 # Weights & Biases
 wandb_mode: online
 wandb_project: ibot-imagenet1k
 wandb_entity: null
-wandb_run_name: null
+wandb_run_name: ibot-200e-vit-small-local-crops
 wandb_run_id: null
 wandb_resume: null

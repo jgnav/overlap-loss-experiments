@@ -36,10 +36,10 @@ from utils.pca_alignment import align_pca_components
 # ---- Standalone configuration ---------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parent
 IMAGENET_VAL = Path("/mnt/fast/nobackup/scratch4weeks/jg02228/datasets/imagenet/val")
-OUTPUT_DIR = REPO_ROOT / "output" / "imagenet_visualizations"
+OUTPUT_DIR = REPO_ROOT / "output" / "imagenet_visualizations" / "long_vit_small_20261001"
 CHECKPOINTS = {
-    "iBOT": REPO_ROOT / "checkpoints/ibot_vit_small.pth",
-    "Ours": REPO_ROOT / "output/ablation/83650_0/checkpoint.pth",
+    "iBOT": REPO_ROOT / "output/long_ibot_vit_small_reference/85535_3/checkpoint.pth",
+    "Ours": REPO_ROOT / "output/long_ibot_vit_small/85535_0/checkpoint.pth",
 }
 N_IMAGES = 10
 SEED = 1
