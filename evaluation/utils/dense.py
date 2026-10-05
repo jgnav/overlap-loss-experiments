@@ -25,8 +25,7 @@ from evaluation.utils.common import (
 from evaluation.utils.datasets import DATASET_SPECS, segmentation_manifest
 
 
-# Compatibility default for callers without a model; production uses the
-# checkpoint's patch size through dense_resolution().
+# CRISP's resolution adjustment preserves 256 spatial tokens for each backbone.
 DENSE_RESOLUTION = 256
 
 
@@ -107,8 +106,9 @@ def _extract_features(model, dataset, batch_size, num_workers, description):
         images = images.cuda(non_blocking=True)
         tokens = model.get_intermediate_layers(images, n=1)[0][:, 1:]
         grid_size = math.isqrt(tokens.shape[1])
-        if grid_size != 16 or tokens.shape[1] != 256:
-            raise ValueError(f"Expected 256 patch tokens, got {tokens.shape[1]}")
+        expected_grid = images.shape[-1] // model.patch_embed.patch_size
+        if grid_size != expected_grid or tokens.shape[1] != grid_size ** 2:
+            raise ValueError(f"Unexpected patch grid: {tokens.shape[1]} tokens")
         batch_features = tokens.reshape(-1, tokens.shape[-1]).float().cpu()
         batch_labels = _patchify_labels(targets, grid_size, grid_size).cpu()
         if features is None:
@@ -195,6 +195,7 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
     start_time = time.monotonic()
     model, metadata = load_backbone(args.checkpoint, args.checkpoint_key, args.arch)
     resolution = dense_resolution(metadata["patch_size"])
+    patch_tokens = (resolution // metadata["patch_size"]) ** 2
     model.cuda().eval()
     spec = DATASET_SPECS[dataset_name]
     full_train = spec["factory"](args.datasets_root, spec["train_split"])
@@ -207,7 +208,7 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
     print(
         f"CAPI {CAPI_REVISION}: {dataset_name}, {spec['train_split']} -> "
         f"{spec['test_split']}, resolution={resolution}, patch_size={metadata['patch_size']}, "
-        "patch_tokens=256, distributed feature extraction and probe search", flush=True,
+        f"patch_tokens={patch_tokens}, distributed feature extraction and probe search", flush=True,
     )
     # Upstream draws its holdout with NumPy's global RNG.
     np.random.seed(args.seed)
@@ -223,6 +224,8 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
         resolution=resolution,
         ignore_labels=spec["ignore_labels"],
         output_dir=str(args.output_dir),
+        # Matches the released CAPI default_eval_config.yaml ADE20K override.
+        classifiers_kwargs={"knn": {"dtype": "bfloat16"}} if dataset_name == "ade20k" else None,
     )
     if not is_main_process():
         return None
@@ -238,15 +241,16 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
             "source": "Pinned official CAPI segmentation evaluator with local I/O adapters",
             "capi_revision": CAPI_REVISION,
             "dataset_train_split": spec["train_split"], "dataset_test_split": spec["test_split"],
-            "input_resolution": resolution, "patch_tokens": 256,
-            "resolution_rule": "16 * checkpoint patch size",
+            "input_resolution": resolution, "patch_tokens": patch_tokens,
+            "resolution_rule": "CRISP adjustment: 16 * checkpoint patch size (256 spatial tokens)",
+            "knn_dtype": "bfloat16" if dataset_name == "ade20k" else "float32",
             "backbone_frozen": True,
             "feature": f"final normalized {args.checkpoint_key} patch tokens",
             "standardization": "StandardScaler fitted on train only",
             "validation_split": "seeded 10% of training set",
             "num_classes": spec["num_classes"], "ignore_labels": list(spec["ignore_labels"]),
             "gpu_count": dist.get_world_size(),
-            "published_score_equivalence": "Exact CRISP dataset lists and CAPI revision not established",
+            "published_score_equivalence": "Pinned CAPI probe recipe; original VOC split and local dataset ordering are recorded separately",
         },
         **_format_capi_result(raw, classifier_name),
     }
@@ -262,7 +266,7 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
 
 def dense_entrypoint(module, dataset_name, classifier_name, evaluation_name):
     parser = base_parser(
-        f"CRISP {DATASET_SPECS[dataset_name]['display_name']} "
+        f"CAPI {DATASET_SPECS[dataset_name]['display_name']} "
         f"{classifier_name} evaluation"
     )
     parser.add_argument("--batch-size", type=int, default=128)

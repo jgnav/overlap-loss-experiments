@@ -218,7 +218,7 @@ class VOCClassificationPreparationTest(unittest.TestCase):
 
 
 class SegmentationResolutionTest(unittest.TestCase):
-    def test_256_resolution_produces_256_tokens_with_aligned_labels(self):
+    def test_crisp_256_resolution_produces_256_tokens_with_aligned_labels(self):
         image_transform, target_transform = dense._dense_transforms()
         image = image_transform(Image.new("RGB", (400, 200)))
         # Each patch has a unique row-major label. Patchification must retain the

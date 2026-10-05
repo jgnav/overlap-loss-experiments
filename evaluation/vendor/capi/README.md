@@ -1,4 +1,4 @@
-# Pinned CAPI segmentation evaluator
+# Pinned CAPI evaluation code
 
 Source: https://github.com/facebookresearch/capi/blob/98b4fa17ee8eec8810c17022df9a27a44845368b/eval_segmentation.py
 
@@ -23,10 +23,31 @@ parameter candidates across ranks; its final refit/scoring remains on rank 0.
 CAPI still performs its own NumPy
 10% holdout, feature standardization, sweep, refit, and final scoring.
 
-Resolution is passed explicitly as `16 * patch_size`: 224 for patch size 14,
-256 for patch size 16. This is CRISP's token-count convention, not CAPI's default
-224 for all models. No legacy feature cache is consumed by this evaluator.
+Resolution retains the user-selected CRISP adjustment: 256 pixels for /16
+and 224 for /14, giving 256 patches in both cases. This differs from upstream
+CAPI's fixed 224-pixel segmentation input. Labels and shard gathering use the actual patch grid.
+ADE20K k-NN uses the bfloat16 override from the released default evaluation YAML.
+VOC uses the user-selected original train/val splits; published VOC-score
+reproduction is not guaranteed by upstream's loader either.
 
-This pins the released implementation, not a claim that CRISP used this exact
-revision, VOC split, or dataset ordering. CAPI's warning about its VOC paper
-results remains relevant to published-score comparisons.
+## Classification
+
+`eval_classification.py` is from the same revision; `classification_support.py`
+copies upstream InfiniteSampler, make_data_loader, DatasetWithEnumeratedTargets,
+MetricLogger and SmoothedValue. Local changes:
+
+- Deferred annotation-only imports and removed upstream CLI/OmegaConf dependencies.
+- Local ImageFolder/checkpoint adapter; independent copies preserve training and
+  holdout transforms. The adapter matches CAPI's released iBOT model-output API.
+- Persist final holdout sweep and selected test classifiers for JSON reporting.
+- Atomic checkpoint/symlink replacement and retain only the latest checkpoint.
+- Fail explicitly on nonfinite loss; do not change classifier calculations.
+- Convert local ImageFolder identifiers to path strings in result keys.
+
+The 12,500-step AdamW schedule, 30 parameter candidates per feature, initializers,
+attention head, multi-head loss, fixed seed-42 split and sampler, padding and
+selection logic remain upstream. Batch per GPU is 1024 / GPU count (256 on four).
+Eager execution (`use_compile=False`) avoids compilation of the 120-head graph;
+it leaves the mathematical protocol unchanged. No mixed precision is introduced.
+
+Source: https://github.com/facebookresearch/capi/blob/98b4fa17ee8eec8810c17022df9a27a44845368b/eval_classification.py

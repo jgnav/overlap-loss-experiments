@@ -32,21 +32,24 @@ class CAPIIntegrationTest(unittest.TestCase):
             classifier.select_hparams(*(torch.zeros(1) for _ in range(4)))
         self.assertEqual(classifier.choice, 1)
 
-    def test_patch_sizes_preserve_256_tokens_and_pixel_alignment(self):
+    def test_crisp_resolution_preserves_256_tokens_and_pixel_alignment(self):
         for ps in (14, 16):
             with self.subTest(patch_size=ps):
                 resolution = dense.dense_resolution(ps)
-                self.assertEqual(resolution, {14: 224, 16: 256}[ps])
+                self.assertEqual(resolution, 16 * ps)
+                grid = resolution // ps
+                count = grid ** 2
+                self.assertEqual(count, 256)
                 transform, target_transform = dense._dense_transforms(resolution)
                 image = transform(Image.new('RGB', (350, 280)))
-                target = np.arange(256, dtype=np.uint8).reshape(16, 16).repeat(ps, 0).repeat(ps, 1)
+                target = np.arange(count, dtype=np.uint8).reshape(grid, grid).repeat(ps, 0).repeat(ps, 1)
                 labels = target_transform(Image.fromarray(target))
                 model = VisionTransformer(img_size=[224], patch_size=ps, embed_dim=12, depth=1, num_heads=3).eval()
                 with torch.no_grad():
                     tokens = model.get_intermediate_layers(image[None], n=1)[0][:, 1:]
-                self.assertEqual(tokens.shape, (1, 256, 12))
-                expected = torch.arange(256, dtype=torch.uint8)[:, None].expand(-1, ps * ps)
-                self.assertTrue(torch.equal(dense._patchify_labels(labels[None], 16, 16), expected))
+                self.assertEqual(tokens.shape, (1, count, 12))
+                expected = torch.arange(count, dtype=torch.uint8)[:, None].expand(-1, ps * ps)
+                self.assertTrue(torch.equal(dense._patchify_labels(labels[None], grid, grid), expected))
 
     def test_checkpoint_loading_infers_patch_size_and_position_grid(self):
         def factory(architecture, **kwargs):

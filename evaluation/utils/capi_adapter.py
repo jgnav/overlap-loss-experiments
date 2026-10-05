@@ -47,8 +47,10 @@ def extract_features(model, dataset, batch_size, num_workers, *, gather_on_cpu=F
         features, labels = _extract_features(
             model, shard, batch_size, num_workers, f"CAPI features rank {rank}"
         )
-        features = features.reshape(len(shard), 16, 16, -1)
-        labels = labels.reshape(len(shard), 16, 16, -1)
+        import math
+        grid = math.isqrt(features.shape[0] // len(shard))
+        features = features.reshape(len(shard), grid, grid, -1)
+        labels = labels.reshape(len(shard), grid, grid, -1)
     if world_size == 1:
         return features, labels
     return gather_image_shards(features, labels, len(dataset))
