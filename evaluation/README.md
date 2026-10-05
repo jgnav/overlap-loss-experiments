@@ -1,8 +1,9 @@
 # Evaluation protocols
 
 Each evaluation has one implementation and one fixed recipe. There are no
-CG-SSL/CAPI/CRISP mode switches. The main references are CG-SSL and CRISP;
-CAPI supplies the segmentation implementation they cite.
+protocol mode switches. ImageNet linear/attentive classification and semantic
+segmentation use the pinned official CAPI evaluator. Other tasks retain their
+existing CRISP/iBOT or task-specific recipes and are non-CAPI extensions.
 
 Training-time monitoring uses these same evaluators for PASCAL VOC k-NN and
 linear segmentation and ImageNet 10% CLS k-NN classification, including their
@@ -18,14 +19,19 @@ handle dataset paths, final normalized patch features, logging and JSON output.
 Equal-scoring parameter choices retain the original grid order across GPU counts.
 See [vendor provenance and integration changes](vendor/capi/README.md).
 
-**CRISP's 256-patch-token convention** is applied dynamically: the checkpoint's
-convolution kernel determines patch size, and input resolution is 16 times
-that size. Patch size 14 uses **224 x 224**; patch size 16 uses **256 x 256**.
-Both produce a 16 x 16 grid. Positional embeddings retain their checkpoint grid
-and interpolate during inference. Compatible iBOT-style ViT-S/B/L checkpoints
-are supported; this does not promise compatibility with arbitrary architectures
-(e.g. register tokens or different transformer blocks). Unsupported patch sizes
-fail explicitly. Classification remains 224 x 224.
+**CRISP's resolution adjustment** is retained: 256 x 256 for patch size 16
+and 224 x 224 for patch size 14. Both produce a 16 x 16 grid (256 tokens).
+This intentionally differs from upstream CAPI's fixed 224-pixel segmentation
+input. Labels are patchified using the actual grid and patch
+size. Final normalized teacher patch features follow CAPI's released iBOT loader.
+Registers are excluded from spatial features. Compatible iBOT-style ViT-S/B/L
+checkpoints are supported; this does not promise compatibility with arbitrary
+architectures. Classification also uses 224 x 224.
+
+The released CAPI `default_eval_config.yaml` uses bfloat16 nearest-neighbor
+search for ADE20K; that override is applied. VOC/Cityscapes use the evaluator's
+float32 default. Backbone feature extraction and cuML logistic regression remain
+float32; TF32 is enabled as in CAPI's runtime setup.
 
 ADE20K, PASCAL VOC 2012 and Cityscapes use frozen final-block patch features,
 train-only StandardScaler, a seeded 10% training holdout for selecting probe
@@ -66,10 +72,9 @@ ADE20K uses official `training` (20,210 images) and `validation` (2,000),
 150 classes, ignoring labels 0 and 255. Cityscapes uses `leftImg8bit` with
 `gtFine` train (2,975) and val (500), maps the 19 evaluation classes to train
 IDs, and ignores other labels (255); coarse annotations and test images are
-not used. Both retain the same CAPI-style holdout/probes and CRISP's 256-token
-resolution. ImageNet classification uses official train/val with matching
+not used. Both retain the CAPI holdout/probes and CRISP's 256-token resolution adjustment. ImageNet classification uses official train/val with matching
 1,000-class vocabularies; k-NN uses 1%, 10%, and 100% training banks and
-linear probing uses all training images. VOC multilabel classification remains
+linear/attentive probing reserves 10% of training images as an internal holdout. VOC multilabel classification remains
 separate from segmentation: official VOC2012 `ImageSets/Main` train/val.
 COCO remains the explicitly selected 2017 train/val baseline. Exact CRISP
 classification split/recipe equivalence is **not established**; see below.
@@ -84,80 +89,65 @@ are edited in place. Retain result JSON files with the evaluated checkpoints.
 
 ## Classification
 
-Full-data linear probes use the following fixed settings:
+### ImageNet: pinned CAPI linear and attentive probes
+
+`imagenet_linear` runs the released CAPI classifier implementation at revision
+`98b4fa17ee8eec8810c17022df9a27a44845368b`. It trains linear heads on final CLS,
+mean final patch, and concatenated final CLS/mean-patch features, plus attentive
+heads on final patch tokens. ViT-S no longer concatenates four intermediate CLS
+blocks. All heads share a single frozen backbone forward per batch.
+
+- **12,500 optimizer iterations**, global batch **1,024**, on 90% of ImageNet
+  training images. Approximately 10 full-dataset passes (11.1 over the 90% split).
+- Fixed 10% holdout with `numpy.default_rng(42)`; official validation is the test
+  set. No reported-test-set tuning.
+- **AdamW**, betas `(0.9, 0.95)`, 1,250-step linear warmup then cosine decay.
+- 30 hyperparameter candidates **per feature source**: base learning rates
+  `{1e-5,2e-5,5e-5,1e-4,2e-4,5e-4,1e-3,2e-3,5e-3,1e-2}` crossed with weight
+  decays `{5e-4,1e-3,5e-2}`. Rates scale by global batch / 256; bias decay is zero.
+- Bicubic random resized crop to 224 and horizontal flip for training; bicubic
+  resize to 256 and center crop to 224 for holdout/test.
+- CAPI's infinite distributed sampler (seed 42), worker persistence, masked
+  padding for validation and independent heldout selection per feature source.
+- Checkpoint and validation every 1,250 steps. Checkpoint writes are atomic and
+  only the latest classifier checkpoint is retained. A protocol/checkpoint/input
+  signature rejects incompatible resume. Old 200-epoch SGD probes cannot resume
+  into this protocol; start them in a new output directory.
+
+`metrics.top1` is the heldout-selected **CLS linear** test accuracy;
+`metrics.attentive_top1` is the patch-attentive accuracy. `feature_results`
+contains the separate CLS, average-patch, concatenated-feature and attentive
+results with selected parameters. `validation_sweep.json` contains all 120
+candidates; `test_classifiers.json` contains the four selected classifiers.
+CAPI reports top-1; a top-5 number is not invented for this evaluator.
+
+The model adapter exposes the same final normalized iBOT features as CAPI's
+released `baselines/ibot_loader.py`. This reproduces the probe recipe on our
+backbones, not CAPI's pretrained representations. Eager execution is used rather
+than compiling the 120-head graph; this is an execution choice, not a change to
+loss, optimizer, schedule or model selection. Four GPUs use 256 images each.
+
+### Non-CAPI classification extensions
+
+CAPI does not release the VOC/COCO/Visual Genome multilabel or few-shot recipes
+used here. As requested, these retain their existing CRISP-derived settings:
 
 | Evaluation | Training data | Epochs | Metric |
 | --- | --- | --- | --- |
-| `imagenet_linear` | Full ImageNet-1K train | 200 | Top-1/top-5 (%) |
 | `pascal_voc_multilabel` | Explicit Pascal classification train split, 20 classes | 500 | mAP |
 | `coco_multilabel` | Explicit COCO classification train split, 80 classes | 200 | mAP |
+| `visual_genome_multilabel` | Explicit VG500 train split, 500 classes | 200 | mAP |
 
-CRISP A.2 specifies 224 x 224 inputs, four GPUs, batch size 256 per GPU, learning
-rate 0.001, and these epoch counts. Automatic GPU scaling targets the same total
-training batch of 1,024 images; see the GPU behavior below. The frozen backbone remains in evaluation
-mode; only a linear layer is trained. The existing `imagenet_knn` remains the
-10% reference-bank evaluation used in CRISP's ablations. The additional
-`imagenet_knn_1pct` and `imagenet_knn_100pct` evaluations complete CRISP Table 4's
-k-NN fractions. All three evaluate the **entire ImageNet validation set** and
-use the same iBOT weighted k-NN recipe: final CLS features, L2 normalization,
-temperature 0.07, and primary k=20 (also reporting k=10/100/200). The 1% and
-10% banks use the fixed ImageNet image lists supplied by SimCLRv2, as required
-by iBOT's semi-supervised frozen-feature protocol. The lists are vendored under
-`evaluation/resources/simclrv2_imagenet_subsets/` and resolved against the
-canonical ImageNet training directory; 100% uses every training image in
-dataset order. Each result records the supplied-list checksum, sample counts,
-and resolved-index hash. Each task extracts its own features; the 100% bank
-needs substantially more GPU memory and work.
+These use SGD/momentum, fixed learning rate 0.001 before cosine decay, global
+batch 1,024, iBOT pooling and bilinear random crops. They report final-epoch
+macro AP with unknown/difficult labels masked. Their unchanged VOC 1/2/5-shot
+variants sample positive images per class, deduplicate the union and train for
+500 epochs. They must not be described as CAPI classification protocols.
 
-`pascal_voc_1shot`, `pascal_voc_2shot`, and `pascal_voc_5shot` implement CRISP
-Table 3's low-shot classification settings. They use the same VOC classification
-manifest and 500-epoch linear recipe as the full-data probe. For each class,
-sample 1, 2, or 5 **positive training images** without replacement using a fixed
-seed, then train on the deduplicated union. Preserve all labels, including
-ignored labels, of each selected image. Multilabel overlap can make the number
-of positive examples for a class exceed the requested shot count; the number
-of unique images can be smaller than 20 times the shot count. No extra negative
-images are added. All three probes evaluate the full original validation set.
-
-For a fixed seed and manifest, per-class permutations are shared across shot
-counts, so 1-shot selections are contained in 2-shot, then 5-shot selections.
-Result JSON and `protocol.json` retain selected indices/images, per-class draws,
-actual positive counts, and a subset hash. CRISP does not specify the seed,
-overlap handling, or nesting: these are explicit reproducible implementation
-choices, not verified author splits. Low-shot datasets produce smaller batches with the existing
-distributed sampler. Use the same manifest and `--seed` for all models.
-
-Every regime has its own result row and probe-checkpoint directory. ImageNet
-linear probing continues to use 100% of the training images.
-
-### Details not established by the papers
-
-CG-SSL does not specify a complete classification training recipe. CRISP adds
-the settings above, but still omits optimizer/schedule, pooling, augmentation,
-exact dataset splits/vocabularies, AP variant, and checkpoint selection. This
-implementation therefore **cannot claim exact published-score reproduction**.
-The full protocol and unresolved choices are saved in every result JSON:
-
-- iBOT-derived pooling: concatenate the last four normalized CLS tokens for
-  ViT-S; for ViT-B/L concatenate the final CLS token and mean final patch token.
-- iBOT-derived optimizer: SGD, momentum 0.9, no weight decay, epoch-wise cosine
-  decay to zero, no warmup. The actual initial learning rate is 0.001; the code
-  does not apply iBOT's extra batch-size rescaling to CRISP's stated rate.
-- iBOT-derived transforms: train RandomResizedCrop(224, bilinear) and horizontal
-  flip; validation shorter-side resize to 256 (bicubic), center crop to 224;
-  ImageNet normalization for both. Features are recomputed from augmented
-  images during probe training, not cached from one deterministic crop.
-- Multiclass cross entropy; multilabel BCE over known labels only. Unknown
-  labels do not contribute gradients or AP. Report non-interpolated per-class
-  average precision and average over the fixed vocabulary. A class with no
-  validation positives gets AP=0 and is explicitly listed in the result.
-- Evaluate the final epoch. Do not select the best epoch on the reported
-  validation set. Probe checkpoints support resuming the same recipe.
-
-These are documented implementation choices, not additional alternative
-protocols. Author-supplied evaluation code/configs would be needed to verify
-them. The full-data multilabel manifests below deliberately make all data
-definitions explicit rather than guessing VOC/COCO versions or splits.
+ImageNet 1%, 10% and 100% k-NN also remain non-CAPI extensions: fixed
+SimCLRv2/iBOT banks, final CLS, temperature 0.07 and primary k=20. CAPI has no
+released image-level k-NN classifier. Correspondence and video tasks similarly
+retain their existing task-specific implementations.
 
 ### Input manifests
 
@@ -279,13 +269,16 @@ automatically launches one worker per visible NVIDIA GPU, including a proper
 distributed process group on a single GPU. No GPU-count setting is required.
 An explicit existing `torchrun` launch is respected. Zero GPUs fails clearly.
 
-- Linear classification uses `max(1, floor(1024 / GPU count))` images per GPU
+- Non-CAPI multilabel classification uses `max(1, floor(1024 / GPU count))` images per GPU
   per training step. This preserves a total batch of 1,024 for 1/2/4/8 GPUs;
   other counts use the nearest lower multiple (3 GPUs: 1,023). Frozen backbone
   forwards use chunks of at most 256 images to limit activation memory. The
   learning rate stays 0.001. Results record actual GPU/batch counts. Smaller
   datasets/final batches remain smaller. Changing GPU count can change
   stochastic augmentation and sampling, so it does not promise identical scores.
+- CAPI ImageNet classification uses 1,024 / GPU count images per GPU and
+  requires a divisor of 1,024; 4 GPUs use 256. Its 120 heads are trained with
+  DDP and its validation metrics aggregate all ranks, excluding padding.
 - ImageNet k-NN distributes both feature extraction and validation queries.
   Each GPU holds the training bank; global top-1/top-5 count every validation
   image once.
@@ -294,8 +287,7 @@ An explicit existing `torchrun` launch is respected. Zero GPUs fails clearly.
   transfers. CAPI's final refit/scoring remains on rank 0, which alone writes
   the result JSON. Host memory requirements grow with worker count. The fixed
   eight-candidate search can use at most eight GPUs concurrently; extraction
-  can use more. This is a requested hardware adaptation of CRISP's one-GPU
-  segmentation setting.
+  can use more. This follows the released distributed CAPI evaluator.
 
 To restrict device use, set `CUDA_VISIBLE_DEVICES` before launching. When
 resuming an unfinished linear probe, keep the same GPU count: its saved
@@ -380,6 +372,9 @@ tasks that remain enabled.
 - CG-SSL: §4.2, Tables 1-2, reference [53] in the user-supplied 2025 PDF.
 - CRISP: §4.2 and Appendix A.2, page 16 of the user's local 30-page
   `25314_Consistent_Region_Inform.pdf` (NeurIPS 2026 version).
+- [CAPI classification evaluator](https://github.com/facebookresearch/capi/blob/98b4fa17ee8eec8810c17022df9a27a44845368b/eval_classification.py),
+  [classification protocol](https://arxiv.org/html/2502.08769v1#A6.SS1), and
+  [released defaults](https://github.com/facebookresearch/capi/blob/98b4fa17ee8eec8810c17022df9a27a44845368b/default_eval_config.yaml).
 - [CAPI segmentation evaluator](https://github.com/facebookresearch/capi/blob/main/eval_segmentation.py)
   and [released dataset loader](https://github.com/facebookresearch/capi/blob/main/data.py), inspected 2026-09-08.
 - [iBOT linear evaluator](https://github.com/bytedance/ibot/blob/main/evaluation/eval_linear.py)

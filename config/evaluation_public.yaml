@@ -16,7 +16,7 @@ seed: 0
 num_workers: 8
 # Evaluations automatically use all GPUs visible through CUDA_VISIBLE_DEVICES.
 # Slurm's GPU allocation controls how many devices are visible to the job.
-segmentation_batch_size: 128  # Feature extraction only; probe recipes stay fixed.
+segmentation_batch_size: 32  # Feature extraction only; probe recipes stay fixed.
 
 # Weights & Biases: online reads .wandb_key at the repository root.
 wandb_mode: offline  # online, offline, or disabled
@@ -29,7 +29,7 @@ wandb_resume: null  # null, allow, must, never; requires wandb_run_id when set
 # Set each evaluation to true or false. Omitted entries are disabled.
 # ImageNet k-NN percentages refer to training banks; all use full validation.
 evaluations:
-  pascal_voc_knn: true
+  pascal_voc_knn: true  # CAPI probes, CRISP resolution: 256 spatial patch tokens
   pascal_voc_linear: true
   ade20k_knn: true
   ade20k_linear: true
@@ -39,7 +39,7 @@ evaluations:
 
   imagenet_knn_1pct: true
   imagenet_knn_100pct: true
-  imagenet_linear: true
+  imagenet_linear: true  # CAPI: 12,500 iterations; linear + attentive heads
   pascal_voc_1shot: true
   pascal_voc_2shot: true
   pascal_voc_5shot: true

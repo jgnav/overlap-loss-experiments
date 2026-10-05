@@ -1,4 +1,4 @@
-"""Full-data and low-shot linear classification using CRISP A.2 settings.
+"""Multilabel and low-shot linear classification using CRISP A.2 settings.
 
 The papers do not specify a complete recipe. iBOT-derived implementation choices
 are identified in the saved protocol metadata and evaluation/README.md.
@@ -131,6 +131,9 @@ def _make_datasets(args, dataset_name):
 
 
 def _protocol(dataset_name, architecture, checkpoint_key, world_size=REFERENCE_GPU_COUNT):
+    if dataset_name == "imagenet":
+        from evaluation.utils.capi_classification import protocol
+        return protocol(world_size)
     n, average_patches = feature_spec(architecture)
     return {
         "source": "CRISP Appendix A.2; CG-SSL Table 2 task coverage",
@@ -142,7 +145,7 @@ def _protocol(dataset_name, architecture, checkpoint_key, world_size=REFERENCE_G
         "feature_microbatch_size": BATCH_SIZE_PER_GPU,
         "learning_rate": LEARNING_RATE,
         "learning_rate_scaled_by_batch_size": False,
-        "epochs": MULTILABEL_DATASETS.get(dataset_name, {"epochs": 200})["epochs"],
+        "epochs": MULTILABEL_DATASETS[dataset_name]["epochs"],
         "backbone_frozen": True, "checkpoint_key": checkpoint_key,
         "feature": {"concatenated_cls_blocks": n, "append_mean_patch_tokens": average_patches},
         "optimizer": "SGD", "momentum": 0.9, "weight_decay": 0.0,
@@ -233,6 +236,9 @@ def evaluate(backbone, head, dataset, architecture, multilabel, device, rank, wo
 
 
 def run_classification(args, dataset_name, evaluation_name, rank, world_size):
+    if dataset_name == "imagenet":
+        from evaluation.utils.capi_classification import run
+        return run(args, rank, world_size)
     started, start_time = utc_now(), time.monotonic()
     train, val, dataset_metadata = _make_datasets(args, dataset_name)
     shots = VOC_SHOT_EVALUATIONS.get(evaluation_name)
@@ -315,6 +321,9 @@ def run_classification(args, dataset_name, evaluation_name, rank, world_size):
 
 
 def classification_entrypoint(module, dataset_name, evaluation_name):
+    if dataset_name == "imagenet":
+        from evaluation.utils.capi_classification import entrypoint
+        return entrypoint()
     shots = VOC_SHOT_EVALUATIONS.get(evaluation_name)
     regime = "Full-data" if shots is None else f"{shots}-shot"
     parser = base_parser(f"{regime} {dataset_name} frozen linear classification (CRISP A.2 settings)")

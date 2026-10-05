@@ -15,6 +15,10 @@ Each scheduled teacher snapshot runs exactly the same offline task modules:
 
 Online and offline evaluation share the worker command builder and task entrypoints.
 See [the offline protocols](../evaluation/README.md) for full recipes.
+The shared segmentation entrypoints retain CRISP's resolution adjustment:
+256-pixel inputs for patch size 16 and 224 for patch size 14, producing 256
+patch tokens in both cases. Measurements using 224-pixel inputs for ViT-S/16
+are a different protocol and must not be mixed without identifying the change.
 Matching checkpoints and seeds use the same protocol; floating-point results can vary
 with hardware and extraction batch size. The former small-subset and configurable-k
 options have been removed.

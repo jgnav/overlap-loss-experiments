@@ -80,7 +80,8 @@ class AutomaticGPUTest(unittest.TestCase):
             self.assertEqual(protocol['gpu_count'], count)
             self.assertEqual(protocol['global_batch_size'], 1024)
             self.assertEqual(protocol['batch_size_per_gpu'], 1024 // count)
-        self.assertEqual(classification._protocol('imagenet', 'vit_small', 'teacher', 3)['global_batch_size'], 1023)
+        with self.assertRaises(ValueError):
+            classification._protocol('imagenet', 'vit_small', 'teacher', 3)
 
     def test_feature_microbatching_preserves_head_gradient(self):
         class Backbone(torch.nn.Module):

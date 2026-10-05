@@ -159,7 +159,7 @@ def _load_completed_result(path, args, evaluation_name):
 
 def _preflight_classification(args, evaluations):
     # Fail on missing/invalid annotation manifests before expensive segmentation
-    # or 200-epoch classification work begins. No data is downloaded implicitly.
+    # or classification work begins. No data is downloaded implicitly.
     from evaluation.utils.classification_data import (
         MULTILABEL_DATASETS, VOC_SHOT_EVALUATIONS, read_multilabel_manifest, sample_few_shot_indices,
     )
