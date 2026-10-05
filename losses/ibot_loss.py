@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .region_loss import RegionLoss
-from .local_region_loss import global_local_region_loss, validate_local_region_settings
+from .local_region_loss import global_local_region_loss, multiview_region_loss, validate_region_views
 from .koleo_loss import KoLeoLoss
 from .patch_rank_distribution_loss import PatchRankDistributionLoss
 from .region_ordering_loss import RegionOrderingLoss, ORDERING_WEIGHT, validate_loss_modality
@@ -39,7 +39,7 @@ class iBOTLoss(nn.Module):
         mim_start_epoch=0,
         region_aggregation="mean",
         region_depths=(),
-        include_local_crops=False,
+        region_views="global",
         loss_modality="standard",
         ordering_seed=0,
     ):
@@ -55,10 +55,14 @@ class iBOTLoss(nn.Module):
         self.lambda1 = lambda1
         self.lambda2 = lambda2
         self.lambda3 = lambda3
-        validate_local_region_settings(include_local_crops, region_aggregation, region_normalization)
-        if include_local_crops and (ngcrops != 2 or nlcrops <= 0):
-            raise ValueError("include_local_crops requires two global crops and at least one local crop")
-        self.include_local_crops = include_local_crops
+        validate_region_views(region_views, region_aggregation, region_normalization)
+        if region_views in ("global_local", "local") and (
+            ngcrops != 2 or nlcrops < (2 if region_views == "local" else 1)
+        ):
+            raise ValueError("region_views requires two globals and enough local crops")
+        if region_views in ("local", "global_unmasked") and loss_modality != "standard":
+            raise ValueError("region_views: local/global_unmasked requires loss_modality: standard")
+        self.region_views = region_views
         validate_loss_modality(loss_modality, region_aggregation, region_normalization,
                                region_patch_threshold, ngcrops, nlcrops)
         self.loss_modality = loss_modality
@@ -69,7 +73,7 @@ class iBOTLoss(nn.Module):
             self.ordering_loss = RegionOrderingLoss(loss_modality, student_temp, ordering_seed, region_min_area)
         else:
             self.ordering_loss = None
-        self.needs_local_patch_logits = include_local_crops or loss_modality == "within_image"
+        self.needs_local_patch_logits = region_views in ("global_local", "local") or loss_modality == "within_image"
         self.region_depths = tuple(region_depths)
         self.deep_region = region_normalization == "deep"
         if self.deep_region:
@@ -267,6 +271,9 @@ class iBOTLoss(nn.Module):
         student_local_patch_logits=None,
         student_patch_features=None,
         teacher_patch_features=None,
+        student_view_patch_logits=None,
+        teacher_view_patch_logits=None,
+        teacher_view_patch_targets=None,
     ):
         """Compute baseline centered DINO/iBOT plus region composition."""
         student_cls, student_patch = student_output
@@ -366,17 +373,35 @@ class iBOTLoss(nn.Module):
                 region_stats = {**layer_stats[-1], "loss": torch.stack([
                     stats["loss"] for stats in layer_stats
                 ]).mean()}
+            elif self.region_views in ("local", "global_unmasked"):
+                expected_views = self.nlcrops if self.region_views == "local" else 4
+                if student_view_patch_logits is None or teacher_view_patch_logits is None:
+                    raise ValueError("region_views requires dedicated student/teacher patch logits")
+                batch = raw_student_patch_c[0].shape[0]
+                if (student_view_patch_logits.shape[0] != batch * expected_views
+                        or teacher_view_patch_logits.shape != student_view_patch_logits.shape):
+                    raise ValueError("region_views requires logits for every dedicated crop")
+                boxes = (crop_boxes[:, self.ngcrops:self.ngcrops + self.nlcrops]
+                         if self.region_views == "local" else crop_boxes[:, -4:])
+                region_stats = multiview_region_loss(
+                    self.region_loss,
+                    student_view_patch_logits.chunk(expected_views),
+                    teacher_view_patch_logits.detach().chunk(expected_views), boxes,
+                    teacher_patch_targets=(teacher_view_patch_targets.detach().chunk(expected_views)
+                                           if teacher_view_patch_targets is not None else None),
+                    min_area=self.region_loss.min_area if self.region_views == "global_unmasked" else 0.,
+                )
             else:
                 region_stats = self.region_loss(
                     raw_student_patch_c,
                     teacher_patch_logits.detach().chunk(self.ngcrops),
                     crop_boxes[:, :self.ngcrops],
                     teacher_patch_targets=teacher_patch_c,
-                    return_per_image=self.include_local_crops,
+                    return_per_image=self.region_views == "global_local",
                 )
-                if self.include_local_crops:
+                if self.region_views == "global_local":
                     if student_local_patch_logits is None:
-                        raise ValueError("include_local_crops requires student local patch logits")
+                        raise ValueError("region_views: global_local requires student local patch logits")
                     region_stats = global_local_region_loss(
                         self.region_loss, region_stats,
                         student_local_patch_logits.chunk(self.nlcrops),
@@ -387,14 +412,16 @@ class iBOTLoss(nn.Module):
             total_loss3 = region_raw * region_weight
             region_valid_ratio = region_stats["valid_ratio"]
             region_intersection_area = region_stats["intersection_area"]
-            overlap_diagnostics = self._masked_overlap_diagnostics(
-                patch_cross_entropies,
-                student_mask,
-                region_stats["patch_mask"],
-                region_stats["valid"],
-            )
-            patch_inside_overlap = overlap_diagnostics["inside"]
-            patch_outside_overlap = overlap_diagnostics["outside"]
+            if self.region_views in ("global", "global_local"):
+                overlap_diagnostics = self._masked_overlap_diagnostics(
+                    patch_cross_entropies, student_mask,
+                    region_stats["patch_mask"], region_stats["valid"],
+                )
+                patch_inside_overlap = overlap_diagnostics["inside"]
+                patch_outside_overlap = overlap_diagnostics["outside"]
+            else:
+                # Dedicated views have no iBOT masks or masked-patch diagnostics.
+                patch_inside_overlap = patch_outside_overlap = zero
             region_active = zero.new_ones(())
             objective = total_loss1 + total_loss2 + total_loss3
 
@@ -484,12 +511,14 @@ class iBOTLoss(nn.Module):
                 f"region_depth_{depth}": stats["loss"].detach()
                 for depth, stats in zip(self.region_depths, layer_stats)
             })
-        if self.include_local_crops and self.lambda3 != 0:
+        if self.region_views == "global_local" and self.lambda3 != 0:
             total_loss.update({
                 f"region_{name}": region_stats[name].detach()
                 for name in ("global_global_loss", "global_local_loss",
                              "global_local_valid_ratio", "global_local_pairs_per_image")
             })
+        if self.region_views in ("local", "global_unmasked") and self.lambda3 != 0:
+            total_loss["region_pairs_per_image"] = region_stats["pairs_per_image"].detach()
         if self.ordering_loss is not None:
             total_loss.update({
                 "region_ordering": ordering,

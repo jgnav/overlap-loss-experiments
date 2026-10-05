@@ -21,7 +21,7 @@ from tensorboardX import SummaryWriter
 from data import DataAugmentationiBOT, ImageFolderMask
 from losses import iBOTLoss
 from losses.region_loss import RegionLoss
-from losses.local_region_loss import validate_local_region_settings
+from losses.local_region_loss import validate_region_views
 from losses.region_ordering_loss import validate_loss_modality
 from model import create_model, iBOTHead
 from utils import training as utils
@@ -56,6 +56,8 @@ def load_config(path):
     with path.open("r", encoding="utf-8") as handle:
         user_config = yaml.safe_load(handle)
 
+    if "include_local_crops" in user_config:
+        raise ValueError("Replace include_local_crops with region_views in the YAML")
     config = {**get_ibot_recipe(user_config["arch"]), **user_config}
     configure_wandb(config)
     for name, minimum in (
@@ -107,16 +109,19 @@ def load_config(path):
         )
     # Validate the aggregation choice and its normalization combination before
     # loading checkpoints, datasets, or initializing distributed training.
-    validate_local_region_settings(
-        config["include_local_crops"], config["region_aggregation"], config["region_normalization"]
+    validate_region_views(
+        config["region_views"], config["region_aggregation"], config["region_normalization"]
     )
     validate_loss_modality(config["loss_modality"], config["region_aggregation"],
                            config["region_normalization"], threshold,
                            config["global_crops_number"], config["local_crops_number"])
-    if config["include_local_crops"] and (
-        config["global_crops_number"] != 2 or config["local_crops_number"] <= 0
+    if config["region_views"] in ("global_local", "local") and (
+        config["global_crops_number"] != 2
+        or config["local_crops_number"] < (2 if config["region_views"] == "local" else 1)
     ):
-        raise ValueError("include_local_crops requires two global crops and at least one local crop")
+        raise ValueError("region_views requires two globals and enough local crops")
+    if config["region_views"] in ("local", "global_unmasked") and config["loss_modality"] != "standard":
+        raise ValueError("region_views: local/global_unmasked requires loss_modality: standard")
     RegionLoss(
         min_area=config["region_min_area"],
         patch_threshold=threshold,
@@ -368,7 +373,8 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
         args.local_crops_number,
         args.global_crop_size,
         args.local_crop_size,
-        include_local_crops=args.include_local_crops or args.loss_modality == "within_image",
+        region_views=args.region_views if args.lambda3 != 0 else "global",
+        record_local_geometry=args.loss_modality == "within_image" and args.lambda3 != 0,
     )
     dataset = ImageFolderMask(
         args.data_path,
@@ -479,7 +485,7 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
         koleo_regularizer=args.koleo_regularizer,
         mim_start_epoch=args.pred_start_epoch,
         region_depths=region_depths,
-        include_local_crops=args.include_local_crops,
+        region_views=args.region_views,
         loss_modality=args.loss_modality,
         ordering_seed=args.seed,
     ).cuda()
@@ -824,6 +830,35 @@ def get_teacher_targets(teacher_output, ibot_loss, epoch):
     return targets
 
 
+def forward_unmasked(model, images):
+    """Forward student crops without replacing any patch by a mask token."""
+    module = model.module if hasattr(model, "module") else model
+    previous = module.backbone.masked_im_modeling
+    module.backbone.masked_im_modeling = False
+    try:
+        return model(images)
+    finally:
+        module.backbone.masked_im_modeling = previous
+
+
+@torch.no_grad()
+def get_region_teacher_targets(teacher, images, ibot_loss, epoch):
+    """Region-only teacher passes; reuse the previous ordinary patch center.
+
+    Extra views never update either center or contribute to DINO/iBOT targets.
+    Call before get_teacher_targets, which updates the centers once.
+    """
+    if ibot_loss.lambda3 == 0 or ibot_loss.region_views not in ("local", "global_unmasked"):
+        return None, None
+    views = (images[ibot_loss.ngcrops:ibot_loss.ngcrops + ibot_loss.nlcrops]
+             if ibot_loss.region_views == "local" else images[-4:])
+    logits = teacher(views)[1]
+    targets = (ibot_loss.softmax_center_teacher_patch(
+        logits, ibot_loss.teacher_temp2_schedule[epoch]
+    ) if ibot_loss.region_loss.normalization == "centering" else None)
+    return logits, targets
+
+
 def train_one_epoch(
     student,
     teacher,
@@ -908,6 +943,9 @@ def train_one_epoch(
                         backbone_features[:, 1 + register_count:]
                     )
                     del backbone_features
+                teacher_view_patch_logits, teacher_view_patch_targets = get_region_teacher_targets(
+                    teacher, images, ibot_loss, epoch
+                )
                 teacher_targets = get_teacher_targets(teacher_output, ibot_loss, epoch)
                 if teacher_region_logits is not None:
                     teacher_region_targets = ibot_loss.deep_teacher_targets(
@@ -939,13 +977,14 @@ def train_one_epoch(
                 if need_rank_features else None
             )
 
-            student.module.backbone.masked_im_modeling = False
-            student_local_output = (
-                student(images[args.global_crops_number :])
-                if len(images) > args.global_crops_number
-                else None
-            )
-            student.module.backbone.masked_im_modeling = args.use_masked_im_modeling
+            local_images = images[args.global_crops_number:args.global_crops_number + args.local_crops_number]
+            student_local_output = forward_unmasked(student, local_images) if local_images else None
+            student_view_patch_logits = None
+            if ibot_loss.lambda3 != 0:
+                if ibot_loss.region_views == "local":
+                    student_view_patch_logits = student_local_output[1]
+                elif ibot_loss.region_views == "global_unmasked":
+                    student_view_patch_logits = forward_unmasked(student, images[-4:])[1]
             student_local_cls = student_local_output[0] if student_local_output is not None else None
             student_local_patch_logits = (
                 student_local_output[1]
@@ -968,6 +1007,9 @@ def train_one_epoch(
                 student_local_patch_logits=student_local_patch_logits,
                 student_patch_features=student_patch_features,
                 teacher_patch_features=teacher_patch_features,
+                student_view_patch_logits=student_view_patch_logits,
+                teacher_view_patch_logits=teacher_view_patch_logits,
+                teacher_view_patch_targets=teacher_view_patch_targets,
             )
             loss = all_loss.pop("loss")
 

@@ -1,21 +1,23 @@
-"""Per-image global/global and global/local regional composition ablation."""
+"""Per-image regional composition over global, local and unmasked views."""
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from itertools import combinations
 
 from .region_loss import intersection_patch_fractions
+from .region_pooling import region_log_probability_mean
 from .sinkhorn import sinkhorn_log_probabilities
 
 
-def validate_local_region_settings(enabled, aggregation, normalization):
-    if type(enabled) is not bool:
-        raise ValueError("include_local_crops must be a boolean")
-    if enabled and (aggregation != "mean" or normalization not in (
+def validate_region_views(views, aggregation, normalization):
+    if views not in ("global", "global_local", "local", "global_unmasked"):
+        raise ValueError("region_views must be global, global_local, local, or global_unmasked")
+    if views != "global" and (aggregation != "mean" or normalization not in (
         "centering", "softmax", "sinkhorn",
     )):
         raise ValueError(
-            "include_local_crops requires region_aggregation: mean and "
+            "region_views other than global requires region_aggregation: mean and "
             "region_normalization: centering, softmax, or sinkhorn"
         )
 
@@ -35,7 +37,7 @@ def global_local_region_loss(
         raise ValueError("Global/local region loss requires two globals and local patch logits")
     batch, global_patches, prototypes = teacher_global_logits[0].shape
     if crop_boxes.shape != (batch, 2 + len(student_local_logits), 5):
-        raise ValueError("include_local_crops requires crop boxes for every global and local view")
+        raise ValueError("region_views: global_local requires crop boxes for every global and local view")
     if any(x.ndim != 3 or x.shape[0] != batch or x.shape[2] != prototypes
            for x in student_local_logits):
         raise ValueError("Local patch logits must match global batch and prototype dimensions")
@@ -102,8 +104,8 @@ def global_local_region_loss(
     valid = global_valid | local_valid
     local_means = local_sums / pair_counts.clamp_min(1)
     global_means = global_stats["per_image_loss"]
-    denominator = .75 * global_valid.float() + .25 * local_valid.float()
-    combined = (.75 * global_means + .25 * local_means) / denominator.clamp_min(.25)
+    denominator = .5 * global_valid.float() + .5 * local_valid.float()
+    combined = (.5 * global_means + .5 * local_means) / denominator.clamp_min(.5)
 
     counts = torch.stack([valid.sum(), global_valid.sum(), local_valid.sum()]).float()
     world_size = 1
@@ -118,4 +120,97 @@ def global_local_region_loss(
         "global_local_loss": local_means.sum() * world_size / counts[2].clamp_min(1),
         "global_local_valid_ratio": local_valid.float().mean(),
         "global_local_pairs_per_image": pair_counts.mean(),
+    }
+
+
+def multiview_region_loss(region_loss, student_logits, teacher_logits, crop_boxes,
+                         *, teacher_patch_targets=None, min_area=0.0):
+    """All distinct crop pairs, both cross-view directions, averaged per image.
+
+    Each participating crop is projected/normalized once. Group all its region
+    masks into one tiled pooling operation, avoiding a prototype tensor per
+    pair. Local/local uses positive intersections; extra globals use the normal
+    global area filter. All these view modes select fully contained patches.
+    """
+    views = len(student_logits)
+    if views < 2 or len(teacher_logits) != views:
+        raise ValueError("Multi-view region loss requires matching teacher/student views")
+    batch, _, prototypes = student_logits[0].shape
+    if crop_boxes.shape != (batch, views, 5) or any(
+        x.ndim != 3 or x.shape[0] != batch or x.shape[2] != prototypes
+        or x.shape != teacher_logits[v].shape for v, x in enumerate(student_logits)
+    ):
+        raise ValueError("Region views require matching logits and crop geometry")
+    pairs = list(combinations(range(views), 2))
+    masks = [[] for _ in range(views)]
+    rows = []
+    validities, areas = [], []
+    for a, b in pairs:
+        fractions, positive, area = intersection_patch_fractions(
+            crop_boxes[:, [a, b]].float(),
+            (student_logits[a].shape[1], student_logits[b].shape[1]), min_area,
+        )
+        weights = tuple((fraction >= 1.0).float() for fraction in fractions)
+        valid = positive & (weights[0].sum(-1) > 0) & (weights[1].sum(-1) > 0)
+        rows.append((a, len(masks[a]), b, len(masks[b])))
+        masks[a].append(weights[0] * valid[:, None])
+        masks[b].append(weights[1] * valid[:, None])
+        validities.append(valid)
+        areas.append(area)
+    masks = [torch.stack(view_masks, 1) for view_masks in masks]
+    validities = torch.stack(validities, 1)
+    pair_counts = validities.sum(1)
+    valid_images = pair_counts > 0
+    indices = torch.arange(batch, device=crop_boxes.device)
+
+    # Ordinary student softmax temperature, centered teacher iBOT temperature.
+    # Pooling recomputes softmax tiles in backward; no per-pair patch-sized graph.
+    with torch.autocast(device_type=crop_boxes.device.type, enabled=False):
+        predictions = [region_log_probability_mean(x, indices, w,
+                          region_loss.student_temperature, 64 * 1024 * 1024)
+                       for x, w in zip(student_logits, masks)]
+        with torch.no_grad():
+            if region_loss.normalization == "centering":
+                if teacher_patch_targets is None or len(teacher_patch_targets) != views:
+                    raise ValueError("Centered region views require teacher patch targets")
+                probabilities = [x.detach().float() for x in teacher_patch_targets]
+            elif region_loss.normalization == "softmax":
+                probabilities = [F.softmax(x.detach().float() / region_loss.temperature, -1)
+                                 for x in teacher_logits]
+            else:
+                selected = [w.any(1) for w in masks]
+                # One assignment problem over unique participating patches,
+                # shared by every pair, including across distributed ranks.
+                packed = torch.cat([x.detach()[m] for x, m in zip(teacher_logits, selected)])
+                assignments = sinkhorn_log_probabilities(packed, region_loss.temperature).exp()
+                probabilities = []
+                offset = 0
+                for x, m in zip(teacher_logits, selected):
+                    dense = torch.zeros_like(x, dtype=torch.float32)
+                    count = int(m.sum())
+                    dense[m] = assignments[offset:offset + count]
+                    offset += count
+                    probabilities.append(dense)
+            targets = [torch.bmm(w, p) / w.sum(-1, keepdim=True).clamp_min(1)
+                       for w, p in zip(masks, probabilities)]
+        sums = sum(x.flatten(1)[:, 0].float() * 0 for x in student_logits)
+        for row, (a, ar, b, br) in enumerate(rows):
+            valid = validities[:, row]
+            # Invalid rows are zero, with finite logs and zero gradients.
+            def ce(t, p):
+                return -(t * p).sum(-1)
+            loss = .5 * (ce(targets[a][:, ar], predictions[b][:, br])
+                         + ce(targets[b][:, br], predictions[a][:, ar]))
+            sums = sums + loss * valid.float()
+        means = sums / pair_counts.clamp_min(1)
+        count = valid_images.sum().float()
+        world = 1
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(count)
+            world = dist.get_world_size()
+    return {
+        "loss": means.sum() * world / count.clamp_min(1),
+        "valid_ratio": valid_images.float().mean(),
+        "intersection_area": torch.stack(areas, 1).mean(),
+        "pairs_per_image": pair_counts.float().mean(),
     }

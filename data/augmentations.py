@@ -15,7 +15,8 @@ class DataAugmentationiBOT:
         local_crops_number,
         global_crop_size,
         local_crop_size,
-        include_local_crops=False,
+        region_views="global",
+        record_local_geometry=False,
     ):
         color_jitter = transforms.Compose(
             [
@@ -62,7 +63,8 @@ class DataAugmentationiBOT:
             ]
         )
         self.local_crops_number = local_crops_number
-        self.include_local_crops = include_local_crops
+        self.record_local_geometry = record_local_geometry or region_views in ("global_local", "local")
+        self.region_views = region_views
         self.local_crops_scale = local_crops_scale
         self.local_crop_size = local_crop_size
         self.local_transfo = transforms.Compose(
@@ -134,6 +136,15 @@ class DataAugmentationiBOT:
         for _ in range(self.local_crops_number):
             crop, crop_box = self._local_crop(image)
             crops.append(crop)
-            if self.include_local_crops:
+            if self.record_local_geometry:
+                global_crop_boxes.append(crop_box)
+        if self.region_views == "global_unmasked":
+            # Separate region-only views, after the original two globals and
+            # all locals. They never contribute to DINO or ordinary iBOT.
+            for view in range(4):
+                crop, crop_box = self._global_crop(
+                    image, self.global_transfo1 if view == 0 else self.global_transfo2
+                )
+                crops.append(crop)
                 global_crop_boxes.append(crop_box)
         return crops, torch.stack(global_crop_boxes)

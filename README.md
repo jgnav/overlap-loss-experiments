@@ -143,33 +143,54 @@ available moment/distribution ablations and their fixed settings, see
 [region aggregation](docs/region_aggregation.md). Patch thresholding or area
 weighting is applied before aggregation.
 
-`include_local_crops: false` preserves the global-only regional objective.
-Set it to `true` for the independent mean-pooling context ablation in
-`config/ablations/include_local_crops_true.yaml` (the only changed setting).
-The recipe still uses two 224-pixel global crops and ten 96-pixel local crops.
-The teacher processes only globals; the student processes all crops, using
-unmasked local forwards already required by DINO. For every global/local pair,
-map their original-image intersection to their respective patch grids,
-including horizontal flips. Pool only fully contained patches with an
-unweighted arithmetic mean. A local pair is valid when its intersection has
-positive area and both views contain at least one complete patch; the existing
-`region_min_area` and `region_patch_threshold` filters still govern global/global.
-Reuse the selected normalization and temperatures (ordinary iBOT teacher
-targets for `centering`) and apply teacher-global to student-local CE.
+`region_views` selects the crops contributing to the regional objective.
+The former `include_local_crops` setting is removed. All four launch configs
+are copies of `config/train.yaml` with only `region_views` changed:
 
-Within **each image**, average valid global/local pair losses separately from
-the symmetric global/global loss. Combine the two means with fixed weights
-0.75 and 0.25; if only one group is valid, use its full loss. Exclude images
-with neither group from the mean across images/GPUs. `lambda3` remains 0.4 in
-the ablation YAML; DINO, ordinary iBOT and all other settings stay unchanged.
-The option requires `region_aggregation: mean` and a probability normalization
-(`centering`, `softmax` or `sinkhorn`); it is separate from the deep and moment
-ablations. Sinkhorn balances unique teacher patches participating in valid
-local intersections jointly across views/GPUs, then reuses their assignments
-for every local pair. The existing global/global Sinkhorn problem is unchanged.
-Logs include `region_global_global_loss`, `region_global_local_loss`,
-`region_global_local_valid_ratio` and `region_global_local_pairs_per_image`.
-Changing this flag requires a new continuation rather than exact resume.
+| Mode | Regional comparisons | Teacher forwards |
+| --- | --- | --- |
+| `global` (default) | Original global/global overlap, both directions | Original two unmasked globals |
+| `global_local` | Mean of all valid global/local comparisons, mixed 50/50 with global/global per image | Original two unmasked globals |
+| `local` | All distinct local/local crop pairs, both directions | Original globals plus the ten unmasked locals |
+| `global_unmasked` | All six pairs among four **additional** global crops, both directions | Original globals plus four unmasked region-only globals |
+
+`global_local` keeps the student local forwards already required by DINO;
+its teacher-global to student-local pair losses are averaged within each
+image. If only the global/global or global/local group is valid, use that
+full group loss. For `local`, the student also reuses its ordinary unmasked
+local forwards. The additional global crops in `global_unmasked` are processed
+without masking in **both** networks and do not enter DINO or iBOT.
+All modes retain the original two globals and ten locals for ordinary SSL.
+
+New crop-pair modes use fully contained patches, accounting for native patch
+grids and flips, and unweighted mean distributions. Local-containing pairs
+require positive intersections and at least one complete patch in each view;
+global/global pairs retain `region_min_area`. `global` retains all existing
+normalization/aggregation options; other view modes require mean pooling and
+`centering`, `softmax`, or `sinkhorn`. Centered extra teacher views use the same
+previous ordinary patch center; only the original globals update that center,
+once per step. Transformations and tiled pooling are reused across pairs.
+
+The regional coefficient remains **0.4**, and every valid image contributes
+equally to the distributed regional mean. Images with no valid pairs are
+excluded; empty ranks still participate in backward. `lambda3: 0` skips all
+region-only crops and teacher/student forwards. Changing `region_views` or
+resuming an old local-weighting checkpoint requires a new continuation using
+`initial_checkpoint` rather than exact resume.
+
+Launch all four independent 50-epoch continuations with the same checkpoint,
+seed, and batch size using:
+
+```bash
+sbatch slurm/slurm_region_views.sh
+# Or launch a single configuration:
+sbatch slurm/slurm_ablation_single.sh config/ablations/region_views_local.yaml
+```
+
+Configs: `config/ablations/region_views_{global,global_local,local,global_unmasked}.yaml`.
+The previous local ablation is now `region_views_global_local.yaml`, with the
+new 50/50 weights. Group diagnostics remain available for `global_local`;
+`local` and `global_unmasked` also log `region_pairs_per_image`.
 
 `loss_modality: patch_rank_distribution` adds patch-wise neighborhood ranking
 supervision alongside the existing centered-softmax regional mean loss. Its
@@ -225,9 +246,9 @@ coefficient is fixed in code. Ordering requires mean aggregation, centering,
 requires at least two locals. Teacher patch
 probabilities reuse the ordinary centered iBOT targets; student patches use
 their ordinary `student_temp` softmax, without teacher centering. The separate
-`include_local_crops` flag keeps controlling the original regional CE branch;
+`region_views` selector keeps controlling the original regional CE branch;
 within-image ordering automatically records all crop boxes and uses the existing
-student local patch outputs, without changing that flag or adding backbone passes.
+student local patch outputs, without changing the selector or adding backbone passes.
 Cross-image ordering uses only global patch outputs and global geometry.
 
 Cross-image ordering constructs only the intersection of the two global crops,

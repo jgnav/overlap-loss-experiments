@@ -44,7 +44,7 @@ RESUME_COMPATIBILITY_KEYS = (
     "region_temp",
     "region_normalization",
     "region_aggregation",
-    "include_local_crops",
+    "region_views",
     "loss_modality",
     "ibot_plus_plus",
     "koleo_regularizer",
@@ -183,8 +183,15 @@ def _validate_resume_compatibility(checkpoint, args):
     mismatches = []
     for key in RESUME_COMPATIBILITY_KEYS:
         saved_value = _checkpoint_argument(checkpoint, key)
-        if key in ("koleo_regularizer", "include_local_crops") and saved_value is None:
+        if key == "koleo_regularizer" and saved_value is None:
             saved_value = False
+        if key == "region_views" and saved_value is None:
+            if _checkpoint_argument(checkpoint, "include_local_crops"):
+                raise ValueError(
+                    "Resume checkpoint uses the old local weighting; start a new "
+                    "region_views continuation using initial_checkpoint"
+                )
+            saved_value = "global"
         if key == "register_warmup_epochs" and saved_value is None:
             saved_value = 0
         if key == "loss_modality" and saved_value is None:

@@ -252,11 +252,11 @@ class DeepRegionTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'incompatible'):
                 load_resume_state(checkpoint, resumed, resumed_teacher, resumed_loss, resumed_optimizer, None)
 
-    def test_deep_ablation_changes_only_the_selector(self):
+    def test_deep_ablation_changes_selector_and_uses_smaller_batch(self):
         root = Path(__file__).parents[1]
         base = (root / 'config/train.yaml').read_bytes()
         ablation = root / 'config/ablations/region_normalization_deep.yaml'
-        self.assertEqual(ablation.read_bytes(), base.replace(b'region_normalization: centering', b'region_normalization: deep'))
+        self.assertEqual(ablation.read_bytes(), base.replace(b'region_normalization: centering', b'region_normalization: deep').replace(b'batch_size_per_gpu: 64', b'batch_size_per_gpu: 32'))
         self.assertEqual(load_config(ablation).region_normalization, 'deep')
 
 

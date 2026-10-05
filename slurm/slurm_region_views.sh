@@ -1,11 +1,9 @@
 #!/bin/bash
-# Submit from the repository root in two stages:
-#   first=$(sbatch --parsable --job-name=ablation-core --array=0-8 slurm/slurm_ablation.sh)
-#   sbatch --job-name=ablation-rest --array=9-28 --dependency="after:${first}" slurm/slurm_ablation.sh
-# The second array becomes eligible when all first-stage tasks have started.
+# Submit all four view ablations from the repository root:
+#   sbatch slurm/slurm_region_views.sh
 
-#SBATCH --job-name=ablation
-#SBATCH --array=0-28
+#SBATCH --job-name=region-views
+#SBATCH --array=0-3
 #SBATCH --partition=3090_risk,a100,rtx_pro6000_risk
 #SBATCH --exclude=aisurrey37
 #SBATCH --nodes=1
@@ -14,8 +12,8 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=128G
 #SBATCH --time=50:00:00
-#SBATCH --output=logs/ablation_%A_%a.out
-#SBATCH --error=logs/ablation_%A_%a.err
+#SBATCH --output=logs/region_views_%A_%a.out
+#SBATCH --error=logs/region_views_%A_%a.err
 
 set -euo pipefail
 
@@ -27,33 +25,8 @@ cd "$SLURM_SUBMIT_DIR"
 
 # Keep this list and --array in sync. One array task launches one training job.
 configs=(
-    lambda3_0p4
-    region_aggregation_mean_scalar_variance
-    region_aggregation_mean_variance
-    region_aggregation_mean_covariance
-    region_normalization_raw_logits
-    region_normalization_sinkhorn
-    region_normalization_softmax
-    region_aggregation_hellinger
-    lambda3_0p2
-    lambda3_0p6
-    lambda3_0p8
-    lambda3_1p0
-    ibot_plus_plus_true
-    koleo_regularizer_true
-    region_min_area_0p2
-    region_min_area_0p3
-    region_min_area_0p5
-    region_patch_threshold_0p2
-    region_patch_threshold_0p5
-    region_patch_threshold_weighted
-    register_4
-    shared_head_false
-    region_normalization_deep
-    region_views_global_local
-    loss_modality_cross_image
-    loss_modality_within_image
     region_views_global
+    region_views_global_local
     region_views_local
     region_views_global_unmasked
 )

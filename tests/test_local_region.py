@@ -69,7 +69,7 @@ def reference(s, local, targets):
         ce(targets[0][0, right], local[1][0]), ce(targets[1][0, left], local[1][0]),
     ]).mean()
     gl2 = .5 * (ce(targets[0][2], local[0][2]) + ce(targets[1][2], local[1][2]))
-    return (torch.stack([.75 * gg[0] + .25 * gl0, gg[1], gl2]).mean()
+    return (torch.stack([.5 * gg[0] + .5 * gl0, gg[1], gl2]).mean()
             + sum(x.sum() * 0 for x in local))
 
 
@@ -163,7 +163,7 @@ class LocalRegionTest(unittest.TestCase):
         arguments = dict(out_dim=5, patch_out_dim=5, nlcrops=3, lambda3=.4,
                          region_min_area=.1, region_patch_threshold=1., region_normalization="centering")
         baseline = make_loss(**arguments)
-        active = make_loss(**arguments, include_local_crops=True)
+        active = make_loss(**arguments, region_views="global_local")
         a = baseline(global_student, teacher_targets, local_cls, masks, boxes[:, :2],
                      teacher_patch_logits=torch.cat(t))
         b = active(global_student, teacher_targets, local_cls, masks, boxes,
@@ -174,7 +174,7 @@ class LocalRegionTest(unittest.TestCase):
         torch.testing.assert_close(b["region"], b["region_raw"] * .4)
         torch.testing.assert_close(a["region_raw"], baseline.region_loss(
             s, t, boxes[:, :2], teacher_patch_targets=targets)["loss"])
-        disabled = make_loss(**{**arguments, "lambda3": 0}, include_local_crops=True)
+        disabled = make_loss(**{**arguments, "lambda3": 0}, region_views="global_local")
         with mock.patch("losses.ibot_loss.global_local_region_loss", side_effect=AssertionError):
             result = disabled(global_student, teacher_targets, local_cls, masks, None)
         torch.testing.assert_close(result["loss"], result["cls"] + result["patch"])
@@ -229,7 +229,7 @@ class LocalRegionTest(unittest.TestCase):
             self.assertEqual(seen["student"], [torch.Size([2, 3, 224, 224]), torch.Size([10, 3, 96, 96])])
             self.assertEqual(local_patch.shape, (10, 36, 5))
             objective = make_loss(out_dim=5, patch_out_dim=5, nlcrops=10, lambda1=0,
-                                  lambda2=0, lambda3=.4, include_local_crops=True,
+                                  lambda2=0, lambda3=.4, region_views="global_local",
                                   region_patch_threshold=1., region_normalization="centering")
             targets = objective.softmax_center_teacher(teacher_output, .07, .07)
             a = [0., 0., .5, .5, 0.]
@@ -257,7 +257,7 @@ class LocalRegionTest(unittest.TestCase):
             random.seed(11)
             torch.manual_seed(11)
             augmentation = DataAugmentationiBOT((.25, 1.), (.05, .25), 2, 10, 224, 96,
-                                                include_local_crops=enabled)
+                                                region_views="global_local" if enabled else "global")
             with mock.patch.object(augmentation, "_spatial_transform",
                                    wraps=augmentation._spatial_transform) as spatial:
                 outputs.append(augmentation(image))
@@ -272,31 +272,31 @@ class LocalRegionTest(unittest.TestCase):
 
     def test_yaml_ablation_and_resume_validation(self):
         base_path = Path("config/train.yaml")
-        ablation_path = Path("config/ablations/include_local_crops_true.yaml")
+        ablation_path = Path("config/ablations/region_views_global_local.yaml")
         self.assertEqual(ablation_path.read_bytes(), base_path.read_bytes().replace(
-            b"include_local_crops: false", b"include_local_crops: true"
+            b"region_views: global", b"region_views: global_local"
         ))
         config = load_config(ablation_path)
-        self.assertTrue(config.include_local_crops)
+        self.assertEqual(config.region_views, "global_local")
         self.assertEqual((config.lambda3, config.region_aggregation), (.4, "mean"))
         self.assertEqual((config.global_crops_number, config.local_crops_number), (2, 10))
         base = yaml.safe_load(base_path.read_text())
-        for invalid in ("true", 1, None):
+        for invalid in ("true", True, 1, None):
             with tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "train.yaml"
-                path.write_text(yaml.safe_dump({**base, "include_local_crops": invalid}))
-                with self.assertRaisesRegex(ValueError, "include_local_crops"):
+                path.write_text(yaml.safe_dump({**base, "region_views": invalid}))
+                with self.assertRaisesRegex(ValueError, "region_views"):
                     load_config(path)
-        with self.assertRaisesRegex(ValueError, "include_local_crops"):
-            _validate_resume_compatibility({"args": SimpleNamespace(include_local_crops=False)},
-                                           SimpleNamespace(include_local_crops=True, lambda3=0))
-        with self.assertRaisesRegex(ValueError, "include_local_crops"):
+        with self.assertRaisesRegex(ValueError, "region_views"):
+            _validate_resume_compatibility({"args": SimpleNamespace(region_views="global")},
+                                           SimpleNamespace(region_views="global_local", lambda3=0))
+        with self.assertRaisesRegex(ValueError, "region_views"):
             _validate_resume_compatibility({"args": SimpleNamespace()},
-                                           SimpleNamespace(include_local_crops=True, lambda3=0))
+                                           SimpleNamespace(region_views="global_local", lambda3=0))
         for kwargs in ({"region_aggregation": "hellinger"}, {"region_normalization": "deep"},
                        {"region_normalization": "raw_logits"}, {"nlcrops": 0}):
-            with self.assertRaisesRegex(ValueError, "include_local_crops"):
-                make_loss(**{"nlcrops": 3, "include_local_crops": True, **kwargs})
+            with self.assertRaisesRegex(ValueError, "region_views"):
+                make_loss(**{"nlcrops": 3, "region_views": "global_local", **kwargs})
 
     @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(), "Gloo required")
     def test_distributed_valid_image_normalization_and_empty_ranks(self):

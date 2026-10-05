@@ -54,10 +54,17 @@ class ImageFolderMask(ImageFolder):
         ).__getitem__(index)
 
         masks = []
-        for img in images:
+        for view, img in enumerate(images):
             try:
                 H, W = img.shape[1] // self.psz, img.shape[2] // self.psz
             except Exception:
+                continue
+
+            if (getattr(self.transform, 'region_views', 'global') == 'global_unmasked'
+                    and view >= len(images) - 4):
+                # These crops have no masked-patch objective. Avoid generating
+                # unused random masks, and retain explicit unmasked metadata.
+                masks.append(np.zeros((H, W), dtype=bool))
                 continue
 
             high = self.get_pred_ratio() * H * W
