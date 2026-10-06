@@ -31,7 +31,7 @@ def print_progress(description, current, total, updates=10):
 
 
 def base_parser(description):
-    parser = argparse.ArgumentParser(description=description)
+    parser = argparse.ArgumentParser(description=description, allow_abbrev=False)
     parser.add_argument("checkpoint", type=Path, help="iBOT/region-loss checkpoint")
     parser.add_argument(
         "--checkpoint-key",
@@ -64,6 +64,11 @@ def base_parser(description):
         "--classification-manifests", type=Path, default=None,
         help="Multilabel split/label JSON directory; defaults to <datasets-root>/evaluation_manifests",
     )
+    parser.add_argument("--video-protocol", choices=("dino_480p_last4", "dino_square_last4", "dinov3"), default="dinov3")
+    parser.add_argument("--video-resolution", choices=("small", "medium", "large"), default="small")
+    parser.add_argument("--video-feature-blocks", type=int, choices=(1, 4), default=4)
+    parser.add_argument("--video-split-manifests-json", dest="video_split_manifests",
+                        type=json.loads, default={}, help=argparse.SUPPRESS)
     return parser
 
 
@@ -143,6 +148,13 @@ def evaluation_identity(args):
         "datasets_root": str(Path(args.datasets_root).expanduser().resolve()),
         "classification_manifests": str(manifests),
         "classification_manifest_hashes": manifest_hashes,
+        "video_protocol": getattr(args, "video_protocol", "dinov3"),
+        "video_resolution": getattr(args, "video_resolution", "small"),
+        "video_feature_blocks": getattr(args, "video_feature_blocks", 4),
+        "video_split_manifest_hashes": {
+            key: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            for key, path in getattr(args, "video_split_manifests", {}).items()
+        },
     }
 
 

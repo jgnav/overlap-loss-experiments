@@ -40,6 +40,8 @@ def load_config(path):
         "checkpoint_key": "teacher", "arch": "auto", "num_workers": 8,
         "seed": 0, "segmentation_batch_size": 128,
         "output_dir": None, "result_json": None, "classification_manifests": None,
+        "video_protocol": "dinov3",
+        "video_resolution": "small", "video_feature_blocks": 4, "video_split_manifests": {},
     }
     required = {"checkpoint", "datasets_root", "evaluations"}
     unknown = set(values) - required - set(defaults)
@@ -54,6 +56,22 @@ def load_config(path):
         raise ValueError("checkpoint_key must be teacher or student")
     if values["arch"] not in ("auto", *ARCHITECTURES):
         raise ValueError(f"arch must be auto or one of {ARCHITECTURES}")
+    if values["video_protocol"] not in ("dino_480p_last4", "dino_square_last4", "dinov3"):
+        raise ValueError("video_protocol must be dino_480p_last4, dino_square_last4 or dinov3")
+    if values["video_resolution"] not in ("small", "medium", "large"):
+        raise ValueError("video_resolution must be small, medium or large")
+    if type(values["video_feature_blocks"]) is not int or values["video_feature_blocks"] not in (1, 4):
+        raise ValueError("video_feature_blocks must be 1 or 4")
+    manifests = values["video_split_manifests"]
+    if not isinstance(manifests, dict) or set(manifests) - {"youtube_vos", "mose"}:
+        raise ValueError("video_split_manifests must map youtube_vos/mose to explicit split JSON paths")
+    resolved_manifests = {}
+    for dataset, value in manifests.items():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"video_split_manifests.{dataset} must be a path string")
+        value = Path(value).expanduser()
+        resolved_manifests[dataset] = str(value.resolve() if value.is_absolute() else (path.parent / value).resolve())
+    values["video_split_manifests"] = resolved_manifests
     for name, minimum in (("num_workers", 0), ("seed", 0), ("segmentation_batch_size", 1)):
         if type(values[name]) is not int or values[name] < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
@@ -69,6 +87,11 @@ def load_config(path):
     if any(type(enabled) is not bool for enabled in switches.values()):
         raise ValueError("Evaluation switches must be YAML true or false, not strings or numbers")
     values["evaluations"] = [name for name in names if switches.get(name, False)]
+    if values["video_protocol"] in ("dino_480p_last4", "dino_square_last4") and any(name.endswith("_vos") for name in values["evaluations"]):
+        if values["video_resolution"] != "small" or values["video_feature_blocks"] != 4:
+            raise ValueError("Original DINO protocols require video_resolution: small and video_feature_blocks: 4")
+        if any(name in values["evaluations"] for name in ("youtube_vos_vos", "mose_vos")):
+            raise ValueError("Original DINO releases DAVIS only; select an explicit extension for other video datasets")
     if not values["evaluations"]:
         raise ValueError("Enable at least one evaluation in the YAML")
     for name in ("checkpoint", "datasets_root", "output_dir", "result_json", "classification_manifests"):
@@ -86,7 +109,8 @@ def load_config(path):
 def config_snapshot(args):
     """Save effective paths and every switch, including omitted/disabled tasks."""
     keys = ("checkpoint", "checkpoint_key", "arch", "datasets_root", "classification_manifests",
-            "output_dir", "result_json", "seed", "num_workers", "segmentation_batch_size", *WANDB_DEFAULTS)
+            "output_dir", "result_json", "seed", "num_workers", "segmentation_batch_size",
+            "video_protocol", "video_resolution", "video_feature_blocks", "video_split_manifests", *WANDB_DEFAULTS)
     result = {key: str(value) if isinstance(value := getattr(args, key), Path) else value for key in keys}
     result["evaluations"] = {name: name in args.evaluations for name, _, _ in EVALUATIONS}
     return result

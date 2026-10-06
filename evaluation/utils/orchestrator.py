@@ -48,10 +48,19 @@ def evaluation_command(args, name, module, result_path):
         "--datasets-root", str(args.datasets_root), "--output-dir", str(args.output_dir),
         "--result-json", str(result_path), "--num-workers", str(args.num_workers),
         "--seed", str(args.seed), "--classification-manifests", str(args.classification_manifests),
+        "--video-protocol", getattr(args, "video_protocol", "dinov3"),
+        "--video-resolution", getattr(args, "video_resolution", "small"),
+        "--video-feature-blocks", str(getattr(args, "video_feature_blocks", 4)),
+        "--video-split-manifests-json", json.dumps(getattr(args, "video_split_manifests", {}), sort_keys=True),
     ]
     if name in {"pascal_voc_knn", "pascal_voc_linear", "ade20k_knn", "ade20k_linear",
                 "cityscapes_knn", "cityscapes_linear"}:
         command.extend(("--batch-size", str(args.segmentation_batch_size)))
+    if name in {"davis_vos", "youtube_vos_vos", "mose_vos"}:
+        manifests = getattr(args, "video_split_manifests", {})
+        dataset = {"davis_vos": "davis", "youtube_vos_vos": "youtube_vos", "mose_vos": "mose"}[name]
+        if dataset in manifests:
+            command.extend(("--video-split-manifest", str(manifests[dataset])))
     return command
 
 
@@ -149,6 +158,9 @@ def _load_completed_result(path, args, evaluation_name):
     ):
         return None
     if evaluation_name == "mose_vos":
+        if (result.get("metrics_status") == "computed"
+                and result.get("protocol", {}).get("source") == "https://arxiv.org/abs/2508.10104v1"):
+            return result
         export = result.get("prediction_export") or {}
         if (result.get("dataset") != "MOSEv2 val"
                 or result.get("metrics_status") != "pending_external_evaluation"
@@ -185,9 +197,6 @@ def _preflight_benchmark_datasets(args, evaluations):
         "spair_correspondence": ("SPair-71k",),
         "navi_correspondence": ("navi_v1",),
         "scannet_correspondence": ("scannet_test_1500",),
-        "davis_vos": ("davis2017", "DAVIS2017", "DAVIS"),
-        "youtube_vos_vos": ("youtube_vos_2019", "YouTubeVOS2019", "YouTube-VOS"),
-        "mose_vos": ("MOSEv2",),
     }
     for evaluation_name, directories in choices.items():
         if evaluation_name in names and not any(
@@ -198,7 +207,11 @@ def _preflight_benchmark_datasets(args, evaluations):
             )
     video_names = {"davis_vos": "davis", "youtube_vos_vos": "youtube_vos", "mose_vos": "mose"}
     if names.intersection(video_names):
-        from evaluation.utils.video_segmentation import preflight_masks
+        if getattr(args, "video_protocol", "dinov3") in ("dino_480p_last4", "dino_square_last4"):
+            from evaluation.utils.video_dino import preflight_masks
+        else:
+            from evaluation.utils.video_dinov3 import preflight_masks
         for evaluation_name, dataset_name in video_names.items():
             if evaluation_name in names:
-                preflight_masks(args.datasets_root, dataset_name)
+                preflight_masks(args.datasets_root, dataset_name,
+                                getattr(args, "video_split_manifests", {}).get(dataset_name))

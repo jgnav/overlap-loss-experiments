@@ -1,0 +1,19 @@
+# Original DINO protocol, aspect-preserving 480p and mean of last four blocks.
+checkpoint: ../output/long_ibot_vit_small/85535_0/checkpoint_source1000_continuation0200.pth
+checkpoint_key: teacher
+arch: auto
+datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
+output_dir: null
+result_json: null
+seed: 0
+num_workers: 4
+segmentation_batch_size: 32
+video_protocol: dino_480p_last4
+video_resolution: small
+video_feature_blocks: 4
+video_split_manifests: {}
+wandb_mode: offline
+wandb_project: ibot-evaluation
+wandb_run_name: dino-480p-last4-region200
+evaluations:
+  davis_vos: true

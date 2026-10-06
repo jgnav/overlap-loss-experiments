@@ -1,0 +1,3 @@
+
+# Preserve the pinned upstream file byte-for-byte, including its whitespace.
+evaluation/vendor/dino/eval_video_segmentation.py -whitespace

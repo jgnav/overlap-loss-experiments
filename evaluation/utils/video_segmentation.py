@@ -25,7 +25,7 @@ N_LAST_FRAMES = 7
 NEIGHBORHOOD = 12
 TOP_K = 5
 TEMPERATURE = 0.1
-NORMALIZE = T.Normalize((0.485, 0.456, 0.406), (0.228, 0.224, 0.225))
+NORMALIZE = T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 # Official YouTube-VOS 2019 scoring_program_release.zip/categories_list_seen.txt.
 YOUTUBE_SEEN_CATEGORIES = frozenset("""airplane ape bear bike bird boat bucket bus camel cat cow crocodile
 deer dog dolphin duck eagle earless_seal elephant fish fox frisbee frog giant_panda
@@ -99,9 +99,23 @@ def _youtube_metadata(image_root, names):
             if (not object_id.isdecimal() or not info.get("category")
                     or not isinstance(frames, list) or len(frames) < 2
                     or any(not isinstance(frame, str) for frame in frames)
-                    or len(frames) != len(set(frames))):
+                    or len(frames) != len(set(frames)) or frames != sorted(frames)):
                 raise ValueError(f"Invalid YouTube-VOS object metadata for {name}/{object_id}")
     return videos
+
+
+def _youtube_initializations(video_metadata, frame_id):
+    """Only each object's first metadata annotation may initialize its mask."""
+    return tuple(sorted(int(object_id) for object_id, info in video_metadata["objects"].items()
+                        if info["frames"][0] == frame_id))
+
+
+def _youtube_start_index(frames, video_metadata):
+    first_id = min(info["frames"][0] for info in video_metadata["objects"].values())
+    for index, frame in enumerate(frames):
+        if frame.stem == first_id:
+            return index
+    raise FileNotFoundError(f"YouTube-VOS first object initialization frame missing: {first_id}")
 
 
 def preflight_masks(root, dataset_name):
@@ -109,6 +123,7 @@ def preflight_masks(root, dataset_name):
     dataset_root = _paths(root, dataset_name)
     image_root, mask_root, names, _ = _layout(dataset_root, dataset_name)
     youtube_videos = _youtube_metadata(image_root, names) if dataset_name == "youtube_vos" else None
+    empty_initializations = []
     mose_videos = None
     if dataset_name == "mose":
         metadata_path = dataset_root / "meta_valid.json"
@@ -137,12 +152,22 @@ def preflight_masks(root, dataset_name):
                 raise ValueError(f"MOSEv2 initialization object IDs differ from metadata: {first}")
             continue
         if youtube_videos is not None:
+            initialization_masks = {}
             for object_id, info in youtube_videos[name]["objects"].items():
                 for frame_id in info["frames"]:
                     if frame_id not in frame_stems:
                         raise FileNotFoundError(f"YouTube-VOS frame {frame_id} missing for {name}/{object_id}")
                     if not (masks / f"{frame_id}.png").is_file():
                         raise FileNotFoundError(f"YouTube-VOS scoring mask missing: {masks / f'{frame_id}.png'}")
+                first_id = info["frames"][0]
+                if first_id not in initialization_masks:
+                    initialization_masks[first_id] = _annotation(masks / f"{first_id}.png")
+                if initialization_masks[first_id].ndim != 2:
+                    raise ValueError(f"Expected indexed YouTube-VOS annotation: {masks / f'{first_id}.png'}")
+                if not np.any(initialization_masks[first_id] == int(object_id)):
+                    # Some released metadata starts an object on an empty mask.
+                    # Preserve that initialization; never seed from later GT.
+                    empty_initializations.append({"video": name, "object_id": int(object_id), "frame": first_id})
         scored = frames[1:-1] if dataset_name == "davis" else frames[1:]
         available = sum((masks / f"{frame.stem}.png").is_file() for frame in scored)
         missing = len(scored) - available
@@ -152,6 +177,7 @@ def preflight_masks(root, dataset_name):
             raise FileNotFoundError(f"{missing} validation scoring masks missing in {masks}")
         if dataset_name == "youtube_vos" and missing and available < 2:
             raise FileNotFoundError(f"Too few labeled YouTube-VOS scoring frames in {masks}")
+    return {"empty_youtube_initializations": empty_initializations}
 
 
 def _annotation(path):
@@ -202,10 +228,16 @@ def _features(backbone, image, patch_size, registers):
     return F.normalize(torch.stack(representations).mean(0).flatten(1).T, dim=1), (height, width)
 
 
+def _labels_at_grid(mask, grid, device):
+    # DINO uses PIL nearest, whose pixel-center sampling aligns annotation
+    # labels with the resized RGB patch grid. Torch "nearest" samples corners.
+    height, width = grid
+    labels = np.asarray(Image.fromarray(mask).resize((width, height), Image.Resampling.NEAREST)).copy()
+    return torch.as_tensor(labels.astype(np.int64), device=device)
+
+
 def _one_hot_mask(mask, object_ids, grid, device):
-    labels = torch.as_tensor(mask.astype(np.int64), device=device)[None, None].float()
-    # Nearest labels prevent fractional IDs; classes follow the initial mask.
-    labels = F.interpolate(labels, size=grid, mode="nearest")[0, 0].long()
+    labels = _labels_at_grid(mask, grid, device)
     return torch.stack([(labels == label).float() for label in (0, *object_ids)], dim=0).flatten(1)
 
 
@@ -232,9 +264,11 @@ def propagate_labels(target, sources, source_masks, grid,
         source_points = coordinates.repeat(len(sources), 1)
         nearby = (target_points[:, None, :] - source_points[None]).abs().amax(2) <= radius
         similarity.masked_fill_(~nearby, float("-inf"))
-        values, indices = similarity.topk(min(topk, nearby.shape[1]), dim=1)
-        weights = values.softmax(1)
-        result[:, start:end] = (masks[:, indices] * weights[None]).sum(-1)
+        values = similarity.topk(min(topk, nearby.shape[1]), dim=1).values
+        # Match DINO's threshold rule: keep all neighbors tied at rank k.
+        similarity.masked_fill_(similarity < values[:, -1:], float("-inf"))
+        weights = similarity.softmax(1)
+        result[:, start:end] = masks @ weights.T
     return result.reshape(1, masks.shape[0], height, width)
 
 
@@ -278,13 +312,23 @@ def _score_video(backbone, metadata, frames, mask_folder, device, dataset_name, 
     export_only = dataset_name == "mose"
     if export_only and prediction_folder is None:
         raise ValueError("MOSEv2 requires a prediction output directory")
+    original_frame_count = len(frames)
+    start_index = _youtube_start_index(frames, video_metadata) if video_metadata is not None else 0
+    # Some official YouTube-VOS videos start before any object is annotated.
+    # Those leading background-only frames are neither references nor scored.
+    frames = frames[start_index:]
     first_path = mask_folder / f"{frames[0].stem}.png"
     if not first_path.is_file():
         raise FileNotFoundError(f"Initial object mask missing: {first_path}")
     first_mask = _annotation(first_path)
-    object_ids = tuple(int(value) for value in np.unique(first_mask) if value not in (0, 255))
+    object_ids = (_youtube_initializations(video_metadata, frames[0].stem) if video_metadata is not None
+                  else tuple(int(value) for value in np.unique(first_mask) if value not in (0, 255)))
     if not object_ids:
         raise ValueError(f"Initial mask has no foreground objects: {first_path}")
+    if video_metadata is None and any(not np.any(first_mask == object_id) for object_id in object_ids):
+        raise ValueError(f"Initial annotation is missing an initialized object: {first_path}")
+    empty_initializations = {str(object_id): frames[0].stem for object_id in object_ids
+                             if not np.any(first_mask == object_id)}
     frame, original_size = _read_image(frames[0])
     if first_mask.shape != (original_size[1], original_size[0]):
         raise ValueError(f"Initial mask and RGB frame sizes differ: {first_path}")
@@ -316,16 +360,21 @@ def _score_video(backbone, metadata, frames, mask_folder, device, dataset_name, 
                 raise ValueError(f"Unexpected object IDs {sorted(unexpected)} in {annotation_path}")
         introduced = ()
         if dataset_name == "youtube_vos" and truth is not None:
-            introduced = tuple(int(value) for value in np.unique(truth)
-                               if value not in (0, 255, *object_ids))
+            introduced = (_youtube_initializations(video_metadata, frame_path.stem) if video_metadata is not None
+                          else tuple(int(value) for value in np.unique(truth)
+                                     if value not in (0, 255, *object_ids)))
+            if any(object_id in object_ids for object_id in introduced):
+                raise ValueError(f"Invalid YouTube-VOS object initialization: {annotation_path}")
+            for object_id in introduced:
+                if not np.any(truth == object_id):
+                    empty_initializations[str(object_id)] = frame_path.stem
             if introduced:
                 pad = (0, 0, 0, len(introduced))
                 first_probabilities = F.pad(first_probabilities, (0, 0, 0, len(introduced)))
                 history = deque(((features, F.pad(probs, pad)) for features, probs in history),
                                 maxlen=N_LAST_FRAMES)
                 next_probabilities = F.pad(propagated[0].flatten(1), pad)
-                truth_at_grid = torch.as_tensor(truth.astype(np.int64), device=device)[None, None].float()
-                truth_at_grid = F.interpolate(truth_at_grid, size=grid, mode="nearest")[0, 0].long().flatten()
+                truth_at_grid = _labels_at_grid(truth, grid, device).flatten()
                 for channel, object_id in enumerate(introduced, start=len(object_ids) + 1):
                     pixels = truth_at_grid == object_id
                     next_probabilities[:, pixels] = 0
@@ -361,7 +410,10 @@ def _score_video(backbone, metadata, frames, mask_folder, device, dataset_name, 
     object_scores = {str(object_id): {"j": float(np.mean([score[0] for score in values])),
                                       "f": float(np.mean([score[1] for score in values]))}
                      for object_id, values in scores.items() if values}
-    return object_scores, {"frames": len(frames), "scored_frames": scored_frames,
+    return object_scores, {"frames": original_frame_count, "processed_frames": len(frames),
+                           "initialization_frame": frames[0].stem, "skipped_leading_frames": start_index,
+                           "empty_initializations": empty_initializations,
+                           "scored_frames": scored_frames,
                            "missing_annotations": missing_annotations, "objects": list(object_ids),
                            "exported_frames": len(frames) if prediction_folder is not None else 0}
 
@@ -393,7 +445,7 @@ def main(dataset_name):
     started, start_time = utc_now(), time.monotonic()
     dataset_root = _paths(args.datasets_root, dataset_name)
     image_root, mask_root, names, split_file = _layout(dataset_root, dataset_name)
-    preflight_masks(args.datasets_root, dataset_name)
+    preflight_report = preflight_masks(args.datasets_root, dataset_name)
     youtube_videos = _youtube_metadata(image_root, names) if dataset_name == "youtube_vos" else None
     export_only = dataset_name == "mose"
     prediction_root = args.output_dir / "Annotations" if export_only else None
@@ -429,6 +481,7 @@ def main(dataset_name):
         "elapsed_seconds": time.monotonic() - start_time,
         "model": metadata, "evaluation_identity": evaluation_identity(args),
         "metrics_status": "pending_external_evaluation" if export_only else "computed",
+        "preflight": preflight_report,
         "prediction_export": {"directory": str(prediction_root), "archive": str(archive_path),
                               "frames": sum(item["exported_frames"] for item in per_video.values()),
                               "initialization_frame_included": True,
@@ -438,10 +491,14 @@ def main(dataset_name):
                      "reference": "first annotated frame plus preceding seven propagated frames",
                      "topk": TOP_K, "neighborhood_radius_patches": NEIGHBORHOOD,
                      "temperature": TEMPERATURE, "split_list": str(split_file) if split_file else None,
+                     "initial_mask_resize": "PIL nearest-neighbour pixel-center sampling",
+                     "affinity_topk": "threshold at rank k, including ties",
+                     "normalization_std": [0.229, 0.224, 0.225],
                      "dataset_root": str(dataset_root), "object_average": "mean over frame scores per object, then objects",
                      "mode": "prediction_export" if export_only else "offline_scoring",
                      "first_frame_scored": False, "davis_last_frame_scored": False,
-                     "youtube_new_objects": "first annotated appearance used as reference, excluded from its own score",
+                     "youtube_new_objects": "first metadata annotation initializes each object; leading background-only frames skipped",
+                     "youtube_empty_initializations": "preserved as empty at the metadata frame; no later ground-truth reseeding",
                      "youtube_scoring": "official meta.json object frames, 360-pixel boundary F, seen/unseen four-metric mean" if youtube_videos else None},
         "videos": per_video, "metrics": metrics,
     })

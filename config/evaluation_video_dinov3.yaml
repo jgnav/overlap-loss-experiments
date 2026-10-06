@@ -1,0 +1,25 @@
+# DINOv3 Section 6.1.5 / Appendix D.5 / Table 27.
+checkpoint: ../output/long_ibot_vit_small/85535_0/checkpoint_source1000_continuation0200.pth
+checkpoint_key: teacher
+arch: auto
+datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
+output_dir: null
+result_json: null
+seed: 0
+num_workers: 4
+segmentation_batch_size: 32
+video_protocol: dinov3
+video_resolution: small
+# User-requested feature aggregation; the DINOv3 paper uses one block.
+video_feature_blocks: 4
+# Explicit installed-data splits; full provenance is saved with every result.
+video_split_manifests:
+  youtube_vos: video_splits/youtube_vos_2019_valid.json
+  mose: video_splits/mosev2_seed0_holdout301.json
+wandb_mode: offline
+wandb_project: ibot-evaluation
+wandb_run_name: dinov3-video-region200
+evaluations:
+  davis_vos: true
+  youtube_vos_vos: true
+  mose_vos: true  # MOSEv2 annotated training holdout: 301 videos, seed 0.

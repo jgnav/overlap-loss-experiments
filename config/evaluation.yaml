@@ -25,6 +25,13 @@ wandb_run_name: null
 wandb_run_id: null
 wandb_resume: null  # null, allow, must, never; requires wandb_run_id when set
 
+video_protocol: dinov3
+video_resolution: small
+video_feature_blocks: 4
+video_split_manifests:
+  youtube_vos: video_splits/youtube_vos_2019_valid.json
+  mose: video_splits/mosev2_seed0_holdout301.json
+
 # Set each evaluation to true or false. Omitted entries are disabled.
 # ImageNet k-NN percentages refer to training banks; all use full validation.
 evaluations:
@@ -49,5 +56,5 @@ evaluations:
   navi_correspondence: true
   scannet_correspondence: true
   davis_vos: true
-  youtube_vos_vos: true
-  mose_vos: true  # MOSEv2 prediction export; scores come from the evaluation server.
+  youtube_vos_vos: true  # YouTube-VOS 2019 validation, all RGB frames, first-frame objects only.
+  mose_vos: true  # MOSEv2 annotated training holdout: 301 videos, seed 0.

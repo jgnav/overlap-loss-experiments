@@ -3,6 +3,7 @@
 import unittest
 import tempfile
 import json
+from unittest import mock
 from types import SimpleNamespace
 from pathlib import Path
 from PIL import Image
@@ -62,9 +63,11 @@ class MainResultsEvaluationTest(unittest.TestCase):
             self.assertEqual(samples["train"][0][1], [1, 0])
             self.assertEqual(samples["train"][1][1], [0, 1])
 
-    def test_default_suite_contains_every_table_column(self):
+    def test_default_suite_contains_supported_tasks(self):
         config = load_config(ROOT / "config/evaluation.yaml")
-        self.assertEqual(set(config.evaluations), {name for name, _, _ in EVALUATIONS})
+        self.assertEqual(set(config.evaluations),
+                         {name for name, _, _ in EVALUATIONS})
+        self.assertEqual(config.video_protocol, "dinov3")
         self.assertEqual(MULTILABEL_DATASETS["visual_genome"]["num_classes"], 500)
         self.assertEqual(MULTILABEL_DATASETS["visual_genome"]["epochs"], 200)
         self.assertEqual(len(EVALUATIONS), 22)
@@ -107,6 +110,23 @@ class MainResultsEvaluationTest(unittest.TestCase):
         result = vos.propagate_labels(features, [features], [masks], (2, 2), radius=1, topk=1)
         torch.testing.assert_close(result[0].flatten(1), masks)
 
+    def test_video_initial_labels_match_pil_pixel_centers(self):
+        mask = np.zeros((32, 32), dtype=np.uint8)
+        mask[8:24, 8:24] = 7
+        expected = np.asarray(Image.fromarray(mask).resize((2, 2), Image.Resampling.NEAREST))
+        labels = vos._labels_at_grid(mask, (2, 2), "cpu")
+        np.testing.assert_array_equal(labels.numpy(), expected)
+        probabilities = vos._one_hot_mask(mask, (7,), (2, 2), "cpu")
+        np.testing.assert_array_equal(probabilities[1].reshape(2, 2).numpy(), expected == 7)
+        # Corner sampling placed the only foreground patch diagonally opposite.
+        self.assertEqual(probabilities[1].tolist(), [1, 0, 0, 0])
+
+    def test_video_topk_keeps_all_tied_neighbors_like_dino(self):
+        features = torch.ones(4, 1)
+        masks = torch.tensor([[1., 1., 1., 0.], [0., 0., 0., 1.]])
+        result = vos.propagate_labels(features, [features], [masks], (2, 2), radius=1, topk=1)
+        torch.testing.assert_close(result[0].flatten(1), torch.tensor([[.75] * 4, [.25] * 4]))
+
     def test_video_preflight_rejects_first_frame_only_validation_masks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -125,8 +145,67 @@ class MainResultsEvaluationTest(unittest.TestCase):
             (masks / "00001.png").touch()
             with self.assertRaisesRegex(FileNotFoundError, "scoring mask missing"):
                 vos.preflight_masks(root, "youtube_vos")
-            (masks / "00002.png").touch()
+            # Preflight also verifies that metadata initialization IDs exist.
+            Image.fromarray(np.ones((32, 32), dtype=np.uint8)).save(masks / "00000.png")
+            Image.fromarray(np.ones((32, 32), dtype=np.uint8)).save(masks / "00002.png")
+            Image.fromarray(np.zeros((32, 32), dtype=np.uint8)).save(masks / "00000.png")
+            report = vos.preflight_masks(root, "youtube_vos")
+            self.assertEqual(report["empty_youtube_initializations"],
+                             [{"video": "example", "object_id": 1, "frame": "00000"}])
+            Image.fromarray(np.ones((32, 32), dtype=np.uint8)).save(masks / "00000.png")
             vos.preflight_masks(root, "youtube_vos")
+
+    def test_youtube_skips_background_prefix_and_uses_metadata_initializations(self):
+        class PositionBackbone:
+            def get_intermediate_layers(self, images, n=4):
+                tokens = torch.cat((torch.zeros(1, 1, 4), torch.eye(4)[None]), dim=1)
+                return [tokens.to(images.device) for _ in range(n)]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frames, masks = root / "frames", root / "masks"
+            frames.mkdir(); masks.mkdir()
+            for index in range(5):
+                Image.new("RGB", (32, 32), color="gray").save(frames / f"{index:05d}.jpg")
+                truth = np.zeros((32, 32), dtype=np.uint8)
+                if index >= 2:
+                    truth[:16, :16] = 1
+                if index >= 3:
+                    truth[16:, 16:] = 2
+                Image.fromarray(truth).save(masks / f"{index:05d}.png")
+            metadata = {"objects": {
+                "1": {"category": "dog", "frames": ["00002", "00003", "00004"]},
+                "2": {"category": "novel", "frames": ["00003", "00004"]},
+            }}
+            with mock.patch.object(vos, "_score_frame", wraps=vos._score_frame) as scorer:
+                scores, details = vos._score_video(
+                    PositionBackbone(), {"patch_size": 240, "num_register_tokens": 0},
+                    sorted(frames.iterdir()), masks, torch.device("cpu"), "youtube_vos", metadata,
+                )
+            # At object 2's initialization, only object 1 is scored. Both are
+            # scored on the following frame, with no ground-truth reset.
+            self.assertEqual(scorer.call_args_list[0].args[2], (1,))
+            self.assertEqual(scorer.call_args_list[1].args[2], (1, 2))
+            self.assertEqual(details["frames"], 5)
+            self.assertEqual(details["processed_frames"], 3)
+            self.assertEqual(details["skipped_leading_frames"], 2)
+            self.assertEqual(details["initialization_frame"], "00002")
+            self.assertEqual(details["scored_frames"], 2)
+            self.assertEqual(details["objects"], [1, 2])
+            self.assertGreater(scores["1"]["j"], 0.8)
+            self.assertGreater(scores["2"]["j"], 0.6)
+            self.assertEqual(vos._youtube_initializations(metadata, "00004"), ())
+            # A declared initialization can be empty in the release. A later
+            # visible ground truth must not silently initialize that object.
+            empty_intro = np.zeros((32, 32), dtype=np.uint8)
+            empty_intro[:16, :16] = 1
+            Image.fromarray(empty_intro).save(masks / "00003.png")
+            scores, details = vos._score_video(
+                PositionBackbone(), {"patch_size": 240, "num_register_tokens": 0},
+                sorted(frames.iterdir()), masks, torch.device("cpu"), "youtube_vos", metadata,
+            )
+            self.assertEqual(details["empty_initializations"], {"2": "00003"})
+            self.assertEqual(scores["2"]["j"], 0.0)
 
     def test_youtube_metrics_balance_seen_and_unseen_objects(self):
         videos = {"a": {"objects": {"1": {"category": "dog"}, "2": {"category": "novel"}}}}
