@@ -39,7 +39,7 @@ evaluations:
 
   imagenet_knn_1pct: true
   imagenet_knn_100pct: true
-  imagenet_linear: true  # CAPI: 12,500 iterations; linear + attentive heads
+  imagenet_linear: true  # CRISP: 200 epochs; CAPI linear + attentive fallback
   pascal_voc_1shot: true
   pascal_voc_2shot: true
   pascal_voc_5shot: true

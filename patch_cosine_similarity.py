@@ -25,14 +25,14 @@ import sys
 # -------------------------- Hard-coded settings --------------------------
 ROOT = Path(__file__).resolve().parent
 IMAGENET_VAL = Path("/mnt/fast/nobackup/scratch4weeks/jg02228/datasets/imagenet/val")
-OUTPUT_DIR = ROOT / "output/patch_cosine_similarity"
+OUTPUT_DIR = ROOT / "output/patch_cosine_similarity_1000"
 CHECKPOINTS = {
     "reference": ROOT / "output/long_ibot_vit_small_reference/85535_3/checkpoint_source1000_continuation0200.pth",
     "region": ROOT / "output/long_ibot_vit_small/85535_0/checkpoint_source1000_continuation0200.pth",
 }
 CHECKPOINT_KEY = "teacher"
 RESOLUTION = 1024                    # Square input; must be divisible by 16.
-N_IMAGENET_IMAGES = 100
+N_IMAGENET_IMAGES = 1000
 SEED = 1                            # Reproducible image and query sampling.
 DEVICE = "cuda"
 COLOR_MIN, COLOR_MAX = 0.0, 1.0       # Fixed viridis scale for BOTH models.

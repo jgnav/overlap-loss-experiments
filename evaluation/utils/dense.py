@@ -239,6 +239,12 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
         "dataset_manifests": manifests,
         "protocol": {
             "source": "Pinned official CAPI segmentation evaluator with local I/O adapters",
+            "protocol_precedence": ["CRISP", "CAPI", "iBOT"],
+            "setting_sources": {
+                "resolution_single_gpu": "CRISP Appendix A.2",
+                "features_classifier_search_standardization_refitting_metrics": "Pinned CAPI evaluator",
+                "voc_original_split_order_seed": "Recorded local choice; exact CRISP lists unpublished",
+            },
             "capi_revision": CAPI_REVISION,
             "dataset_train_split": spec["train_split"], "dataset_test_split": spec["test_split"],
             "input_resolution": resolution, "patch_tokens": patch_tokens,

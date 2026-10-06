@@ -1,0 +1,40 @@
+# CRISP settings; applicable CAPI and iBOT fallback details.
+checkpoint: ../output/long_ibot_vit_small/85535_0/checkpoint_source1000_continuation0200.pth
+checkpoint_key: teacher
+arch: auto
+datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
+classification_manifests: null
+output_dir: null
+result_json: null
+seed: 0
+num_workers: 4
+segmentation_batch_size: 32
+wandb_mode: offline
+wandb_project: ibot-evaluation
+wandb_entity: null
+wandb_run_name: crisp-region-vits-e200
+wandb_run_id: null
+wandb_resume: null
+evaluations:
+  pascal_voc_knn: true
+  pascal_voc_linear: true
+  ade20k_knn: true
+  ade20k_linear: true
+  cityscapes_knn: true
+  cityscapes_linear: true
+  imagenet_knn: true
+  imagenet_knn_1pct: true
+  imagenet_knn_100pct: true
+  imagenet_linear: true
+  pascal_voc_1shot: true
+  pascal_voc_2shot: true
+  pascal_voc_5shot: true
+  pascal_voc_multilabel: true
+  coco_multilabel: true
+  visual_genome_multilabel: true
+  spair_correspondence: true
+  navi_correspondence: true
+  scannet_correspondence: false
+  davis_vos: true
+  youtube_vos_vos: true
+  mose_vos: true

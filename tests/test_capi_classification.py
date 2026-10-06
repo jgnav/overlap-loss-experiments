@@ -55,14 +55,17 @@ class CAPIClassificationTest(unittest.TestCase):
         self.assertEqual(len(dataset), 4)
         self.assertEqual(dataset[3][1][0], -1)
 
-    def test_global_batch_and_short_schedule(self):
+    def test_crisp_epoch_budget_and_scaled_fixed_learning_rate(self):
         for count in (1, 2, 4, 8):
-            p = adapter.protocol(count)
+            p = adapter.protocol(count, training_samples=1153050)
             self.assertEqual(p['global_batch_size'], p['batch_size_per_gpu'] * count)
-            self.assertEqual(p['iterations'], 12500)
+            self.assertEqual(p['epochs'], 200)
+            self.assertEqual(p['iterations'], 225206)
             self.assertEqual(p['warmup_iterations'], 1250)
             self.assertEqual(p['optimizer'], 'AdamW')
-            self.assertEqual(len(p['learning_rates']) * len(p['weight_decays']), 30)
+            self.assertEqual(p['learning_rates'], [.001])
+            self.assertEqual(p['actual_initial_learning_rates'], [.004])
+            self.assertEqual(len(p['learning_rates']) * len(p['weight_decays']), 3)
         with self.assertRaises(ValueError):
             adapter.protocol(3)
 

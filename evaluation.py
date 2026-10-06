@@ -68,8 +68,14 @@ def run_evaluations(args):
             else:
                 print(f"[{index}/{len(evaluations)}] Starting {name}", flush=True)
                 try:
+                    environment = worker_environment()
+                    if name in {"pascal_voc_knn", "pascal_voc_linear", "ade20k_knn", "ade20k_linear",
+                                "cityscapes_knn", "cityscapes_linear"}:
+                        # CRISP evaluates segmentation on one GPU, also when
+                        # a mixed suite was submitted with a larger allocation.
+                        environment["CUDA_VISIBLE_DEVICES"] = environment.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
                     completed = subprocess.run(evaluation_command(args, name, module, result_path),
-                                               cwd=REPO_ROOT, env=worker_environment(), check=False)
+                                               cwd=REPO_ROOT, env=environment, check=False)
                     if completed.returncode != 0:
                         raise RuntimeError(f"{name} exited with status {completed.returncode}")
                     result = _load_completed_result(result_path, args, name)

@@ -334,6 +334,15 @@ class ClassificationTest(unittest.TestCase):
         loss.backward()
         self.assertEqual(logits.grad[0, 1].item(), 0)
 
+    def test_multilabel_lr_scales_with_actual_global_batch(self):
+        for dataset, epochs in (("pascal_voc", 500), ("coco", 200), ("visual_genome", 200)):
+            for world_size in (1, 2, 4, 8):
+                recipe = classification._protocol(dataset, "vit_small", "teacher", world_size)
+                self.assertEqual(recipe["epochs"], epochs)
+                self.assertEqual(recipe["base_learning_rate"], 0.001)
+                self.assertEqual(recipe["learning_rate"], 0.004)
+                self.assertTrue(recipe["learning_rate_scaled_by_batch_size"])
+
     def test_map_is_global_per_class_and_masks_unknown_labels(self):
         labels = np.array([[1, 0], [0, 1], [1, -1], [0, 0]])
         scores = np.array([[0.9, 0.8], [0.8, 0.9], [0.7, 100.0], [0.1, 0.1]])

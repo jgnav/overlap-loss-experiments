@@ -29,7 +29,7 @@ from evaluation.utils.imagenet import IMAGENET_NORMALIZE, _resolve_imagenet_root
 REFERENCE_GPU_COUNT = 4
 BATCH_SIZE_PER_GPU = 256
 GLOBAL_BATCH_SIZE = REFERENCE_GPU_COUNT * BATCH_SIZE_PER_GPU
-LEARNING_RATE = 0.001
+BASE_LEARNING_RATE = 0.001
 
 
 def classification_transforms():
@@ -135,16 +135,21 @@ def _protocol(dataset_name, architecture, checkpoint_key, world_size=REFERENCE_G
         from evaluation.utils.capi_classification import protocol
         return protocol(world_size)
     n, average_patches = feature_spec(architecture)
+    batch_per_gpu = max(1, GLOBAL_BATCH_SIZE // world_size)
+    global_batch = batch_per_gpu * world_size
     return {
         "source": "CRISP Appendix A.2; CG-SSL Table 2 task coverage",
-        "equivalence": "Matches stated CRISP settings; unpublished choices remain unverified",
+        "equivalence": "CRISP settings with applicable iBOT fallback components; unpublished choices remain unverified",
+        "protocol_precedence": ["CRISP", "CAPI", "iBOT"],
         "input_resolution": 224, "gpu_count": world_size,
-        "batch_size_per_gpu": max(1, GLOBAL_BATCH_SIZE // world_size),
-        "global_batch_size": max(1, GLOBAL_BATCH_SIZE // world_size) * world_size,
+        "batch_size_per_gpu": batch_per_gpu,
+        "global_batch_size": global_batch,
         "reference_global_batch_size": GLOBAL_BATCH_SIZE,
         "feature_microbatch_size": BATCH_SIZE_PER_GPU,
-        "learning_rate": LEARNING_RATE,
-        "learning_rate_scaled_by_batch_size": False,
+        "base_learning_rate": BASE_LEARNING_RATE,
+        "learning_rate": BASE_LEARNING_RATE * global_batch / 256,
+        "learning_rate_scaled_by_batch_size": True,
+        "learning_rate_interpretation": "CRISP 0.001 treated as base LR using iBOT scaling; author convention unverified",
         "epochs": MULTILABEL_DATASETS[dataset_name]["epochs"],
         "backbone_frozen": True, "checkpoint_key": checkpoint_key,
         "feature": {"concatenated_cls_blocks": n, "append_mean_patch_tokens": average_patches},
@@ -154,10 +159,15 @@ def _protocol(dataset_name, architecture, checkpoint_key, world_size=REFERENCE_G
         "train_transform": "RandomResizedCrop(224, bilinear), horizontal flip, ImageNet normalization",
         "val_transform": "Resize(shorter side=256, bicubic), CenterCrop(224), ImageNet normalization",
         "checkpoint_selection": "final epoch; no selection on reported validation set",
+        "setting_sources": {
+            "epochs_resolution_gpu_batch_base_lr": "CRISP Appendix A.2",
+            "pooling_optimizer_schedule_transforms_initialization": "Original iBOT linear evaluator; CAPI has no released VOC/COCO/VG multilabel protocol",
+            "loss_ap_difficult_labels_split_final_epoch": "Documented local choices; absent from applicable released protocols",
+        },
         "metric": "macro average precision (non-interpolated)" if dataset_name != "imagenet" else "top-1/top-5 accuracy",
         "implementation_choices_not_specified_by_papers": [
             "iBOT architecture-dependent feature pooling, SGD/momentum/weight decay, cosine schedule, augmentation, and head initialization",
-            "0.001 is interpreted as the actual optimizer learning rate, without iBOT's batch-size rescaling",
+            "0.001 is interpreted as base learning rate with iBOT batch scaling; CRISP's actual LR is unverified",
             "multilabel masked BCE, unknown-label handling, and non-interpolated macro AP",
             "final-epoch reporting instead of selecting an epoch on the evaluation set",
             "dataset versions, split membership, and label vocabulary are supplied by input manifests",
@@ -263,7 +273,7 @@ def run_classification(args, dataset_name, evaluation_name, rank, world_size):
     multilabel = dataset_name != "imagenet"
     head = linear_head(backbone, architecture, len(train.classes)).to(device)
     head = nn.parallel.DistributedDataParallel(head, device_ids=[device.index])
-    optimizer = torch.optim.SGD(head.parameters(), lr=LEARNING_RATE, momentum=0.9, weight_decay=0)
+    optimizer = torch.optim.SGD(head.parameters(), lr=protocol["learning_rate"], momentum=0.9, weight_decay=0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     sampler = DistributedSampler(train, shuffle=True, seed=args.seed)
     loader = DataLoader(

@@ -1,4 +1,4 @@
-"""Local ImageNet/checkpoint adapter for the pinned official CAPI evaluator."""
+"""CRISP ImageNet settings with the pinned CAPI classifier implementation."""
 
 import copy
 import hashlib
@@ -21,10 +21,10 @@ from evaluation.utils.common import (
 )
 from evaluation.utils.imagenet import _resolve_imagenet_root
 
-ITERATIONS = 12_500
+EPOCHS = 200
 WARMUP_ITERATIONS = 1_250
 GLOBAL_BATCH_SIZE = 1_024
-LEARNING_RATES = (1e-5, 2e-5, 5e-5, 1e-4, 2e-4, 5e-4, 1e-3, 2e-3, 5e-3, 1e-2)
+LEARNING_RATES = (0.001,)
 WEIGHT_DECAYS = (5e-4, 1e-3, 5e-2)
 
 
@@ -56,17 +56,24 @@ class CAPIBackbone(nn.Module):
         return tokens[:, 0], tokens[:, :0], patches.reshape(len(images), height, width, -1)
 
 
-def protocol(world_size):
+def protocol(world_size, training_samples=None):
     if GLOBAL_BATCH_SIZE % world_size:
         raise ValueError("CAPI requires a GPU count dividing global batch size 1024")
     return {
-        "source": "Official CAPI classification evaluator", "capi_revision": CAPI_REVISION,
-        "iterations": ITERATIONS, "warmup_iterations": WARMUP_ITERATIONS,
+        "source": "CRISP Appendix A.2 settings; pinned CAPI classification fallback",
+        "protocol_precedence": ["CRISP", "CAPI", "iBOT"],
+        "capi_revision": CAPI_REVISION,
+        "epochs": EPOCHS,
+        "iterations": math.ceil(EPOCHS * training_samples / GLOBAL_BATCH_SIZE) if training_samples is not None else None,
+        "iteration_rule": "ceil(200 * actual training-split images / global batch); CAPI infinite sampler",
+        "warmup_iterations": WARMUP_ITERATIONS,
         "global_batch_size": GLOBAL_BATCH_SIZE, "batch_size_per_gpu": GLOBAL_BATCH_SIZE // world_size,
         "gpu_count": world_size, "input_resolution": 224, "backbone_frozen": True,
         "optimizer": "AdamW", "betas": [0.9, 0.95],
         "learning_rates": list(LEARNING_RATES), "weight_decays": list(WEIGHT_DECAYS),
         "learning_rate_scaling": "base learning rate * global batch size / 256",
+        "actual_initial_learning_rates": [rate * GLOBAL_BATCH_SIZE / 256 for rate in LEARNING_RATES],
+        "learning_rate_interpretation": "CRISP 0.001 treated as base LR using CAPI/iBOT scaling; author convention unverified",
         "bias_weight_decay": 0.0, "schedule": "linear warmup then cosine decay to zero",
         "representations": ["cls", "avg_patch", "cls_avg_patch", "patch"],
         "feature": "final normalized CLS/patch tokens; no concatenation of intermediate blocks",
@@ -79,8 +86,13 @@ def protocol(world_size):
         "test_transform": "Resize(256, bicubic), CenterCrop(224), ImageNet normalization",
         "test_split": "official ImageNet validation; never used for hyperparameter selection",
         "checkpoint_period": 1250, "validation_period": 1250,
-        "use_compile": False, "compile_note": "execution optimization only; eager avoids compiling 120 heads",
-        "published_score_equivalence": "CAPI probe recipe on an adapted iBOT backbone; not CAPI pretrained weights",
+        "use_compile": False, "compile_note": "execution optimization only; eager execution",
+        "setting_sources": {
+            "epochs_resolution_gpu_batch_base_lr": "CRISP Appendix A.2",
+            "features_optimizer_warmup_transforms_holdout_weight_decay_selection": "Pinned CAPI evaluator",
+            "lr_scaling": "CAPI/iBOT fallback assumption",
+        },
+        "published_score_equivalence": "CRISP stated settings with CAPI fallback details; exact author recipe unverified",
     }
 
 
@@ -107,9 +119,10 @@ def run(args, rank, world_size):
     if train.class_to_idx != test.class_to_idx or len(train.classes) != 1000:
         raise ValueError("ImageNet train/val must share exactly 1000 classes")
     backbone, model_metadata = load_backbone(args.checkpoint, args.checkpoint_key, args.arch)
-    recipe = protocol(world_size)
+    dataset_metadata = split_metadata(train)
+    recipe = protocol(world_size, dataset_metadata["train"])
     signature = {"evaluation_identity": evaluation_identity(args), "model": model_metadata,
-                 "protocol": recipe, "dataset": split_metadata(train)}
+                 "protocol": recipe, "dataset": dataset_metadata}
     signature_path = args.output_dir / "protocol.json"
     if signature_path.is_file() and json.loads(signature_path.read_text()) != signature:
         raise ValueError("Existing CAPI probe belongs to a different checkpoint/protocol; use a new output directory")
@@ -121,7 +134,7 @@ def run(args, rank, world_size):
         output_dir=str(args.output_dir), train_dataset_name=train,
         test_dataset_names=(test,), val_proportion=0.1,
         representations=("cls", "avg_patch", "patch"),
-        n_iters=ITERATIONS, warmup_iters=WARMUP_ITERATIONS,
+        n_iters=recipe["iterations"], warmup_iters=WARMUP_ITERATIONS,
         learning_rates=LEARNING_RATES, weight_decays=WEIGHT_DECAYS,
         batch_size=recipe["batch_size_per_gpu"], num_classes=1000,
         num_workers=args.num_workers, use_compile=False, dataset_use_cache=False,

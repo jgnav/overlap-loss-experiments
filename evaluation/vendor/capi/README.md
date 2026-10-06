@@ -44,10 +44,14 @@ MetricLogger and SmoothedValue. Local changes:
 - Fail explicitly on nonfinite loss; do not change classifier calculations.
 - Convert local ImageFolder identifiers to path strings in result keys.
 
-The 12,500-step AdamW schedule, 30 parameter candidates per feature, initializers,
-attention head, multi-head loss, fixed seed-42 split and sampler, padding and
-selection logic remain upstream. Batch per GPU is 1024 / GPU count (256 on four).
-Eager execution (`use_compile=False`) avoids compilation of the 120-head graph;
+The vendor core retains upstream implementations. The local adapter overrides
+the training budget with CRISP's 200 epochs of image exposure and replaces the
+LR grid with base LR 0.001 (actual peak 0.004 at global batch 1,024).
+AdamW, 1,250-step warmup, three weight-decay candidates per feature, initializers,
+attention head, multi-head loss, seed-42 split/sampler, padding and selection
+remain upstream. These overrides are recorded as CRISP settings with CAPI
+fallback assumptions; this is not the unchanged CAPI protocol. Batch per GPU is 1024 / GPU count (256 on four).
+Eager execution (`use_compile=False`) avoids compilation of the 12-head graph;
 it leaves the mathematical protocol unchanged. No mixed precision is introduced.
 
 Source: https://github.com/facebookresearch/capi/blob/98b4fa17ee8eec8810c17022df9a27a44845368b/eval_classification.py

@@ -5,8 +5,8 @@
 #   sbatch slurm/evaluation.sh config/evaluation.yaml
 #
 # The YAML controls the checkpoint, dataset paths, output directory, and
-# selected evaluations.  Each evaluation worker discovers and uses all four
-# GPUs allocated by Slurm.
+# selected evaluations. Use evaluation.launch_slurm to submit task groups with
+# one GPU for segmentation/video and four for classification.
 
 #SBATCH --job-name=ibot-evaluation
 #SBATCH --partition=3090_risk,a100,rtx_pro6000_risk
@@ -15,9 +15,9 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
-#SBATCH --mem=192G
-#SBATCH --time=10:00:00
-#SBATCH --nice=1000
+#SBATCH --mem=128G
+#SBATCH --time=3-00:00:00
+#SBATCH --nice=0
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@600
 #SBATCH --output=output/evaluation_%j.out
@@ -34,8 +34,8 @@ if [[ ! -f "${CONFIG_PATH}" ]]; then
     exit 2
 fi
 
-export OMP_NUM_THREADS=4
-export MKL_NUM_THREADS=4
+export OMP_NUM_THREADS=2
+export MKL_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export MALLOC_ARENA_MAX=2
 export MALLOC_TRIM_THRESHOLD_=131072

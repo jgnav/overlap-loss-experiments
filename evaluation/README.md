@@ -1,9 +1,11 @@
 # Evaluation protocols
 
 Each evaluation has one implementation and one fixed recipe. There are no
-protocol mode switches. ImageNet linear/attentive classification and semantic
-segmentation use the pinned official CAPI evaluator. Other tasks retain their
-existing CRISP/iBOT or task-specific recipes and are non-CAPI extensions.
+protocol mode switches. Settings follow CRISP first, then applicable CAPI details, then iBOT.
+ImageNet linear/attentive classification uses CRISP duration/batch/base-LR
+settings with the pinned CAPI implementation. Segmentation uses CAPI classifiers
+and CRISP resolution. Other tasks use documented CRISP/iBOT or task-specific
+components. Missing author details remain explicit assumptions.
 
 Training-time monitoring uses these same evaluators for PASCAL VOC k-NN and
 linear segmentation and ImageNet 10% CLS k-NN classification, including their
@@ -89,7 +91,7 @@ are edited in place. Retain result JSON files with the evaluated checkpoints.
 
 ## Classification
 
-### ImageNet: pinned CAPI linear and attentive probes
+### ImageNet: CRISP settings with CAPI linear and attentive components
 
 `imagenet_linear` runs the released CAPI classifier implementation at revision
 `98b4fa17ee8eec8810c17022df9a27a44845368b`. It trains linear heads on final CLS,
@@ -97,37 +99,40 @@ mean final patch, and concatenated final CLS/mean-patch features, plus attentive
 heads on final patch tokens. ViT-S no longer concatenates four intermediate CLS
 blocks. All heads share a single frozen backbone forward per batch.
 
-- **12,500 optimizer iterations**, global batch **1,024**, on 90% of ImageNet
-  training images. Approximately 10 full-dataset passes (11.1 over the 90% split).
+- **200 epochs of image exposure**, global batch **1,024**, on the CAPI 90%
+  training split. The infinite-sampler iteration budget is
+  `ceil(200 * actual_training_images / 1024)` (225,206 steps for 1,153,050 images).
+  This overrides upstream CAPI's 12,500-step budget using CRISP Appendix A.2.
 - Fixed 10% holdout with `numpy.default_rng(42)`; official validation is the test
   set. No reported-test-set tuning.
 - **AdamW**, betas `(0.9, 0.95)`, 1,250-step linear warmup then cosine decay.
-- 30 hyperparameter candidates **per feature source**: base learning rates
-  `{1e-5,2e-5,5e-5,1e-4,2e-4,5e-4,1e-3,2e-3,5e-3,1e-2}` crossed with weight
-  decays `{5e-4,1e-3,5e-2}`. Rates scale by global batch / 256; bias decay is zero.
+- Fixed **base LR 0.001** from CRISP, with CAPI/iBOT batch scaling: the peak
+  optimizer LR is **0.004** at global batch 1,024. CRISP does not specify whether
+  its 0.001 was a base or actual LR; this is an explicit fallback assumption.
+  Three CAPI weight decays `{5e-4,1e-3,5e-2}` remain per feature source; bias
+  decay is zero. There are 12 heads in total, rather than upstream's 120.
 - Bicubic random resized crop to 224 and horizontal flip for training; bicubic
   resize to 256 and center crop to 224 for holdout/test.
 - CAPI's infinite distributed sampler (seed 42), worker persistence, masked
   padding for validation and independent heldout selection per feature source.
 - Checkpoint and validation every 1,250 steps. Checkpoint writes are atomic and
   only the latest classifier checkpoint is retained. A protocol/checkpoint/input
-  signature rejects incompatible resume. Old 200-epoch SGD probes cannot resume
-  into this protocol; start them in a new output directory.
+  signature rejects incompatible resume. Previous 12,500-step CAPI and
+  200-epoch SGD probes require a new output directory and fresh head training.
 
 `metrics.top1` is the heldout-selected **CLS linear** test accuracy;
 `metrics.attentive_top1` is the patch-attentive accuracy. `feature_results`
 contains the separate CLS, average-patch, concatenated-feature and attentive
-results with selected parameters. `validation_sweep.json` contains all 120
+results with selected parameters. `validation_sweep.json` contains all 12
 candidates; `test_classifiers.json` contains the four selected classifiers.
 CAPI reports top-1; a top-5 number is not invented for this evaluator.
 
 The model adapter exposes the same final normalized iBOT features as CAPI's
-released `baselines/ibot_loader.py`. This reproduces the probe recipe on our
-backbones, not CAPI's pretrained representations. Eager execution is used rather
-than compiling the 120-head graph; this is an execution choice, not a change to
-loss, optimizer, schedule or model selection. Four GPUs use 256 images each.
+released `baselines/ibot_loader.py`. CRISP overrides duration and base LR; CAPI supplies the remaining classifier
+details. Exact CRISP score reproduction is not established. Eager execution
+avoids compiling the classifier graph without changing its calculations. Four GPUs use 256 images each.
 
-### Non-CAPI classification extensions
+### Multilabel classification with iBOT fallback components
 
 CAPI does not release the VOC/COCO/Visual Genome multilabel or few-shot recipes
 used here. As requested, these retain their existing CRISP-derived settings:
@@ -138,7 +143,7 @@ used here. As requested, these retain their existing CRISP-derived settings:
 | `coco_multilabel` | Explicit COCO classification train split, 80 classes | 200 | mAP |
 | `visual_genome_multilabel` | Explicit VG500 train split, 500 classes | 200 | mAP |
 
-These use SGD/momentum, fixed learning rate 0.001 before cosine decay, global
+These use SGD/momentum, base learning rate 0.001, scaled to actual LR 0.004 at global batch 1,024, before cosine decay, global
 batch 1,024, iBOT pooling and bilinear random crops. They report final-epoch
 macro AP with unknown/difficult labels masked. Their unchanged VOC 1/2/5-shot
 variants sample positive images per class, deduplicate the union and train for
@@ -273,11 +278,11 @@ An explicit existing `torchrun` launch is respected. Zero GPUs fails clearly.
   per training step. This preserves a total batch of 1,024 for 1/2/4/8 GPUs;
   other counts use the nearest lower multiple (3 GPUs: 1,023). Frozen backbone
   forwards use chunks of at most 256 images to limit activation memory. The
-  learning rate stays 0.001. Results record actual GPU/batch counts. Smaller
+  optimizer LR follows base LR 0.001 times actual global batch / 256. Results record actual GPU/batch counts. Smaller
   datasets/final batches remain smaller. Changing GPU count can change
   stochastic augmentation and sampling, so it does not promise identical scores.
 - CAPI ImageNet classification uses 1,024 / GPU count images per GPU and
-  requires a divisor of 1,024; 4 GPUs use 256. Its 120 heads are trained with
+  requires a divisor of 1,024; 4 GPUs use 256. Its 12 heads are trained with
   DDP and its validation metrics aggregate all ranks, excluding padding.
 - ImageNet k-NN distributes both feature extraction and validation queries.
   Each GPU holds the training bank; global top-1/top-5 count every validation
@@ -528,3 +533,28 @@ The result JSON records export paths/counts and
 `metrics_status: pending_external_evaluation`; J/F entries are `null` until
 scored externally. A completed export is reused only while its submission ZIP
 still exists. Submission is not automatic.
+
+## Slurm resources and combined suites
+
+Use `./.conda-env/bin/python -m evaluation.launch_slurm config/evaluation_region_vits200.yaml`
+to split a full suite into independent jobs. `--dry-run` previews allocations:
+
+| Group | GPUs | CPUs | RAM | Time limit |
+| --- | ---: | ---: | ---: | --- |
+| Segmentation | 1 | 16 | 128 GiB | 48 hours |
+| ImageNet linear/attentive | 4 | 24 | 64 GiB | 72 hours |
+| Other classification | 4 | 24 | 64 GiB | 24 hours |
+| Correspondence/video | 1 | 8 | 32 GiB | 72 hours |
+
+All groups use the same checkpoint, datasets and seed, with separate outputs.
+A dependent CPU job merges their results into the suite's `full_evaluation.json`.
+`python -m evaluation.merge_results <suite-directory>` refreshes partial results.
+Groups requeue ten minutes before their limits. Completed evaluations are reused;
+unfinished linear heads resume optimizer/scheduler state. An interrupted dense
+fit or video/correspondence task may repeat its unfinished task.
+
+The generic `sbatch slurm/evaluation.sh <config>` remains available for one
+allocation (four GPUs, 128 GiB, 72 hours). Its offline segmentation workers see
+only one GPU. The grouped launcher avoids reserving the other GPUs for these
+tasks. Selected dataset splits and local multilabel BCE/AP/final-epoch choices
+remain unchanged and are recorded in result metadata.
