@@ -42,32 +42,49 @@ harness and custom split lists are not released.
 | --- | --- | --- |
 | DAVIS2017 | Official validation, 30 videos | All frames; standard native J/F |
 | YouTube-VOS2019 | Official validation, 507 videos | All RGB frames from the released ZIP; score supplied annotations only |
-| MOSEv2 | Seed0 holdout of 301 annotated training videos | All released RGB frames and masks |
+| MOSE (2023) | Seed0 split: 1206 validation / 301 test videos, evaluate test | All released RGB frames and masks |
 
-The two non-DAVIS splits are installed-data adaptations. They do not claim to
-match DINOv3's custom 690-video YouTube-VOS or original-MOSE 301-video test lists.
+YouTube-VOS remains an installed-data adaptation. MOSE now uses the original
+2023 release's 1507 fully annotated training videos, matching DINOv3's dataset
+version and 1206/301 split sizes. The author video lists and seed are unavailable;
+our fallback sorts the original IDs, shuffles with Python `random.Random(0)`,
+and reserves the first 301 for testing and the other 1206 for validation.
+These manifests do not claim to match DINOv3's custom 690-video YouTube-VOS
+or original-MOSE 301-video test IDs.
 The manifests explicitly record versions, split provenance and
 `author_split_verified: false`. YouTube-VOS uses first-frame objects and an
 all-object J/F average under this protocol, rather than the challenge server's
 seen/unseen averaging and later-object initialization rules.
 
-MOSEv2's remaining 3365 training videos and YouTube-VOS's 3471 training videos
+MOSE's 1206 validation videos and YouTube-VOS's 3471 training videos
 are recorded as disjoint selection sets but are unused: propagation parameters
 are fixed to the published DAVIS-selected values, without tuning on any test set.
-MOSEv2 official validation has initial masks only and cannot produce local J/F;
-the annotated training holdout supports offline scoring.
+The original MOSE release was downloaded from the authors' linked
+[Hugging Face repository](https://huggingface.co/datasets/FudanCVL/MOSE), with
+the outer archive and inner training archive SHA256 checks verified. It is stored
+under `datasets_root/MOSE2023`; `preparation_report.json` records provenance,
+hashes and annotation alignment across the complete original archive. The 301
+test videos are extracted for scoring; the unused 1206 validation videos remain
+available in the verified archive. The split builder uses the original
+`meta_train.json` population and requires every selected test video to be
+extracted. Official MOSE validation has initial masks only
+and cannot produce local J/F. The earlier MOSEv2 manifest is retained only for
+reproducing the previous adaptation, and is no longer selected by offline configs.
 
 `config/video_splits/*.json` contains the exact IDs. Paths resolve relative to
 `datasets_root`, keeping manifests usable on another installation. Rebuild with:
 
 ```bash
 python evaluation/prepare_video_splits.py /path/to/datasets
+# Rebuild only the original MOSE split:
+python evaluation/prepare_video_splits.py /path/to/datasets --mose-only
 ```
 
-The builder sorts IDs before seeded sampling. ZIP access validates frame names,
+The builder rejects a wrong original-MOSE population or missing annotation video
+IDs before creating the 1206/301 split. ZIP access validates frame names,
 checks all available annotation/RGB alignment, and decompresses frames on demand.
-ZIP CRCs, names and sizes form a recorded archive index hash. No full archive
-extraction or extra download is needed.
+YouTube-VOS ZIP CRCs, names and sizes form a recorded archive index hash;
+its dense RGB frames are read on demand without archive extraction.
 
 ## Run and resume
 
@@ -78,6 +95,8 @@ probe/training protocols retain their existing configurations.
 
 ```bash
 sbatch slurm/evaluation_video_dinov3.sh config/evaluation_video_dinov3.yaml
+# Original MOSE only:
+sbatch slurm/evaluation_video_dinov3.sh config/evaluation_mose_dinov3.yaml
 ```
 
 The Slurm launcher requests one GPU, four CPUs, 24GiB RAM and twelve hours.

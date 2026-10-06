@@ -1,0 +1,19 @@
+# DINOv3 paper propagation, original MOSE, paper-sized seeded fallback split.
+checkpoint: ../output/long_ibot_vit_small/85535_0/checkpoint_source1000_continuation0200.pth
+checkpoint_key: teacher
+arch: auto
+datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
+output_dir: null
+seed: 0
+num_workers: 4
+video_protocol: dinov3
+video_resolution: small
+# Explicitly requested modification: average last four blocks rather than last one.
+video_feature_blocks: 4
+video_split_manifests:
+  mose: video_splits/mose2023_seed0_test301.json
+wandb_mode: offline
+wandb_project: ibot-evaluation
+wandb_run_name: dinov3-mose2023-region200
+evaluations:
+  mose_vos: true

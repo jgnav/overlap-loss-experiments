@@ -21,7 +21,7 @@ video_feature_blocks: 4
 # DINOv3 propagation on explicit available-data splits (not its unpublished author splits).
 video_split_manifests:
   youtube_vos: video_splits/youtube_vos_2019_valid.json
-  mose: video_splits/mosev2_seed0_holdout301.json
+  mose: video_splits/mose2023_seed0_test301.json
 evaluations:
   pascal_voc_knn: true
   pascal_voc_linear: true
@@ -44,4 +44,4 @@ evaluations:
   scannet_correspondence: false
   davis_vos: true
   youtube_vos_vos: true
-  mose_vos: true  # MOSEv2 annotated training holdout: 301 videos, seed 0.
+  mose_vos: true  # Original MOSE: seeded 1206 validation / 301 test split.

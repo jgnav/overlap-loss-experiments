@@ -15,11 +15,11 @@ video_feature_blocks: 4
 # Explicit installed-data splits; full provenance is saved with every result.
 video_split_manifests:
   youtube_vos: video_splits/youtube_vos_2019_valid.json
-  mose: video_splits/mosev2_seed0_holdout301.json
+  mose: video_splits/mose2023_seed0_test301.json
 wandb_mode: offline
 wandb_project: ibot-evaluation
 wandb_run_name: dinov3-video-region200
 evaluations:
   davis_vos: true
   youtube_vos_vos: true
-  mose_vos: true  # MOSEv2 annotated training holdout: 301 videos, seed 0.
+  mose_vos: true  # Original MOSE: seeded 1206 validation / 301 test split.

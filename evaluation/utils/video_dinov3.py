@@ -186,6 +186,9 @@ def dataset_layout(root, dataset, manifest_path=None):
         raise ValueError("Split manifests require selection/evaluation ID lists and a nonempty evaluation set")
     if manifest["author_split_verified"] and ((len(selection), len(held_out)) != expected or release == "v2"):
         raise ValueError(f"DINOv3 {dataset} split sizes must be {expected}, found {(len(selection), len(held_out))}")
+    if manifest.get("paper_split_sizes_matched") and (
+            (len(selection), len(held_out)) != expected or (dataset == "mose" and release != "2023")):
+        raise ValueError("Paper-sized split requires the original release and published selection/evaluation counts")
     if (any(not isinstance(name, str) or not name or name in {".", ".."} or "\\" in name or Path(name).name != name
             for name in [*selection, *held_out]) or len(set(selection)) != len(selection)
             or len(set(held_out)) != len(held_out) or set(selection).intersection(held_out)):
@@ -217,6 +220,9 @@ def dataset_layout(root, dataset, manifest_path=None):
         "split_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
         "author_split_verified": manifest["author_split_verified"], "split_source": manifest["source"],
         "dataset_release": release, "split_name": manifest.get("split_name"),
+        "selection_videos": len(selection), "evaluation_videos": len(held_out),
+        "paper_split_sizes_matched": manifest.get("paper_split_sizes_matched", False),
+        "selection_set_usage": manifest.get("selection_set_usage"),
         "frame_sampling": manifest.get("frame_sampling", "released RGB cadence"), **archive_metadata,
     }
 
