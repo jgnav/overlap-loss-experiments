@@ -55,6 +55,7 @@ RESUME_COMPATIBILITY_KEYS = (
     "gpu_count",
     "world_size",
     "effective_batch_size",
+    "gradient_accumulation_steps",
     "optimizer",
     "lr_schedule",
     "lr",
@@ -183,6 +184,8 @@ def _validate_resume_compatibility(checkpoint, args):
     mismatches = []
     for key in RESUME_COMPATIBILITY_KEYS:
         saved_value = _checkpoint_argument(checkpoint, key)
+        if key == "gradient_accumulation_steps" and saved_value is None:
+            saved_value = 1
         if key == "koleo_regularizer" and saved_value is None:
             saved_value = False
         if key == "region_views" and saved_value is None:

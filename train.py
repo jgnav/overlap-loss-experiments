@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,6 +43,7 @@ from utils.register_warmup import (
     teacher_ema_pairs,
 )
 from utils.collapse_diagnostics import FeatureCollapseDiagnostics, prototype_geometry_metrics
+from utils.gradient_accumulation import AccumulatedTeacherCenters, accumulation_window
 from utils.wandb_logging import configure_wandb, init_wandb_run
 from evaluation.online_probes import OnlineProbeRunner, probe_due, validate_probe_data
 
@@ -60,6 +62,15 @@ def load_config(path):
         raise ValueError("Replace include_local_crops with region_views in the YAML")
     config = {**get_ibot_recipe(user_config["arch"]), **user_config}
     configure_wandb(config)
+    if type(config["gradient_accumulation_steps"]) is not int or config["gradient_accumulation_steps"] < 1:
+        raise ValueError("gradient_accumulation_steps must be an integer >= 1")
+    if config["gradient_accumulation_steps"] > 1 and (
+        config["region_normalization"] == "deep"
+        or config["loss_modality"] != "standard"
+        or config["koleo_regularizer"]
+        or config["region_normalization"] == "sinkhorn"
+    ):
+        raise ValueError("Gradient accumulation requires the standard loss without deep centers, Sinkhorn, or KoLeo")
     for name, minimum in (
         ("diagnostic_feature_batches", 1),
         ("diagnostic_max_patch_features_per_batch", 2),
@@ -349,7 +360,9 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
     if args.precision == "bf16" and not torch.cuda.is_bf16_supported():
         raise RuntimeError("BF16 training is not supported by the allocated GPU")
     utils.fix_random_seeds(args.seed)
-    args.effective_batch_size = args.batch_size_per_gpu * utils.get_world_size()
+    args.effective_batch_size = (
+        args.batch_size_per_gpu * utils.get_world_size() * args.gradient_accumulation_steps
+    )
     if args.resume_checkpoint is None:
         checkpoint = read_pretrained_checkpoint(args)
         start_epoch = 0
@@ -397,6 +410,7 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
     )
     if len(data_loader) == 0:
         raise ValueError("The distributed data loader is empty")
+    args.optimizer_steps_per_epoch = math.ceil(len(data_loader) / args.gradient_accumulation_steps)
     print(f"Data loaded: there are {len(dataset)} images.")
 
     student = create_model(
@@ -596,28 +610,28 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
         raise ValueError(f"Unsupported learning-rate schedule: {args.lr_schedule}")
     lr_schedule = utils.cosine_scheduler(
         args.lr
-        * (args.batch_size_per_gpu * utils.get_world_size())
+        * args.effective_batch_size
         / args.reference_batch_size,
         args.min_lr,
         args.normal_training_epochs,
-        len(data_loader),
+        args.optimizer_steps_per_epoch,
         warmup_epochs=0,
     )
     wd_schedule = utils.cosine_scheduler(
         args.weight_decay,
         args.weight_decay_end,
         args.normal_training_epochs,
-        len(data_loader),
+        args.optimizer_steps_per_epoch,
     )
     momentum_schedule = utils.cosine_scheduler(
-        args.momentum_teacher, 1, args.normal_training_epochs, len(data_loader)
+        args.momentum_teacher, 1, args.normal_training_epochs, args.optimizer_steps_per_epoch
     )
     lr_schedule, wd_schedule, momentum_schedule = (
-        prepend_register_warmup(schedule, args.register_warmup_epochs, len(data_loader))
+        prepend_register_warmup(schedule, args.register_warmup_epochs, args.optimizer_steps_per_epoch)
         for schedule in (lr_schedule, wd_schedule, momentum_schedule)
     )
     if start_epoch < args.epochs:
-        first_schedule_iteration = start_epoch * len(data_loader)
+        first_schedule_iteration = start_epoch * args.optimizer_steps_per_epoch
         print(
             "Continuation schedulers ready: no LR warm-up; first optimizer-step "
             f"lr={lr_schedule[first_schedule_iteration]:.12g}; "
@@ -815,7 +829,7 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
 
 
 @torch.no_grad()
-def get_teacher_targets(teacher_output, ibot_loss, epoch):
+def get_teacher_targets(teacher_output, ibot_loss, epoch, center_accumulator=None):
     """Use previous CLS/patch centers for targets, then update both centers once.
 
     The raw teacher output is not modified and feeds the independent region
@@ -826,7 +840,10 @@ def get_teacher_targets(teacher_output, ibot_loss, epoch):
         ibot_loss.teacher_temp_schedule[epoch],
         ibot_loss.teacher_temp2_schedule[epoch],
     )
-    ibot_loss.update_center(*teacher_output)
+    if center_accumulator is None:
+        ibot_loss.update_center(*teacher_output)
+    else:
+        center_accumulator.add(*teacher_output)
     return targets
 
 
@@ -889,11 +906,17 @@ def train_one_epoch(
 
     register_only = epoch < args.register_warmup_epochs
     ema_pairs = teacher_ema_pairs(student.module, teacher_without_ddp, register_only)
+    accumulation_steps = args.gradient_accumulation_steps
+    steps_per_epoch = math.ceil(len(data_loader) / accumulation_steps)
+    center_accumulator = AccumulatedTeacherCenters(ibot_loss) if accumulation_steps > 1 else None
 
     for iteration, (images, _labels, masks, crop_boxes) in enumerate(
         metric_logger.log_every(data_loader, args.print_freq, header)
     ):
-        schedule_iteration = len(data_loader) * epoch + iteration
+        window = accumulation_window(iteration, len(data_loader), accumulation_steps)
+        schedule_iteration = steps_per_epoch * epoch + window.step
+        if window.first:
+            optimizer.zero_grad(set_to_none=True)
         for index, parameter_group in enumerate(optimizer.param_groups):
             parameter_group["lr"] = lr_schedule[schedule_iteration]
             if index == 0:
@@ -905,178 +928,177 @@ def train_one_epoch(
             crop_boxes.cuda(non_blocking=True) if ibot_loss.lambda3 != 0 else None
         )
 
-        autocast_enabled = args.precision in {"fp16", "bf16"}
-        autocast_dtype = (
-            torch.bfloat16 if args.precision == "bf16" else torch.float16
-        )
-        with torch.autocast(
-            device_type="cuda",
-            dtype=autocast_dtype,
-            enabled=autocast_enabled,
-        ):
-            with torch.no_grad():
-                diagnostic_batch = iteration < args.diagnostic_feature_batches
-                need_rank_features = ibot_loss.needs_patch_rank_features and ibot_loss.lambda3 != 0
-                need_teacher_features = diagnostic_batch or need_rank_features
-                teacher_result = teacher(
+        sync_context = student.no_sync() if not window.last else nullcontext()
+        with sync_context:
+            autocast_enabled = args.precision in {"fp16", "bf16"}
+            autocast_dtype = (
+                torch.bfloat16 if args.precision == "bf16" else torch.float16
+            )
+            with torch.autocast(
+                device_type="cuda",
+                dtype=autocast_dtype,
+                enabled=autocast_enabled,
+            ):
+                with torch.no_grad():
+                    diagnostic_batch = iteration < args.diagnostic_feature_batches
+                    need_rank_features = ibot_loss.needs_patch_rank_features and ibot_loss.lambda3 != 0
+                    need_teacher_features = diagnostic_batch or need_rank_features
+                    teacher_result = teacher(
+                        images[: args.global_crops_number],
+                        return_backbone_feat=need_teacher_features,
+                        return_region_logits=ibot_loss.deep_region and ibot_loss.lambda3 != 0,
+                    )
+                    teacher_region_logits = None
+                    teacher_region_targets = None
+                    if ibot_loss.deep_region and ibot_loss.lambda3 != 0:
+                        *teacher_result, teacher_region_logits = teacher_result
+                        if not need_teacher_features:
+                            teacher_result = teacher_result[0]
+                    if need_teacher_features:
+                        backbone_features, teacher_output = teacher_result
+                    else:
+                        teacher_output = teacher_result
+                    teacher_patch_features = None
+                    if need_teacher_features:
+                        register_count = teacher_without_ddp.backbone.num_register_tokens
+                        if need_rank_features:
+                            teacher_patch_features = backbone_features[:, 1 + register_count:]
+                    if diagnostic_batch:
+                        feature_diagnostics.update(
+                            backbone_features[:, 1 + register_count:]
+                        )
+                        del backbone_features
+                    teacher_view_patch_logits, teacher_view_patch_targets = get_region_teacher_targets(
+                        teacher, images, ibot_loss, epoch
+                    )
+                    teacher_targets = get_teacher_targets(teacher_output, ibot_loss, epoch, center_accumulator)
+                    if teacher_region_logits is not None:
+                        teacher_region_targets = ibot_loss.deep_teacher_targets(
+                            teacher_region_logits, teacher_targets[1],
+                            ibot_loss.teacher_temp2_schedule[epoch],
+                        )
+                need_student_features = ibot_loss.koleo_regularizer or need_rank_features
+                student_result = student(
                     images[: args.global_crops_number],
-                    return_backbone_feat=need_teacher_features,
+                    mask=masks[: args.global_crops_number],
+                    return_backbone_feat=need_student_features,
                     return_region_logits=ibot_loss.deep_region and ibot_loss.lambda3 != 0,
                 )
-                teacher_region_logits = None
-                teacher_region_targets = None
+                student_region_logits = None
                 if ibot_loss.deep_region and ibot_loss.lambda3 != 0:
-                    *teacher_result, teacher_region_logits = teacher_result
-                    if not need_teacher_features:
-                        teacher_result = teacher_result[0]
-                if need_teacher_features:
-                    backbone_features, teacher_output = teacher_result
+                    *student_result, student_region_logits = student_result
+                    if not need_student_features:
+                        student_result = student_result[0]
+                if need_student_features:
+                    student_backbone_features, student_output = student_result
                 else:
-                    teacher_output = teacher_result
-                teacher_patch_features = None
-                if need_teacher_features:
-                    register_count = teacher_without_ddp.backbone.num_register_tokens
-                    if need_rank_features:
-                        teacher_patch_features = backbone_features[:, 1 + register_count:]
-                if diagnostic_batch:
-                    feature_diagnostics.update(
-                        backbone_features[:, 1 + register_count:]
-                    )
-                    del backbone_features
-                teacher_view_patch_logits, teacher_view_patch_targets = get_region_teacher_targets(
-                    teacher, images, ibot_loss, epoch
+                    student_output = student_result
+                student_cls_features = (
+                    student_backbone_features[:, 0] if need_student_features else None
                 )
-                teacher_targets = get_teacher_targets(teacher_output, ibot_loss, epoch)
-                if teacher_region_logits is not None:
-                    teacher_region_targets = ibot_loss.deep_teacher_targets(
-                        teacher_region_logits, teacher_targets[1],
-                        ibot_loss.teacher_temp2_schedule[epoch],
-                    )
-            need_student_features = ibot_loss.koleo_regularizer or need_rank_features
-            student_result = student(
-                images[: args.global_crops_number],
-                mask=masks[: args.global_crops_number],
-                return_backbone_feat=need_student_features,
-                return_region_logits=ibot_loss.deep_region and ibot_loss.lambda3 != 0,
-            )
-            student_region_logits = None
-            if ibot_loss.deep_region and ibot_loss.lambda3 != 0:
-                *student_result, student_region_logits = student_result
-                if not need_student_features:
-                    student_result = student_result[0]
-            if need_student_features:
-                student_backbone_features, student_output = student_result
+
+                student_patch_features = (
+                    student_backbone_features[:, 1 + student.module.backbone.num_register_tokens:]
+                    if need_rank_features else None
+                )
+
+                local_images = images[args.global_crops_number:args.global_crops_number + args.local_crops_number]
+                student_local_output = forward_unmasked(student, local_images) if local_images else None
+                student_view_patch_logits = None
+                if ibot_loss.lambda3 != 0:
+                    if ibot_loss.region_views == "local":
+                        student_view_patch_logits = student_local_output[1]
+                    elif ibot_loss.region_views == "global_unmasked":
+                        student_view_patch_logits = forward_unmasked(student, images[-4:])[1]
+                student_local_cls = student_local_output[0] if student_local_output is not None else None
+                student_local_patch_logits = (
+                    student_local_output[1]
+                    if student_local_output is not None and ibot_loss.needs_local_patch_logits and ibot_loss.lambda3 != 0
+                    else None
+                )
+                del student_local_output
+
+                all_loss = ibot_loss(
+                    student_output,
+                    teacher_targets,
+                    student_local_cls,
+                    masks,
+                    crop_boxes,
+                    teacher_patch_logits=teacher_output[1],
+                    student_cls_features=student_cls_features,
+                    student_region_logits=student_region_logits,
+                    teacher_region_logits=teacher_region_logits,
+                    teacher_region_targets=teacher_region_targets,
+                    student_local_patch_logits=student_local_patch_logits,
+                    student_patch_features=student_patch_features,
+                    teacher_patch_features=teacher_patch_features,
+                    student_view_patch_logits=student_view_patch_logits,
+                    teacher_view_patch_logits=teacher_view_patch_logits,
+                    teacher_view_patch_targets=teacher_view_patch_targets,
+                )
+                loss = all_loss.pop("loss")
+
+            if not math.isfinite(loss.item()):
+                component_values = {
+                    name: value.detach().float().item()
+                    for name, value in all_loss.items()
+                    if torch.is_tensor(value) and value.numel() == 1
+                }
+                non_finite_components = {
+                    name: value
+                    for name, value in component_values.items()
+                    if not math.isfinite(value)
+                }
+                print(
+                    f"Loss is {loss.item()} on rank {utils.get_rank()}, stopping "
+                    f"training. Non-finite components: {non_finite_components}; "
+                    f"all components: {component_values}",
+                    force=True,
+                )
+                sys.exit(1)
+
+            probs1 = teacher_output[0].chunk(args.global_crops_number)
+            probs2 = student_output[0].chunk(args.global_crops_number)
+            pred1 = utils.concat_all_gather(probs1[0].max(dim=1)[1])
+            pred2 = utils.concat_all_gather(probs2[1].max(dim=1)[1])
+            accuracy = (pred1 == pred2).sum() / pred1.size(0)
+
+            backward_loss = loss / window.size
+            if fp16_scaler is None:
+                backward_loss.backward()
             else:
-                student_output = student_result
-            student_cls_features = (
-                student_backbone_features[:, 0] if need_student_features else None
-            )
+                fp16_scaler.scale(backward_loss).backward()
 
-            student_patch_features = (
-                student_backbone_features[:, 1 + student.module.backbone.num_register_tokens:]
-                if need_rank_features else None
-            )
-
-            local_images = images[args.global_crops_number:args.global_crops_number + args.local_crops_number]
-            student_local_output = forward_unmasked(student, local_images) if local_images else None
-            student_view_patch_logits = None
-            if ibot_loss.lambda3 != 0:
-                if ibot_loss.region_views == "local":
-                    student_view_patch_logits = student_local_output[1]
-                elif ibot_loss.region_views == "global_unmasked":
-                    student_view_patch_logits = forward_unmasked(student, images[-4:])[1]
-            student_local_cls = student_local_output[0] if student_local_output is not None else None
-            student_local_patch_logits = (
-                student_local_output[1]
-                if student_local_output is not None and ibot_loss.needs_local_patch_logits and ibot_loss.lambda3 != 0
-                else None
-            )
-            del student_local_output
-
-            all_loss = ibot_loss(
-                student_output,
-                teacher_targets,
-                student_local_cls,
-                masks,
-                crop_boxes,
-                teacher_patch_logits=teacher_output[1],
-                student_cls_features=student_cls_features,
-                student_region_logits=student_region_logits,
-                teacher_region_logits=teacher_region_logits,
-                teacher_region_targets=teacher_region_targets,
-                student_local_patch_logits=student_local_patch_logits,
-                student_patch_features=student_patch_features,
-                teacher_patch_features=teacher_patch_features,
-                student_view_patch_logits=student_view_patch_logits,
-                teacher_view_patch_logits=teacher_view_patch_logits,
-                teacher_view_patch_targets=teacher_view_patch_targets,
-            )
-            loss = all_loss.pop("loss")
-
-        if not math.isfinite(loss.item()):
-            component_values = {
-                name: value.detach().float().item()
-                for name, value in all_loss.items()
-                if torch.is_tensor(value) and value.numel() == 1
-            }
-            non_finite_components = {
-                name: value
-                for name, value in component_values.items()
-                if not math.isfinite(value)
-            }
-            print(
-                f"Loss is {loss.item()} on rank {utils.get_rank()}, stopping "
-                f"training. Non-finite components: {non_finite_components}; "
-                f"all components: {component_values}",
-                force=True,
-            )
-            sys.exit(1)
-
-        probs1 = teacher_output[0].chunk(args.global_crops_number)
-        probs2 = student_output[0].chunk(args.global_crops_number)
-        pred1 = utils.concat_all_gather(probs1[0].max(dim=1)[1])
-        pred2 = utils.concat_all_gather(probs2[1].max(dim=1)[1])
-        accuracy = (pred1 == pred2).sum() / pred1.size(0)
-
-        optimizer.zero_grad()
-        optimizer_updated = True
-        if fp16_scaler is None:
-            loss.backward()
+        if window.last:
+            if center_accumulator is not None:
+                center_accumulator.flush()
             if register_only:
                 clear_non_register_gradients(student.module)
-            if args.clip_grad:
-                utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(
-                source_epoch if source_epoch is not None else epoch,
-                student,
-                args.freeze_last_layer,
-            )
-            optimizer.step()
-        else:
-            fp16_scaler.scale(loss).backward()
-            if register_only:
-                clear_non_register_gradients(student.module)
-            if args.clip_grad:
+            if fp16_scaler is not None:
                 fp16_scaler.unscale_(optimizer)
+            if args.clip_grad:
                 utils.clip_gradients(student, args.clip_grad)
             utils.cancel_gradients_last_layer(
                 source_epoch if source_epoch is not None else epoch,
                 student,
                 args.freeze_last_layer,
             )
-            scale_before = fp16_scaler.get_scale()
-            fp16_scaler.step(optimizer)
-            fp16_scaler.update()
-            # GradScaler decreases its scale only when it skipped the step.
-            optimizer_updated = fp16_scaler.get_scale() >= scale_before
+            optimizer_updated = True
+            if fp16_scaler is None:
+                optimizer.step()
+            else:
+                scale_before = fp16_scaler.get_scale()
+                fp16_scaler.step(optimizer)
+                fp16_scaler.update()
+                optimizer_updated = fp16_scaler.get_scale() >= scale_before
 
-        if optimizer_updated:
-            with torch.no_grad():
-                momentum = momentum_schedule[schedule_iteration]
-                for param_q, param_k in ema_pairs:
-                    param_k.data.mul_(momentum).add_(
-                        (1 - momentum) * param_q.detach().data
-                    )
+            if optimizer_updated:
+                with torch.no_grad():
+                    momentum = momentum_schedule[schedule_iteration]
+                    for param_q, param_k in ema_pairs:
+                        param_k.data.mul_(momentum).add_(
+                            (1 - momentum) * param_q.detach().data
+                        )
 
         torch.cuda.synchronize()
         metric_logger.update(loss=loss.item())

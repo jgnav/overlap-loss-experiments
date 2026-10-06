@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Submit small runs (tasks 0 and 3) on 3090, A100, or RTX Pro 6000:
 #   sbatch --array=0,3 slurm/slurm_long_training.sh
-# Submit base and large runs (tasks 1 and 2), including RTX 3090 GPUs:
-#   sbatch --array=1-2 --partition=3090,3090_risk,a100,rtx_pro6000_risk slurm/slurm_long_training.sh
+# Submit BF16 base and large runs using their four-GPU launcher:
+#   sbatch slurm/slurm_long_training_base_large.sh
+# With this legacy array launcher instead:
+#   sbatch --array=1-2 --gpus-per-node=4 --partition=a100,rtx_pro6000_risk slurm/slurm_long_training.sh
 
 #SBATCH --job-name=ibot-long
-#SBATCH --array=0-3
+#SBATCH --array=0,3
 #SBATCH --partition=3090_risk,a100,rtx_pro6000_risk
 #SBATCH --exclude=aisurrey37
 #SBATCH --nodes=1
@@ -78,7 +80,7 @@ trap requeue_before_timeout USR1
 
 "$torchrun_bin" \
     --standalone \
-    --nproc_per_node=8 \
+    --nproc_per_node="${SLURM_GPUS_ON_NODE:?Missing Slurm GPU allocation}" \
     train.py "$config_path" &
 train_pid=$!
 wait "$train_pid"

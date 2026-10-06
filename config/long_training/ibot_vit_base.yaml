@@ -34,16 +34,18 @@ teacher_patch_temp: 0.07
 
 # Fresh post-pretraining stage
 additional_epochs: 150
-gpu_count: 8
+gpu_count: 4
 batch_size_per_gpu: 48
+gradient_accumulation_steps: 3  # 48 * 4 * 3 = 576 images per optimizer step.
 seed: 0
 # Choose bf16 for supported GPUs, or fp16 to use a GradScaler.
-precision: fp16
+precision: bf16
 
 # Fresh optimizer and schedules
 optimizer: adamw
 lr_schedule: cosine
-lr: 0.00001
+# Preserve the previous actual initial LR: 3.333333e-6 * 576 / 256 = 7.5e-6.
+lr: 0.0000033333333333333333
 min_lr: 0.000001
 warmup_epochs: 0
 weight_decay: 0.04
@@ -74,6 +76,6 @@ online_probe_gpu: null
 wandb_mode: online
 wandb_project: ibot-imagenet1k
 wandb_entity: null
-wandb_run_name: ibot-150e-vit-base-region
+wandb_run_name: ibot-150e-vit-base-region-bf16-b576
 wandb_run_id: null
 wandb_resume: null

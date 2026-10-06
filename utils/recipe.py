@@ -33,6 +33,7 @@ COMMON_IBOT_RECIPE = {
     "warmup_teacher_patch_temp": 0.07,
     "warmup_teacher_temp_epochs": 0,
     "reference_batch_size": 256,
+    "gradient_accumulation_steps": 1,
     "distributed_backend": "nccl",
     "dist_url": "env://",
     "saveckp_freq": 40,
