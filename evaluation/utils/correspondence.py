@@ -22,18 +22,31 @@ from evaluation.utils.common import (
 SPAIR_BINS = ("0", "1", "2", "all")
 NAVI_EDGES = (0, 30, 60, 90, 120)
 SCANNET_EDGES = (0, 15, 30, 60, 180)
+PROBE3D_COMMIT = "a1f14640076e38b8bc07b66d0fe2d01d15691e9d"
+PROBE3D_SOURCE = f"https://github.com/mbanani/probe3d/tree/{PROBE3D_COMMIT}"
 
 
 @torch.no_grad()
 def patch_features(backbone, images, patch_size, num_register_tokens=0):
-    """Final, normalized patch tokens in [B,C,H,W], excluding CLS/registers."""
-    tokens = backbone.get_intermediate_layers(images, n=1)[0]
+    """Probe3D iBOT adapter: raw final block, before final LayerNorm.
+
+    SPair normalizes these vectors before keypoint sampling; NAVI normalizes
+    only after bicubic interpolation to the geometry grid. These operations
+    do not commute, so return raw patch vectors here.
+    """
+    if hasattr(backbone, "extract_patch_map"):
+        return backbone.extract_patch_map(images)
+    if images.shape[-2] % patch_size or images.shape[-1] % patch_size:
+        raise ValueError("Correspondence image dimensions must be patch aligned")
+    tokens = backbone.prepare_tokens(images)
+    for block in backbone.blocks:
+        tokens = block(tokens)
     height, width = images.shape[-2] // patch_size, images.shape[-1] // patch_size
-    tokens = tokens[:, 1:]
+    tokens = tokens[:, 1 + num_register_tokens:]
     if tokens.shape[1] != height * width:
         raise ValueError("Backbone token grid does not match correspondence image size")
     features = tokens.float().transpose(1, 2).reshape(len(images), -1, height, width)
-    return F.normalize(features, dim=1)
+    return features
 
 
 def nearest_ratio_matches(source, target, max_matches=1000, chunk_size=1024):
@@ -73,6 +86,7 @@ def binned_pair_recall(rows, edges):
 
 def _spair_errors(features, source_keypoints, target_keypoints, bbox_scale, image_size):
     """Probe3D PCK errors for keypoints annotated in both views."""
+    features = F.normalize(features.float(), dim=1)
     source, target = features
     source_keypoints = source_keypoints.float()
     target_keypoints = target_keypoints.float()
@@ -92,19 +106,45 @@ def _spair_errors(features, source_keypoints, target_keypoints, bbox_scale, imag
     return (predicted - truth).norm(dim=1).cpu() / float(bbox_scale)
 
 
+def _spair_dataset_class():
+    """Read shared annotations once without changing upstream subset sampling."""
+    from evaluation.vendor.probe3d.evals.datasets.spair import SPairDataset
+
+    class CachedSPairDataset(SPairDataset):
+        pair_annotations = None
+        image_annotations_cache = None
+
+        def get_pair_annotations(self):
+            if type(self).pair_annotations is None:
+                type(self).pair_annotations = super().get_pair_annotations()
+            # Each dataset must have its own list for upstream seed-20 shuffle.
+            return list(type(self).pair_annotations)
+
+        def get_image_annotations(self):
+            if type(self).image_annotations_cache is None:
+                type(self).image_annotations_cache = super().get_image_annotations()
+            return type(self).image_annotations_cache
+
+    return CachedSPairDataset
+
+
 def run_spair(backbone, metadata, datasets_root, device):
-    from evaluation.vendor.probe3d.evals.datasets.spair import CLASS_IDS, SPairDataset
+    from evaluation.vendor.probe3d.evals.datasets.spair import CLASS_IDS
+    SPairDataset = _spair_dataset_class()
     root = datasets_root / "SPair-71k"
     if not root.is_dir():
         raise FileNotFoundError(f"Probe3D SPair-71k directory missing: {root}")
-    per_category = {}
+    per_category, pair_ids = {}, {}
     for class_name in CLASS_IDS:
-        category = {}
+        category, category_pairs = {}, {}
         for difficulty in (0, 1, 2, None):
             dataset = SPairDataset(
                 str(root), "test", image_size=800, image_mean="imagenet",
                 use_bbox=False, class_name=class_name, num_instances=200, vp_diff=difficulty,
             )
+            category_pairs[str(difficulty) if difficulty is not None else "all"] = [
+                item["filename"] for item in dataset.instances
+            ]
             errors = []
             for index in range(len(dataset)):
                 src, _, src_kp, dst, _, dst_kp, bbox_scale, _ = dataset[index]
@@ -118,6 +158,7 @@ def run_spair(backbone, metadata, datasets_root, device):
                 None if not errors else 100.0 * float(np.mean(np.asarray(errors) < 0.1))
             )
         per_category[class_name] = category
+        pair_ids[class_name] = category_pairs
     scores = {}
     for difficulty in SPAIR_BINS:
         valid = [row[difficulty] for row in per_category.values() if row[difficulty] is not None]
@@ -125,6 +166,10 @@ def run_spair(backbone, metadata, datasets_root, device):
             raise ValueError(f"SPair-71k has no evaluated keypoints for viewpoint {difficulty}")
         scores[f"d{difficulty}" if difficulty != "all" else "all"] = float(np.mean(valid))
     return scores, {"root": str(root), "per_category": per_category, "pairs_per_category_and_difficulty": 200,
+                    "pair_ids": pair_ids, "source": PROBE3D_SOURCE,
+                    "feature_layer": "raw final block before final LayerNorm",
+                    "feature_normalization": "L2 before bilinear keypoint sampling",
+                    "aggregation": "keypoint mean per category, then category mean",
                     "sampling": "Probe3D seed 20 per category/viewpoint subset", "pck_alpha_bbox": 0.1,
                     "image_size": 800, "bbox_crop": False}
 
@@ -150,7 +195,7 @@ def run_navi(backbone, metadata, datasets_root, device):
                    pair_dataset=True, max_angle=120)
     if len(dataset) == 0:
         raise ValueError("NAVI in-the-wild test split has no pairs")
-    rows = []
+    rows, pair_results = [], []
     for index in range(len(dataset)):
         item = dataset[index]
         images = torch.stack((item["image_0"], item["image_1"])).to(device)
@@ -166,8 +211,16 @@ def run_navi(backbone, metadata, datasets_root, device):
         transformed = source_xyz @ transform[:, :3].T + transform[:, 3]
         error = (transformed - target_xyz).norm(dim=1)
         rows.append((relative_rotation_degrees(transform.cpu()), float((error < 0.02).float().mean())))
+        obj, scene, _ = dataset.instances[index]
+        pair_results.append({"object": obj, "scene": scene, "pair_id": item["pair_id"],
+                             "rotation_degrees": rows[-1][0], "recall_2cm": rows[-1][1],
+                             "matches": len(src_idx)})
         print_progress("NAVI correspondence", index + 1, len(dataset))
     return binned_pair_recall(rows, NAVI_EDGES), {"root": str(root), "pairs": len(rows),
+        "pair_results": pair_results, "source": PROBE3D_SOURCE,
+        "feature_layer": "raw final block before final LayerNorm",
+        "feature_normalization": "L2 after bicubic geometry-grid interpolation",
+        "aggregation": "mean pair recall per half-open rotation bin",
         "split": "wild/all", "image_size": [512, 512], "bbox_crop": True,
         "geometry_scale": 0.25, "max_correspondences": 1000, "3d_threshold_m": 0.02,
         "pairing": "released Probe3D NAVI test pair selection, seed 8"}
@@ -212,7 +265,7 @@ def run_scannet(backbone, metadata, datasets_root, device):
     dataset = LocatedScanNet()
     if len(dataset) == 0:
         raise ValueError("ScanNet released test split has no pairs")
-    rows = []
+    rows, pair_results = [], []
     for index in range(len(dataset)):
         item = dataset[index]
         images = torch.stack((item["rgb_0"], item["rgb_1"])).to(device)
@@ -229,8 +282,14 @@ def run_scannet(backbone, metadata, datasets_root, device):
         uv0, uv1 = _project(transformed, intrinsics), _project(xyz1[dst_idx], intrinsics)
         error = (uv0 - uv1).norm(dim=1)
         rows.append((relative_rotation_degrees(transform.cpu()), float((error < 10).float().mean())))
+        pair_results.append({"scene": item["sequence_id"], "source_frame": item["frame_0"],
+                             "target_frame": item["frame_1"], "rotation_degrees": rows[-1][0],
+                             "recall_10px": rows[-1][1], "matches": len(src_idx)})
         print_progress("ScanNet correspondence", index + 1, len(dataset))
     return binned_pair_recall(rows, SCANNET_EDGES), {"root": str(root), "pairs": len(rows),
+        "pair_results": pair_results, "source": PROBE3D_SOURCE,
+        "feature_layer": "raw final block before final LayerNorm",
+        "feature_normalization": "L2 after bilinear geometry-point sampling",
         "image_size": [480, 640], "geometry_scale": 0.25, "max_correspondences": 1000,
         "reprojection_threshold_px_at_geometry_scale": 10,
         "split": "Probe3D scannet_test_1500/test.npz"}
@@ -245,9 +304,41 @@ def main(dataset_name):
     backbone, metadata = load_backbone(args.checkpoint, args.checkpoint_key, args.arch)
     device = torch.device("cuda:0")
     backbone.to(device).eval()
+    from evaluation.utils.correspondence_features import (
+        CorrespondenceFeatures, fit_voc_standardizer, load_patch_projection,
+    )
+    variant = args.correspondence_feature_variant
+    descriptions = {
+        "raw_final": "raw final block before final LayerNorm",
+        "final_norm_standardized": "final block after final LayerNorm and frozen VOC-train StandardScaler",
+        "projection": "trained teacher patch-head output logits, after final backbone LayerNorm",
+        "projection_softmax": "softmax of trained teacher patch-head output logits, after final backbone LayerNorm",
+        "concat_4_6_8_12": "concatenated raw outputs of blocks 4, 6, 8 and 12, without final LayerNorm",
+    }
+    feature_protocol = {"variant": variant, "feature_layer": descriptions[variant],
+                        "official_probe3d_feature_recipe": variant == "raw_final",
+                        "projection_head": None, "standardization": None}
+    projection = None
+    if variant.startswith("projection"):
+        projection, head_metadata = load_patch_projection(args.checkpoint, args.checkpoint_key)
+        projection.to(device).eval()
+        feature_protocol["projection_head"] = head_metadata
+        if variant == "projection_softmax":
+            feature_protocol.update(softmax_temperature=args.correspondence_softmax_temperature,
+                                    centering=False, sinkhorn=False)
+    extractor = CorrespondenceFeatures(backbone, variant, metadata["patch_size"],
+                                       metadata["num_register_tokens"], projection,
+                                       args.correspondence_softmax_temperature).eval()
+    if variant == "final_norm_standardized":
+        feature_protocol["standardization"] = fit_voc_standardizer(
+            extractor, args.datasets_root, args.output_dir, device, args.seed, args.num_workers)
+    write_json(args.output_dir / "feature_protocol.json", feature_protocol)
+    print(f"Correspondence features: {feature_protocol}", flush=True)
     runners = {"spair": run_spair, "navi": run_navi, "scannet": run_scannet}
     with torch.inference_mode():
-        metrics, dataset_metadata = runners[dataset_name](backbone, metadata, args.datasets_root, device)
+        metrics, dataset_metadata = runners[dataset_name](extractor, metadata, args.datasets_root, device)
+    dataset_metadata["feature_layer"] = descriptions[variant]
+    dataset_metadata["feature_variant_protocol"] = feature_protocol
     write_json(args.result_json, {
         "evaluation": evaluation_name, "task": "semantic_correspondence" if dataset_name == "spair" else "geometric_correspondence",
         "dataset": {"spair": "SPair-71k", "navi": "NAVI", "scannet": "ScanNet"}[dataset_name],

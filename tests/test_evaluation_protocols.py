@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, DistributedSampler, TensorDataset
 
 from evaluation.prepare_voc_manifest import VOC_CLASSES, build_voc2012_manifest, prepare_voc2012_manifest
 from evaluation.utils import classification, dense, orchestrator
@@ -334,14 +334,67 @@ class ClassificationTest(unittest.TestCase):
         loss.backward()
         self.assertEqual(logits.grad[0, 1].item(), 0)
 
-    def test_multilabel_lr_scales_with_actual_global_batch(self):
-        for dataset, epochs in (("pascal_voc", 500), ("coco", 200), ("visual_genome", 200)):
-            for world_size in (1, 2, 4, 8):
-                recipe = classification._protocol(dataset, "vit_small", "teacher", world_size)
-                self.assertEqual(recipe["epochs"], epochs)
-                self.assertEqual(recipe["base_learning_rate"], 0.001)
-                self.assertEqual(recipe["learning_rate"], 0.004)
-                self.assertTrue(recipe["learning_rate_scaled_by_batch_size"])
+    def test_crisp_linear_protocol_uses_actual_lr_and_full_data(self):
+        for dataset, epochs in (("pascal_voc", 500), ("coco", 200), ("visual_genome", 200), ("imagenet", 200)):
+            recipe = classification._protocol(dataset, "vit_small", "teacher", 4)
+            self.assertEqual(recipe["epochs"], epochs)
+            self.assertEqual(recipe["learning_rate"], 0.001)
+            self.assertFalse(recipe["learning_rate_scaled_by_batch_size"])
+            self.assertFalse(recipe["internal_training_holdout"])
+            self.assertEqual(recipe["classifier"], "single linear layer")
+
+    def test_imagenet_linear_trains_the_head_with_unscaled_lr(self):
+        # Exercise the configured ImageNet path through real SGD, CE training,
+        # cosine scheduling and final validation without requiring CUDA.
+        class CPUHead(torch.nn.Linear):
+            def to(self, *args, **kwargs):
+                return self
+
+        class CPUBackbone(_IdentityFeatures):
+            embed_dim = 3
+            def to(self, *args, **kwargs):
+                return self
+
+        class WrappedHead(torch.nn.Module):
+            def __init__(self, module, **kwargs):
+                super().__init__()
+                self.module = module
+            def forward(self, images):
+                return self.module(images)
+
+        train = TensorDataset(torch.randn(12, 3), torch.arange(12) % 6)
+        val = TensorDataset(torch.randn(7, 3), torch.arange(7) % 6)
+        train.classes = val.classes = list(range(6))
+        metadata = {"architecture": "vit_base", "checkpoint_key": "teacher"}
+        recipe = classification._protocol("imagenet", "vit_base", "teacher", 4)
+        recipe["epochs"] = 2
+        real_epoch, real_evaluate = classification.train_epoch, classification.evaluate
+        def cpu_epoch(*args):
+            return real_epoch(*args[:6], "cpu", *args[7:])
+        def cpu_evaluate(*args):
+            return real_evaluate(*args[:5], "cpu", args[6], 1, args[8])
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(output_dir=Path(directory), result_json=Path(directory)/"results.json",
+                                   checkpoint=Path(directory)/"encoder.pth", checkpoint_key="teacher",
+                                   arch="vit_base", seed=0, num_workers=0)
+            with mock.patch.object(classification, "_make_datasets", return_value=(train, val, {"training_fraction": 1.0})), \
+                 mock.patch.object(classification, "load_backbone", return_value=(CPUBackbone(), metadata)), \
+                 mock.patch.object(classification, "_protocol", return_value=recipe), \
+                 mock.patch.object(classification, "linear_head", return_value=CPUHead(6, 6)), \
+                 mock.patch.object(classification, "evaluation_identity", return_value={"version": 3}), \
+                 mock.patch.object(classification.torch.cuda, "current_device", return_value=0), \
+                 mock.patch.object(classification.nn.parallel, "DistributedDataParallel", WrappedHead), \
+                 mock.patch.object(classification, "DistributedSampler", side_effect=lambda dataset, **kwargs: DistributedSampler(dataset, num_replicas=1, rank=0, **kwargs)), \
+                 mock.patch.object(classification.dist, "barrier"), \
+                 mock.patch.object(classification, "train_epoch", side_effect=cpu_epoch), \
+                 mock.patch.object(classification, "evaluate", side_effect=cpu_evaluate), \
+                 mock.patch.object(classification.torch.optim, "SGD", wraps=torch.optim.SGD) as optimizer:
+                classification.run_classification(args, "imagenet", "imagenet_linear", 0, 4)
+            self.assertEqual(optimizer.call_args.kwargs["lr"], 0.001)
+            result = json.loads(args.result_json.read_text())
+            self.assertEqual(result["dataset_sizes"], {"train": 12, "test": 7})
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(set(result["metrics"]), {"top1", "top5"})
 
     def test_map_is_global_per_class_and_masks_unknown_labels(self):
         labels = np.array([[1, 0], [0, 1], [1, -1], [0, 0]])

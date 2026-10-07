@@ -1,4 +1,4 @@
-# CRISP Table 3: explicit paper settings with documented iBOT fallback details.
+# CRISP Table 3: stated paper settings with documented iBOT/local details.
 checkpoint: ../output/long_ibot_vit_small/85535_0/checkpoint_source1000_continuation0200.pth
 checkpoint_key: teacher
 arch: vit_small
@@ -20,7 +20,7 @@ wandb_run_id: null
 wandb_resume: null
 
 # Omitted tasks are disabled. VOC probes use 500 epochs; COCO/VG use 200.
-# Frozen features, global batch 1024; base LR 0.001 scales to actual LR 0.004.
+# Frozen features, 4 GPUs x 256, 224 inputs, actual optimizer LR 0.001.
 evaluations:
   pascal_voc_1shot: true
   pascal_voc_2shot: true

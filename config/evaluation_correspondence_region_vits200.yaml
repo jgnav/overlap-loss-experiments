@@ -1,0 +1,12 @@
+# CRISP Table 5: released Probe3D correspondence protocol, final raw block.
+checkpoint: ../output/long_ibot_vit_small/85535_0/checkpoint_source1000_continuation0200.pth
+checkpoint_key: teacher
+arch: auto
+datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
+num_workers: 4
+seed: 0
+wandb_mode: disabled
+evaluations:
+  spair_correspondence: true
+  navi_correspondence: true
+  scannet_correspondence: true  # Public LoFTR / Probe3D 1,500-pair subset.

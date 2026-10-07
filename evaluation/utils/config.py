@@ -1,5 +1,6 @@
 """Validated run configuration for evaluation.py; probe recipes remain fixed."""
 
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,6 +43,7 @@ def load_config(path):
         "output_dir": None, "result_json": None, "classification_manifests": None,
         "video_protocol": "dinov3",
         "video_resolution": "small", "video_feature_blocks": 4, "video_split_manifests": {},
+        "correspondence_feature_variant": "raw_final", "correspondence_softmax_temperature": 1.0,
     }
     required = {"checkpoint", "datasets_root", "evaluations"}
     unknown = set(values) - required - set(defaults)
@@ -51,6 +53,12 @@ def load_config(path):
     if missing:
         raise ValueError(f"Missing evaluation configuration keys: {', '.join(sorted(missing))}")
     values = {**defaults, **values}
+    from evaluation.utils.correspondence_features import FEATURE_VARIANTS
+    if values["correspondence_feature_variant"] not in FEATURE_VARIANTS:
+        raise ValueError(f"correspondence_feature_variant must be one of {FEATURE_VARIANTS}")
+    temperature = values["correspondence_softmax_temperature"]
+    if type(temperature) not in (float, int) or not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("correspondence_softmax_temperature must be positive and finite")
     configure_wandb(values)
     if values["checkpoint_key"] not in ("teacher", "student"):
         raise ValueError("checkpoint_key must be teacher or student")
@@ -111,7 +119,8 @@ def config_snapshot(args):
     """Save effective paths and every switch, including omitted/disabled tasks."""
     keys = ("checkpoint", "checkpoint_key", "arch", "datasets_root", "classification_manifests",
             "output_dir", "result_json", "seed", "num_workers", "segmentation_batch_size",
-            "video_protocol", "video_resolution", "video_feature_blocks", "video_split_manifests", *WANDB_DEFAULTS)
+            "video_protocol", "video_resolution", "video_feature_blocks", "video_split_manifests",
+            "correspondence_feature_variant", "correspondence_softmax_temperature", *WANDB_DEFAULTS)
     result = {key: str(value) if isinstance(value := getattr(args, key), Path) else value for key in keys}
     result["evaluations"] = {name: name in args.evaluations for name, _, _ in EVALUATIONS}
     return result

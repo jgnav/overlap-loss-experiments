@@ -1,4 +1,4 @@
-# CRISP Table 4: stated paper settings; documented CAPI/iBOT fallback details.
+# CRISP Table 4: stated paper settings; documented iBOT/local details.
 checkpoint: ../output/long_ibot_vit_small/85535_0/checkpoint_source1000_continuation0200.pth
 checkpoint_key: teacher
 arch: vit_small
@@ -17,8 +17,8 @@ wandb_resume: null
 
 # k-NN: fixed SimCLRv2 1%/10% banks and all training images for 100%;
 # final CLS, cosine similarity, temperature 0.07, primary k=20.
-# Linear: 4 GPUs x 256, 224 inputs, 200 epochs; CAPI heads and 10% holdout.
-# CRISP's 0.001 is treated as base LR (actual 0.004), an unverified convention.
+# Linear: 4 GPUs x 256, 224 inputs, 200 epochs, actual optimizer LR 0.001.
+# One frozen linear probe, all training images, full official validation set.
 # Unlisted evaluations are disabled.
 evaluations:
   imagenet_knn_1pct: true

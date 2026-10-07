@@ -1,4 +1,8 @@
-"""CRISP ImageNet settings with the pinned CAPI classifier implementation."""
+"""Legacy CAPI classification comparison, excluded from the CRISP linear suite.
+
+Retained for prior-result interpretation and CAPI adapter tests. The configured
+imagenet_linear evaluation now uses evaluation.utils.classification.
+"""
 
 import copy
 import hashlib

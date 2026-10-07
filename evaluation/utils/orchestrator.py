@@ -56,6 +56,9 @@ def evaluation_command(args, name, module, result_path):
     if name in {"pascal_voc_knn", "pascal_voc_linear", "ade20k_knn", "ade20k_linear",
                 "cityscapes_knn", "cityscapes_linear"}:
         command.extend(("--batch-size", str(args.segmentation_batch_size)))
+    if name.endswith("_correspondence"):
+        command.extend(("--correspondence-feature-variant", getattr(args, "correspondence_feature_variant", "raw_final"),
+                        "--correspondence-softmax-temperature", str(getattr(args, "correspondence_softmax_temperature", 1.0))))
     if name in {"davis_vos", "youtube_vos_vos", "mose_vos"}:
         manifests = getattr(args, "video_split_manifests", {})
         dataset = {"davis_vos": "davis", "youtube_vos_vos": "youtube_vos", "mose_vos": "mose"}[name]
@@ -161,6 +164,11 @@ def _load_completed_result(path, args, evaluation_name):
         if (result.get("metrics_status") == "computed"
                 and result.get("protocol", {}).get("source") == "https://arxiv.org/abs/2508.10104v1"):
             return result
+        if (result.get("metrics_status") == "computed"
+                and result.get("protocol", {}).get("name") in ("dino_v1_480p", "dino_480p_last4", "dino_square_last4")):
+            from evaluation.utils.video_dino import SOURCE
+            if result.get("protocol", {}).get("source") == SOURCE:
+                return result
         export = result.get("prediction_export") or {}
         if (result.get("dataset") != "MOSEv2 val"
                 or result.get("metrics_status") != "pending_external_evaluation"

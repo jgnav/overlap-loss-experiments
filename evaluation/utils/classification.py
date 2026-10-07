@@ -1,4 +1,4 @@
-"""Multilabel and low-shot linear classification using CRISP A.2 settings.
+"""Frozen linear classification using CRISP Table 3/4 and A.2 settings.
 
 The papers do not specify a complete recipe. iBOT-derived implementation choices
 are identified in the saved protocol metadata and evaluation/README.md.
@@ -29,7 +29,15 @@ from evaluation.utils.imagenet import IMAGENET_NORMALIZE, _resolve_imagenet_root
 REFERENCE_GPU_COUNT = 4
 BATCH_SIZE_PER_GPU = 256
 GLOBAL_BATCH_SIZE = REFERENCE_GPU_COUNT * BATCH_SIZE_PER_GPU
-BASE_LEARNING_RATE = 0.001
+LEARNING_RATE = 0.001
+
+
+def require_crisp_gpus(world_size):
+    if world_size != REFERENCE_GPU_COUNT:
+        raise ValueError(
+            f"CRISP linear classification requires exactly {REFERENCE_GPU_COUNT} GPUs "
+            f"with {BATCH_SIZE_PER_GPU} images per GPU; got {world_size} GPUs"
+        )
 
 
 def classification_transforms():
@@ -131,43 +139,43 @@ def _make_datasets(args, dataset_name):
 
 
 def _protocol(dataset_name, architecture, checkpoint_key, world_size=REFERENCE_GPU_COUNT):
-    if dataset_name == "imagenet":
-        from evaluation.utils.capi_classification import protocol
-        return protocol(world_size)
+    require_crisp_gpus(world_size)
+    multilabel = dataset_name != "imagenet"
+    epochs = MULTILABEL_DATASETS[dataset_name]["epochs"] if multilabel else 200
     n, average_patches = feature_spec(architecture)
-    batch_per_gpu = max(1, GLOBAL_BATCH_SIZE // world_size)
-    global_batch = batch_per_gpu * world_size
     return {
-        "source": "CRISP Appendix A.2; CG-SSL Table 2 task coverage",
-        "equivalence": "CRISP settings with applicable iBOT fallback components; unpublished choices remain unverified",
-        "protocol_precedence": ["CRISP", "CAPI", "iBOT"],
+        "source": "CRISP Tables 3/4 and Appendix A.2",
+        "protocol_version": 3,
+        "equivalence": "All explicitly stated CRISP classification settings; unpublished details use documented iBOT/local choices",
+        "protocol_precedence": ["CRISP", "iBOT", "documented local choices"],
         "input_resolution": 224, "gpu_count": world_size,
-        "batch_size_per_gpu": batch_per_gpu,
-        "global_batch_size": global_batch,
-        "reference_global_batch_size": GLOBAL_BATCH_SIZE,
+        "batch_size_per_gpu": BATCH_SIZE_PER_GPU,
+        "global_batch_size": GLOBAL_BATCH_SIZE,
         "feature_microbatch_size": BATCH_SIZE_PER_GPU,
-        "base_learning_rate": BASE_LEARNING_RATE,
-        "learning_rate": BASE_LEARNING_RATE * global_batch / 256,
-        "learning_rate_scaled_by_batch_size": True,
-        "learning_rate_interpretation": "CRISP 0.001 treated as base LR using iBOT scaling; author convention unverified",
-        "epochs": MULTILABEL_DATASETS[dataset_name]["epochs"],
+        "learning_rate": LEARNING_RATE,
+        "learning_rate_scaled_by_batch_size": False,
+        "learning_rate_interpretation": "Actual initial optimizer LR 0.001 as stated in CRISP Appendix A.2; no batch scaling",
+        "epochs": epochs,
         "backbone_frozen": True, "checkpoint_key": checkpoint_key,
+        "classifier": "single linear layer",
         "feature": {"concatenated_cls_blocks": n, "append_mean_patch_tokens": average_patches},
         "optimizer": "SGD", "momentum": 0.9, "weight_decay": 0.0,
         "schedule": "epoch cosine annealing to zero; no warmup",
-        "loss": "masked binary cross entropy" if dataset_name != "imagenet" else "cross entropy",
+        "loss": "masked binary cross entropy" if multilabel else "cross entropy",
         "train_transform": "RandomResizedCrop(224, bilinear), horizontal flip, ImageNet normalization",
         "val_transform": "Resize(shorter side=256, bicubic), CenterCrop(224), ImageNet normalization",
         "checkpoint_selection": "final epoch; no selection on reported validation set",
+        "training_split": "full training split; VOC low-shot tasks replace training images with per-class random samples",
+        "validation_split": "full evaluation split from the dataset manifest" if multilabel else "full official ImageNet-1K validation set",
+        "internal_training_holdout": False,
         "setting_sources": {
-            "epochs_resolution_gpu_batch_base_lr": "CRISP Appendix A.2",
+            "epochs_resolution_gpu_batch_actual_lr": "CRISP Appendix A.2",
             "pooling_optimizer_schedule_transforms_initialization": "Original iBOT linear evaluator; CAPI has no released VOC/COCO/VG multilabel protocol",
             "loss_ap_difficult_labels_split_final_epoch": "Documented local choices; absent from applicable released protocols",
         },
-        "metric": "macro average precision (non-interpolated)" if dataset_name != "imagenet" else "top-1/top-5 accuracy",
+        "metric": "macro average precision (non-interpolated)" if multilabel else "top-1/top-5 accuracy",
         "implementation_choices_not_specified_by_papers": [
             "iBOT architecture-dependent feature pooling, SGD/momentum/weight decay, cosine schedule, augmentation, and head initialization",
-            "0.001 is interpreted as base learning rate with iBOT batch scaling; CRISP's actual LR is unverified",
             "multilabel masked BCE, unknown-label handling, and non-interpolated macro AP",
             "final-epoch reporting instead of selecting an epoch on the evaluation set",
             "dataset versions, split membership, and label vocabulary are supplied by input manifests",
@@ -246,9 +254,7 @@ def evaluate(backbone, head, dataset, architecture, multilabel, device, rank, wo
 
 
 def run_classification(args, dataset_name, evaluation_name, rank, world_size):
-    if dataset_name == "imagenet":
-        from evaluation.utils.capi_classification import run
-        return run(args, rank, world_size)
+    require_crisp_gpus(world_size)
     started, start_time = utc_now(), time.monotonic()
     train, val, dataset_metadata = _make_datasets(args, dataset_name)
     shots = VOC_SHOT_EVALUATIONS.get(evaluation_name)
@@ -331,9 +337,6 @@ def run_classification(args, dataset_name, evaluation_name, rank, world_size):
 
 
 def classification_entrypoint(module, dataset_name, evaluation_name):
-    if dataset_name == "imagenet":
-        from evaluation.utils.capi_classification import entrypoint
-        return entrypoint()
     shots = VOC_SHOT_EVALUATIONS.get(evaluation_name)
     regime = "Full-data" if shots is None else f"{shots}-shot"
     parser = base_parser(f"{regime} {dataset_name} frozen linear classification (CRISP A.2 settings)")

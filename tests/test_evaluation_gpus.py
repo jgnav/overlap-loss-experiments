@@ -74,14 +74,14 @@ class AutomaticGPUTest(unittest.TestCase):
             initialize.assert_called_once()
             select.assert_called_once_with(0)
 
-    def test_classification_batch_preserves_reference_for_one_two_four_eight(self):
-        for count in (1, 2, 4, 8):
-            protocol = classification._protocol('imagenet', 'vit_small', 'teacher', count)
-            self.assertEqual(protocol['gpu_count'], count)
-            self.assertEqual(protocol['global_batch_size'], 1024)
-            self.assertEqual(protocol['batch_size_per_gpu'], 1024 // count)
-        with self.assertRaises(ValueError):
-            classification._protocol('imagenet', 'vit_small', 'teacher', 3)
+    def test_classification_requires_crisp_four_gpu_allocation(self):
+        protocol = classification._protocol('imagenet', 'vit_small', 'teacher', 4)
+        self.assertEqual(protocol['global_batch_size'], 1024)
+        self.assertEqual(protocol['batch_size_per_gpu'], 256)
+        for dataset in ('imagenet', 'pascal_voc', 'coco', 'visual_genome'):
+            for count in (1, 2, 3, 8):
+                with self.subTest(dataset=dataset, count=count), self.assertRaisesRegex(ValueError, 'exactly 4 GPUs'):
+                    classification._protocol(dataset, 'vit_small', 'teacher', count)
 
     def test_feature_microbatching_preserves_head_gradient(self):
         class Backbone(torch.nn.Module):

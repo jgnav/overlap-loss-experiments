@@ -2,8 +2,8 @@
 
 Each evaluation has one implementation and one fixed recipe. There are no
 protocol mode switches. Settings follow CRISP first, then applicable CAPI details, then iBOT.
-ImageNet linear/attentive classification uses CRISP duration/batch/base-LR
-settings with the pinned CAPI implementation. Segmentation uses CAPI classifiers
+ImageNet and multilabel linear classification use CRISP resolution, actual learning
+rate, GPU/batch counts and epoch budgets with documented iBOT/local details. Segmentation uses CAPI classifiers
 and CRISP resolution. Other tasks use documented CRISP/iBOT or task-specific
 components. Missing author details remain explicit assumptions.
 
@@ -76,7 +76,8 @@ ADE20K uses official `training` (20,210 images) and `validation` (2,000),
 IDs, and ignores other labels (255); coarse annotations and test images are
 not used. Both retain the CAPI holdout/probes and CRISP's 256-token resolution adjustment. ImageNet classification uses official train/val with matching
 1,000-class vocabularies; k-NN uses 1%, 10%, and 100% training banks and
-linear/attentive probing reserves 10% of training images as an internal holdout. VOC multilabel classification remains
+linear probing uses the full official training split and reports on the full official
+validation set. VOC multilabel classification remains
 separate from segmentation: official VOC2012 `ImageSets/Main` train/val.
 COCO remains the explicitly selected 2017 train/val baseline. Exact CRISP
 classification split/recipe equivalence is **not established**; see below.
@@ -91,68 +92,58 @@ are edited in place. Retain result JSON files with the evaluated checkpoints.
 
 ## Classification
 
-### ImageNet: CRISP settings with CAPI linear and attentive components
+### Linear classification: CRISP stated settings
 
-`imagenet_linear` runs the released CAPI classifier implementation at revision
-`98b4fa17ee8eec8810c17022df9a27a44845368b`. It trains linear heads on final CLS,
-mean final patch, and concatenated final CLS/mean-patch features, plus attentive
-heads on final patch tokens. ViT-S no longer concatenates four intermediate CLS
-blocks. All heads share a single frozen backbone forward per batch.
+`imagenet_linear` and the VOC/COCO/VG linear probes share the frozen linear
+classifier in `evaluation/utils/classification.py`. Their fixed settings match
+CRISP Tables 3/4 and Appendix A.2:
 
-- **200 epochs of image exposure**, global batch **1,024**, on the CAPI 90%
-  training split. The infinite-sampler iteration budget is
-  `ceil(200 * actual_training_images / 1024)` (225,206 steps for 1,153,050 images).
-  This overrides upstream CAPI's 12,500-step budget using CRISP Appendix A.2.
-- Fixed 10% holdout with `numpy.default_rng(42)`; official validation is the test
-  set. No reported-test-set tuning.
-- **AdamW**, betas `(0.9, 0.95)`, 1,250-step linear warmup then cosine decay.
-- Fixed **base LR 0.001** from CRISP, with CAPI/iBOT batch scaling: the peak
-  optimizer LR is **0.004** at global batch 1,024. CRISP does not specify whether
-  its 0.001 was a base or actual LR; this is an explicit fallback assumption.
-  Three CAPI weight decays `{5e-4,1e-3,5e-2}` remain per feature source; bias
-  decay is zero. There are 12 heads in total, rather than upstream's 120.
-- Bicubic random resized crop to 224 and horizontal flip for training; bicubic
-  resize to 256 and center crop to 224 for holdout/test.
-- CAPI's infinite distributed sampler (seed 42), worker persistence, masked
-  padding for validation and independent heldout selection per feature source.
-- Checkpoint and validation every 1,250 steps. Checkpoint writes are atomic and
-  only the latest classifier checkpoint is retained. A protocol/checkpoint/input
-  signature rejects incompatible resume. Previous 12,500-step CAPI and
-  200-epoch SGD probes require a new output directory and fresh head training.
-
-`metrics.top1` is the heldout-selected **CLS linear** test accuracy;
-`metrics.attentive_top1` is the patch-attentive accuracy. `feature_results`
-contains the separate CLS, average-patch, concatenated-feature and attentive
-results with selected parameters. `validation_sweep.json` contains all 12
-candidates; `test_classifiers.json` contains the four selected classifiers.
-CAPI reports top-1; a top-5 number is not invented for this evaluator.
-
-The model adapter exposes the same final normalized iBOT features as CAPI's
-released `baselines/ibot_loader.py`. CRISP overrides duration and base LR; CAPI supplies the remaining classifier
-details. Exact CRISP score reproduction is not established. Eager execution
-avoids compiling the classifier graph without changing its calculations. Four GPUs use 256 images each.
-
-### Multilabel classification with iBOT fallback components
-
-CAPI does not release the VOC/COCO/Visual Genome multilabel or few-shot recipes
-used here. As requested, these retain their existing CRISP-derived settings:
+- **Exactly four GPUs**, **256 images per GPU** (global batch **1,024**).
+  Any other GPU count is rejected before loading datasets or training probes.
+- **224 x 224** inputs; the encoder remains frozen and only a single linear
+  classifier is trained.
+- **Actual initial optimizer learning rate 0.001**, followed by cosine decay.
+  No multiplication by batch size is applied.
+- **500 epochs** for VOC Full and VOC 1/2/5-shot; **200 epochs** for COCO,
+  VG and ImageNet linear.
+- Full-data tasks use their full training split and report on the full evaluation
+  split. ImageNet uses every official training image and all 50,000 official
+  validation images. No internal holdout or attentive classifier is used.
+- VOC low-shot tasks randomly draw 1, 2 or 5 positive images per class from the
+  training split using fixed seed 0, then report mAP on the full VOC validation
+  set. Draws are nested across shot counts; the deduplicated union retains all
+  labels of selected images. The authors' seed and multilabel overlap handling
+  are not published.
 
 | Evaluation | Training data | Epochs | Metric |
 | --- | --- | --- | --- |
-| `pascal_voc_multilabel` | Explicit Pascal classification train split, 20 classes | 500 | mAP |
-| `coco_multilabel` | Explicit COCO classification train split, 80 classes | 200 | mAP |
-| `visual_genome_multilabel` | Explicit VG500 train split, 500 classes | 200 | mAP |
+| `imagenet_linear` | Full official ImageNet-1K train, 1,000 classes | 200 | top-1/top-5 |
+| `pascal_voc_multilabel` | VOC2012 classification train, 20 classes | 500 | mAP |
+| `pascal_voc_1shot`, `pascal_voc_2shot`, `pascal_voc_5shot` | Random positive images per class from VOC train | 500 | mAP |
+| `coco_multilabel` | COCO2017 train, 80 classes | 200 | mAP |
+| `visual_genome_multilabel` | SSGRL VG500 train, 500 classes | 200 | mAP |
 
-These use SGD/momentum, base learning rate 0.001, scaled to actual LR 0.004 at global batch 1,024, before cosine decay, global
-batch 1,024, iBOT pooling and bilinear random crops. They report final-epoch
-macro AP with unknown/difficult labels masked. Their unchanged VOC 1/2/5-shot
-variants sample positive images per class, deduplicate the union and train for
-500 epochs. They must not be described as CAPI classification protocols.
+The following are **documented implementation choices**, not confirmed CRISP
+settings: iBOT feature pooling (last-four CLS concatenation for ViT-S; final CLS
+plus mean patch features for ViT-B/L), SGD with momentum 0.9 and zero weight
+decay, cosine decay without warmup, iBOT head initialization and augmentations,
+masked BCE for multilabel tasks, unknown/difficult-label exclusion, and
+non-interpolated macro AP. Results use the final epoch; reported validation
+images do not select hyperparameters or epochs. The PDF does not establish
+exact dataset versions/split membership, feature pooling, optimizer, schedule,
+AP convention or seed. Matching every stated setting therefore does not prove
+bit-for-bit reproduction of the authors' complete recipe.
 
-ImageNet 1%, 10% and 100% k-NN also remain non-CAPI extensions: fixed
-SimCLRv2/iBOT banks, final CLS, temperature 0.07 and primary k=20. CAPI has no
-released image-level k-NN classifier. Correspondence and video tasks similarly
-retain their existing task-specific implementations.
+The previous 0.004-LR, one-GPU probes and CAPI ImageNet probes are historical
+results. New launches must use fresh output directories: probe checkpoint
+signatures reject incompatible resume. `capi_classification.py` remains a legacy
+comparison adapter; it is not selected by `imagenet_linear`.
+
+ImageNet 1%, 10% and 100% k-NN continue to use fixed SimCLRv2/iBOT training banks,
+final CLS features, temperature 0.07 and primary k=20, with full official
+validation. The CRISP PDF does not specify k, temperature or exact subset
+membership, so these remain explicit fallback choices. k-NN does not train a
+linear classifier and therefore has no learning-rate/epoch requirement.
 
 ### Input manifests
 
@@ -268,22 +259,28 @@ does not claim that a newly invented split reproduces either paper.
 
 ## Running
 
+For the classification tables, use the standard-GPU wrapper, which allocates
+four GPUs, eight CPUs and 64 GiB with automatic checkpoint requeue:
+
+```bash
+sbatch slurm/evaluation_classification.sh config/evaluation_multilabel_region_vits200.yaml
+sbatch slurm/evaluation_classification.sh config/evaluation_imagenet_region_vits200.yaml
+```
+
+Generated launch configs should set a persistent absolute output directory so a
+requeue resumes the same probe. `evaluation.launch_slurm` also allocates four
+GPUs for both classification groups.
+
 Use Python 3.10/3.11 and the repository's CUDA requirements in production
 (PyTorch 2.3's torch.compile does not support Python 3.12). Every evaluator
 automatically launches one worker per visible NVIDIA GPU, including a proper
 distributed process group on a single GPU. No GPU-count setting is required.
 An explicit existing `torchrun` launch is respected. Zero GPUs fails clearly.
 
-- Non-CAPI multilabel classification uses `max(1, floor(1024 / GPU count))` images per GPU
-  per training step. This preserves a total batch of 1,024 for 1/2/4/8 GPUs;
-  other counts use the nearest lower multiple (3 GPUs: 1,023). Frozen backbone
-  forwards use chunks of at most 256 images to limit activation memory. The
-  optimizer LR follows base LR 0.001 times actual global batch / 256. Results record actual GPU/batch counts. Smaller
-  datasets/final batches remain smaller. Changing GPU count can change
-  stochastic augmentation and sampling, so it does not promise identical scores.
-- CAPI ImageNet classification uses 1,024 / GPU count images per GPU and
-  requires a divisor of 1,024; 4 GPUs use 256. Its 12 heads are trained with
-  DDP and its validation metrics aggregate all ranks, excluding padding.
+- CRISP linear classification requires four GPUs with 256 images per GPU,
+  actual initial LR 0.001, and a single frozen linear probe. Small few-shot
+  datasets and final batches can be smaller. DDP aggregates training gradients;
+  validation shards count each evaluation image once, without padding.
 - ImageNet k-NN distributes both feature extraction and validation queries.
   Each GPU holds the training bank; global top-1/top-5 count every validation
   image once.
@@ -465,15 +462,42 @@ slurm/prepare_navi_downsampled.sh`). The released Probe3D reader requires
 `downsampled_` RGB/depth files made with its 1024-pixel resize recipe; the
 original NAVI archive has only the source files.
 
-The SPair test split uses 800-pixel images without bounding-box crop, final
-patch tokens, PCK@0.1, and at most 200 seeded pairs per category and viewpoint
+The correspondence iBOT adapter uses raw final-block patch tokens before
+the final LayerNorm, matching Probe3D's released `evals/models/ibot.py`.
+SPair applies L2 normalization before keypoint sampling; NAVI applies it
+after bicubic feature interpolation to the geometry grid. This differs from
+the normalized block features used by the video and segmentation probes.
+The SPair test split uses 800-pixel images without bounding-box crop,
+PCK@0.1, and at most 200 seeded pairs per category and viewpoint
 level. NAVI uses its in-the-wild test pairs, 512-pixel bbox crop, 1,000
 ratio-ranked correspondences, and 2-cm 3D recall in four rotation bins.
 ScanNet uses released test pairs at 480 x 640, 1,000 correspondences, and
 10-pixel reprojection recall on Probe3D's quarter-resolution geometry grid.
+Correspondence results also record the actual selected pair identities.
+Controlled feature comparisons can set `correspondence_feature_variant` to
+`final_norm_standardized`, `projection`, `projection_softmax`, or
+`concat_4_6_8_12` in the evaluation YAML. The default remains `raw_final`.
+These alternatives retain the released pairs and matching protocol, but are
+feature ablations rather than the official Probe3D feature recipe.
+The standardized variant fits channelwise `StandardScaler` on normalized
+patch features from CAPI's seeded 90% VOC training subset at 256 pixels for
+patch size 16, then freezes it for every correspondence test dataset. It
+never fits on correspondence test images. Saved scaler statistics and training
+image indices identify the calibration inputs.
+Projection variants restore the checkpoint's trained teacher patch MLP and
+prototype layer with strict loading. `projection` uses its output logits;
+`projection_softmax` applies plain per-patch softmax, without centering or
+Sinkhorn, at `correspondence_softmax_temperature` (default 1.0).
+`concat_4_6_8_12` concatenates the raw outputs of those four one-based blocks,
+without final LayerNorm, following iBOT's linear segmentation feature recipe.
+Upstream pair sampling depends on filesystem enumeration, so seed equality
+alone cannot establish equality with CRISP's unpublished sampled pairs.
 All three results include split and threshold metadata. Probe3D's published
 10-pixel cutoff is measured on that quarter-resolution ScanNet grid; the
 current draft should state this if those numbers are used in Table 4.
+Probe3D documents a public LoFTR download of `scannet_test_1500`, which
+contains the RGB, depth and poses needed here without downloading the full
+ScanNet release: see [its dataset instructions](https://github.com/mbanani/probe3d/blob/main/data_processing/README.md#scannet-correspondence-test-split).
 
 Video inputs use standard validation layouts:
 
@@ -542,7 +566,7 @@ to split a full suite into independent jobs. `--dry-run` previews allocations:
 | Group | GPUs | CPUs | RAM | Time limit |
 | --- | ---: | ---: | ---: | --- |
 | Segmentation | 1 | 16 | 128 GiB | 48 hours |
-| ImageNet linear/attentive | 4 | 24 | 64 GiB | 72 hours |
+| ImageNet linear | 4 | 24 | 64 GiB | 72 hours |
 | Other classification | 4 | 24 | 64 GiB | 24 hours |
 | Correspondence/video | 1 | 8 | 32 GiB | 72 hours |
 

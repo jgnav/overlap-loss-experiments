@@ -1,0 +1,27 @@
+# Control for the CRISP Table 3 VOC results using the original iBOT initialization.
+# Same evaluator/protocol as evaluation_multilabel_region_vits200.yaml.
+checkpoint: ../checkpoints/ibot_vit_small.pth
+checkpoint_key: teacher
+arch: vit_small
+datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
+classification_manifests: null
+
+output_dir: null
+result_json: null
+seed: 0
+num_workers: 4
+
+wandb_mode: offline
+wandb_project: ibot-evaluation
+wandb_entity: null
+wandb_run_name: ibot-original-multilabel-control
+wandb_run_id: null
+wandb_resume: null
+
+# VOC probes: 500 epochs, frozen last-four CLS features, 4 GPUs x 256.
+# Actual optimizer LR 0.001 without scaling; unpublished CRISP details unverified.
+evaluations:
+  pascal_voc_1shot: true
+  pascal_voc_2shot: true
+  pascal_voc_5shot: true
+  pascal_voc_multilabel: true
