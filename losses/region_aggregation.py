@@ -8,6 +8,7 @@ METHODS = (
     "mean", "hellinger", "mean_scalar_variance", "mean_variance",
     "mean_covariance", "mean_projected_variance", "mean_projected_covariance",
     "swd", "mean_centered_swd", "mean_normalized_swd",
+    "region_token",
 )
 
 
@@ -70,6 +71,8 @@ class RegionAggregation(nn.Module):
 
     def forward(self, s, t, sw, tw, mean_loss):
         """Return one loss per region; caller supplies detached teacher values."""
+        if self.method == "region_token":
+            raise ValueError("region_token requires learned aggregation of backbone features")
         t = t.detach()
         _, sr, sw = self.moments(s, sw)
         _, tr, tw = self.moments(t, tw)

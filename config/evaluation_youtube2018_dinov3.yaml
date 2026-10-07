@@ -1,0 +1,20 @@
+# Official YouTube-VOS 2018 validation: 474 videos with dense RGB and full GT.
+# DINOv3 propagation settings with the requested last-four-block average.
+# This is the official validation split, not DINOv3's custom training holdout.
+checkpoint: ../output/long_ibot_vit_small/85535_0/checkpoint_source1000_continuation0200.pth
+checkpoint_key: teacher
+arch: auto
+datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
+output_dir: null
+seed: 0
+num_workers: 4
+video_protocol: dinov3
+video_resolution: small
+video_feature_blocks: 4
+video_split_manifests:
+  youtube_vos: video_splits/youtube_vos_2018_valid.json
+wandb_mode: offline
+wandb_project: ibot-evaluation
+wandb_run_name: dinov3-youtube2018-valid-region200
+evaluations:
+  youtube_vos_vos: true

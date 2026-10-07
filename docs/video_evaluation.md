@@ -107,6 +107,35 @@ Historical output is preserved; launches use new output directories.
 
 ## Historical protocol comparisons
 
+`video_protocol: dino_v1_480p` runs the pinned DINO v1 propagation and accepts
+`video_feature_blocks: 1` (the upstream final-block features) or `4` (mean of
+the last four normalized blocks). Both use short side 480, long side floored
+to a multiple of 64, OpenCV RGB resizing, the upstream normalization including
+red-channel standard deviation 0.228, temperature 0.1, top-5 neighbors across
+the first frame and up to seven previous frames, and a square radius of 12
+patches applied to every context frame. Mask postprocessing and soft-label
+history follow the pinned evaluator. Existing `dino_480p_last4` and
+`dino_square_last4` configurations retain their four-block behavior.
+
+Only DAVIS 2017 validation is an upstream DINO benchmark. YouTube-VOS and MOSE
+use explicit split manifests with the same propagation, native-resolution
+J/F scoring, and first-frame objects only. YouTube-VOS results from this
+extension are all-object averages, not official seen/unseen challenge scores.
+Use the standard YouTube-VOS 2018 validation RGB release for the matched
+three-checkpoint comparison; its sparse cadence differs from the optional
+dense `all_frames` release. For this DINO comparison, an explicit
+`initial_mask_root` in the split manifest points to the original supplied
+initialization masks, separately from the full scoring `mask_root`. Some
+full-GT first frames include objects omitted from the supplied initialization;
+do not introduce those objects through scoring ground truth. Later supplied
+initializations are ignored by this first-frame-only extension. Each
+clip starts at its first supplied initialization; preceding unlabeled RGB
+frames and their scoring annotations are excluded. The original
+MOSE 2023 split is frozen at 301
+evaluation clips and 1,206 disjoint reserved clips (seed 0); its author split
+is unverified. Never label these results as an exact CRISP reproduction
+without the corresponding split and scoring details.
+
 Completed DAVIS comparisons, all 30 videos and 61 first-frame objects:
 
 | Protocol / features | Original iBOT J&F | Region200 J&F |
@@ -121,3 +150,21 @@ Historical measurements remain under `output/analysis/`. Original DINO adapters
 and the pinned source/license are retained for reproducing those comparisons;
 `dino_480p_last4` and `dino_square_last4` require explicit selection. They are not
 the default offline video protocol.
+
+## DINO controls on YouTube-VOS and MOSE
+
+An explicit `video_split_manifests` entry also permits DINO propagation on
+YouTube-VOS and MOSE. These are extensions: the original DINO repository releases
+only a DAVIS evaluator. They retain original DINO propagation, RGB normalization,
+initial mask sampling, and prediction resizing, with the requested mean of the
+last four normalized blocks. `dino_480p_last4` uses a 480-pixel short side and
+floors the longer side to a multiple of 64; it does not produce square inputs.
+
+Use the exact same split manifests as the DINOv3 comparison. Propagate every
+released RGB frame, initialize only objects in the first provided annotation,
+and score available annotations after initialization. YouTube-VOS's unannotated
+frames still update the seven-frame context. First and last frames are excluded
+for DAVIS; YouTube-VOS/MOSE include the final annotation. J/F averaging is over
+frames per object, then over objects. Non-DAVIS controls compute metrics without
+exporting prediction masks. These settings do not establish equivalence with
+CRISP's unspecified YouTube-VOS/MOSE splits or scoring adaptations.

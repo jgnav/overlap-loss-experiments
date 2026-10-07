@@ -56,8 +56,8 @@ def load_config(path):
         raise ValueError("checkpoint_key must be teacher or student")
     if values["arch"] not in ("auto", *ARCHITECTURES):
         raise ValueError(f"arch must be auto or one of {ARCHITECTURES}")
-    if values["video_protocol"] not in ("dino_480p_last4", "dino_square_last4", "dinov3"):
-        raise ValueError("video_protocol must be dino_480p_last4, dino_square_last4 or dinov3")
+    if values["video_protocol"] not in ("dino_v1_480p", "dino_480p_last4", "dino_square_last4", "dinov3"):
+        raise ValueError("video_protocol must be dino_v1_480p, dino_480p_last4, dino_square_last4 or dinov3")
     if values["video_resolution"] not in ("small", "medium", "large"):
         raise ValueError("video_resolution must be small, medium or large")
     if type(values["video_feature_blocks"]) is not int or values["video_feature_blocks"] not in (1, 4):
@@ -87,11 +87,12 @@ def load_config(path):
     if any(type(enabled) is not bool for enabled in switches.values()):
         raise ValueError("Evaluation switches must be YAML true or false, not strings or numbers")
     values["evaluations"] = [name for name in names if switches.get(name, False)]
-    if values["video_protocol"] in ("dino_480p_last4", "dino_square_last4") and any(name.endswith("_vos") for name in values["evaluations"]):
-        if values["video_resolution"] != "small" or values["video_feature_blocks"] != 4:
-            raise ValueError("Original DINO protocols require video_resolution: small and video_feature_blocks: 4")
-        if any(name in values["evaluations"] for name in ("youtube_vos_vos", "mose_vos")):
-            raise ValueError("Original DINO releases DAVIS only; select an explicit extension for other video datasets")
+    if values["video_protocol"] in ("dino_v1_480p", "dino_480p_last4", "dino_square_last4") and any(name.endswith("_vos") for name in values["evaluations"]):
+        if values["video_resolution"] != "small" or (values["video_protocol"] != "dino_v1_480p" and values["video_feature_blocks"] != 4):
+            raise ValueError("DINO requires small resolution; legacy last4 protocols require four blocks")
+        for dataset, evaluation in (("youtube_vos", "youtube_vos_vos"), ("mose", "mose_vos")):
+            if evaluation in values["evaluations"] and dataset not in values["video_split_manifests"]:
+                raise ValueError(f"DINO propagation on {dataset} is an extension requiring an explicit split manifest")
     if not values["evaluations"]:
         raise ValueError("Enable at least one evaluation in the YAML")
     for name in ("checkpoint", "datasets_root", "output_dir", "result_json", "classification_manifests"):

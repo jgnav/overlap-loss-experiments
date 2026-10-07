@@ -207,7 +207,7 @@ def _preflight_benchmark_datasets(args, evaluations):
             )
     video_names = {"davis_vos": "davis", "youtube_vos_vos": "youtube_vos", "mose_vos": "mose"}
     if names.intersection(video_names):
-        if getattr(args, "video_protocol", "dinov3") in ("dino_480p_last4", "dino_square_last4"):
+        if getattr(args, "video_protocol", "dinov3") in ("dino_v1_480p", "dino_480p_last4", "dino_square_last4"):
             from evaluation.utils.video_dino import preflight_masks
         else:
             from evaluation.utils.video_dinov3 import preflight_masks

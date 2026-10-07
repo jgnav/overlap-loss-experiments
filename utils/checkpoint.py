@@ -75,6 +75,10 @@ RESUME_TOPOLOGY_KEYS = {
 }
 
 
+def _is_region_token_parameter(name):
+    return name.startswith("region_token.") or ".region_token." in name
+
+
 def _read_checkpoint(path):
     path = Path(path)
     if not path.is_file():
@@ -310,7 +314,8 @@ def _load_optimizer_with_head_copies(checkpoint, student, optimizer):
         names = [parameter_names[id(p)] for p in live_group["params"]]
         mapped = [canonical.get(_source_parameter_name(name, source, student)) for name in names]
         missing_names = [name for name, source_name in zip(names, mapped) if source_name is None]
-        if any(not name.endswith("backbone.register_tokens") for name in missing_names):
+        if any(not name.endswith("backbone.register_tokens") and not _is_region_token_parameter(name)
+               for name in missing_names):
             raise ValueError("Cannot expand optimizer: missing source parameter")
         mapped_names = {name for name in mapped if name is not None}
         source_names = [name for name in source if name in mapped_names and canonical[name] == name]
@@ -345,6 +350,7 @@ def load_pretrained_state(
     ibot_loss,
     allow_new_register_tokens=False,
     allow_new_region_heads=False,
+    allow_new_region_tokens=False,
 ):
     objects = {
         "student": student,
@@ -368,6 +374,8 @@ def load_pretrained_state(
                 name for name in missing
                 if not name.endswith("backbone.register_tokens")
             ]
+        if allow_new_region_tokens and not any(_is_region_token_parameter(name) for name in source):
+            missing = [name for name in missing if not _is_region_token_parameter(name)]
         if missing or incompatible.unexpected_keys:
             raise ValueError(
                 f"Checkpoint key '{key}' is incompatible: "
@@ -395,6 +403,14 @@ def load_pretrained_state(
             ):
                 target_register.copy_(source_register)
 
+    if allow_new_region_tokens and not any(
+        _is_region_token_parameter(name) for name in checkpoint["student"]
+    ):
+        source_wrapper = student.module if hasattr(student, "module") else student
+        target_wrapper = teacher.module if hasattr(teacher, "module") else teacher
+        if hasattr(source_wrapper, "region_token"):
+            target_wrapper.region_token.load_state_dict(source_wrapper.region_token.state_dict())
+
     missing_centers = sorted(
         {"center", "center2"} - set(checkpoint["ibot_loss"])
     )
@@ -406,6 +422,14 @@ def load_pretrained_state(
     center_state = {
         key: checkpoint["ibot_loss"][key] for key in ("center", "center2")
     }
+    if hasattr(getattr(ibot_loss, "region_loss", None), "center"):
+        token_center = "region_loss.center"
+        if token_center in checkpoint["ibot_loss"]:
+            center_state[token_center] = checkpoint["ibot_loss"][token_center]
+        elif not allow_new_region_tokens or any(
+            _is_region_token_parameter(name) for name in checkpoint["teacher"]
+        ):
+            raise ValueError("Region token checkpoint is missing its independent center")
     if getattr(ibot_loss, "ordering_loss", None) is not None:
         step_key = "ordering_loss.sampling_step"
         if step_key in checkpoint["ibot_loss"]:
@@ -490,6 +514,7 @@ def load_continuation_state(
         ibot_loss,
         allow_new_register_tokens=True,
         allow_new_region_heads=True,
+        allow_new_region_tokens=True,
     )
     optimizer_restored = "optimizer" in checkpoint and not reset_optimizer
     if optimizer_restored:

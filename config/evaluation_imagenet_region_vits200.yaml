@@ -1,0 +1,27 @@
+# CRISP Table 4: stated paper settings; documented CAPI/iBOT fallback details.
+checkpoint: ../output/long_ibot_vit_small/85535_0/checkpoint_source1000_continuation0200.pth
+checkpoint_key: teacher
+arch: vit_small
+datasets_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets
+classification_manifests: null
+output_dir: null
+result_json: null
+seed: 0
+num_workers: 4
+wandb_mode: offline
+wandb_project: ibot-evaluation
+wandb_entity: null
+wandb_run_name: region-vits200-imagenet
+wandb_run_id: null
+wandb_resume: null
+
+# k-NN: fixed SimCLRv2 1%/10% banks and all training images for 100%;
+# final CLS, cosine similarity, temperature 0.07, primary k=20.
+# Linear: 4 GPUs x 256, 224 inputs, 200 epochs; CAPI heads and 10% holdout.
+# CRISP's 0.001 is treated as base LR (actual 0.004), an unverified convention.
+# Unlisted evaluations are disabled.
+evaluations:
+  imagenet_knn_1pct: true
+  imagenet_knn: true
+  imagenet_knn_100pct: true
+  imagenet_linear: true

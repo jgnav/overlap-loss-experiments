@@ -1,5 +1,6 @@
 """Compare the 480p/four-block adapter with the actual pinned DINO code."""
 import ast
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -24,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def upstream_functions():
     tree = ast.parse((ROOT / 'evaluation/vendor/dino/eval_video_segmentation.py').read_text())
     names = {'read_frame', 'read_seg', 'color_normalize', 'to_one_hot',
-             'restrict_neighborhood', 'label_propagation', 'norm_mask'}
+             'restrict_neighborhood', 'label_propagation', 'norm_mask', 'extract_feature'}
     definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     namespace = {'cv2': cv2, 'np': np, 'torch': torch, 'F': F, 'Image': Image}
     exec(compile(ast.Module(body=definitions, type_ignores=[]), '<pinned DINO>', 'exec'), namespace)
@@ -102,6 +103,84 @@ class DINOVideoTest(unittest.TestCase):
         self.assertEqual(grid, (1, 1))
         torch.testing.assert_close(features, torch.tensor([[2.5, 2.]]))
 
+    def test_final_block_features_match_upstream(self):
+        class Backbone:
+            patch_embed = SimpleNamespace(patch_size=16)
+
+            def get_intermediate_layers(self, image, n):
+                self.n = n
+                return [torch.tensor([[[100., 100.], [3., 2.], [4., 5.]]])]
+
+        model = Backbone()
+        image = torch.zeros(3, 16, 32)
+        original = upstream_functions()
+        with patch.object(torch.Tensor, 'cuda', lambda self, *a, **kw: self):
+            expected, h, w = original['extract_feature'](model, image, return_h_w=True)
+        actual, grid = vos.patch_features(model, image, 16, feature_blocks=1)
+        self.assertEqual(model.n, 1)
+        self.assertEqual(grid, (h, w))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_dino_v1_configuration_accepts_both_feature_counts(self):
+        original = (ROOT / 'config/evaluation_video_dino.yaml').read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.yaml'
+            for blocks in (1, 4):
+                path.write_text(original.replace('dino_480p_last4', 'dino_v1_480p')
+                                .replace('video_feature_blocks: 4', f'video_feature_blocks: {blocks}'))
+                args = load_config(path)
+                command = evaluation_command(args, 'davis_vos', 'evaluation.utils.davis_vos', Path('/tmp/result.json'))
+                worker = base_parser('test').parse_args(command[3:])
+                self.assertEqual(worker.video_protocol, 'dino_v1_480p')
+                self.assertEqual(worker.video_feature_blocks, blocks)
+
+    def test_supplied_initialization_is_separate_from_scoring_ground_truth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            masks, initial = root / 'gt', root / 'initial'
+            masks.mkdir(); initial.mkdir()
+            seed = np.zeros((32, 32), dtype=np.uint8)
+            seed[:, :16] = 1
+            full = seed.copy(); full[:, 16:] = 2
+            frames = [root / f'{i:05d}.jpg' for i in range(3)]
+            for frame in frames:
+                Image.fromarray(full).save(masks / f'{frame.stem}.png')
+            Image.fromarray(seed).save(initial / '00000.png')
+            features = torch.ones(4, 2)
+            with patch.object(vos, 'read_image', return_value=(torch.zeros(3, 32, 32), (32, 32))), \
+                 patch.object(vos, 'patch_features', return_value=(features, (2, 2))), \
+                 patch.object(vos, 'prediction', return_value=seed), \
+                 patch.object(vos, 'propagate', side_effect=lambda target, feats, probs, grid: probs[0]):
+                objects, details = vos.score_video(None, 16, frames, masks, 'cpu', None,
+                                                  dataset='youtube_vos', feature_blocks=1,
+                                                  initial_mask_folder=initial)
+            self.assertEqual(set(objects), {'1'})
+            self.assertEqual(details['object_ids'], [1])
+            self.assertEqual(details['scored_frames'], 2)
+            self.assertEqual(objects['1'], {'j': 1.0, 'f': 1.0})
+
+    def test_clip_starts_at_supplied_initialization_not_full_gt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rgb, gt, seed = root / 'rgb' / 'clip', root / 'gt' / 'clip', root / 'seed' / 'clip'
+            for folder in (rgb, gt, seed):
+                folder.mkdir(parents=True)
+            for index in range(3):
+                Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8)).save(rgb / f'{index:05d}.jpg')
+                Image.fromarray(np.ones((32, 32), dtype=np.uint8)).save(gt / f'{index:05d}.png')
+            Image.fromarray(np.ones((32, 32), dtype=np.uint8)).save(seed / '00001.png')
+            manifest = root / 'split.json'
+            manifest.write_text(json.dumps({'dataset': 'youtube_vos', 'dataset_release': '2018',
+                                           'author_split_verified': False, 'source': 'test',
+                                           'paths_relative_to': 'datasets_root', 'image_root': 'rgb',
+                                           'mask_root': 'gt', 'initial_mask_root': 'seed',
+                                           'splits': {'selection': [], 'evaluation': ['clip']}}))
+            images, _, names, split = vos.preflight_masks(root, 'youtube_vos', manifest)
+            self.assertEqual(names, ['clip'])
+            frames, details = vos.evaluation_frames(images / 'clip', Path(split['initial_mask_root']) / 'clip', 'youtube_vos')
+            self.assertEqual([frame.stem for frame in frames], ['00001', '00002'])
+            self.assertEqual(details['skipped_leading_unannotated_frames'], 1)
+
     def test_default_protocol_and_explicit_dinov3_remain_distinct(self):
         args = load_config(ROOT / 'config/evaluation_video_dino.yaml')
         self.assertEqual(args.video_protocol, 'dino_480p_last4')
@@ -111,7 +190,7 @@ class DINOVideoTest(unittest.TestCase):
         self.assertEqual(worker.video_feature_blocks, 4)
         self.assertEqual(worker.video_resolution, 'small')
         self.assertEqual(load_config(ROOT / 'config/evaluation_video_dinov3.yaml').video_protocol, 'dinov3')
-        with self.assertRaisesRegex(ValueError, 'DAVIS protocol only'):
+        with self.assertRaisesRegex(FileNotFoundError, 'explicit custom split manifest'):
             vos.preflight_masks('/tmp', 'youtube_vos')
 
 

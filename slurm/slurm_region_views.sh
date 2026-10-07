@@ -9,7 +9,7 @@
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --time=50:00:00
 #SBATCH --output=logs/region_views_%A_%a.out
@@ -45,7 +45,7 @@ fi
 # All ranks of this task share a unique output directory; separate tasks never
 # overwrite one another's checkpoint or TensorBoard files.
 export IBOT_RUN_ID="${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
-# Four training ranks and two data-loader workers per rank fit within 12 CPUs.
+# One CPU per GPU; each rank uses one data-loader worker and one compute thread.
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 

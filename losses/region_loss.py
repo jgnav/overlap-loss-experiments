@@ -120,6 +120,8 @@ class RegionLoss(nn.Module):
         elif normalization == "softmax":
             self.register_buffer("softmax_ordinary_student_temperature", torch.tensor(True))
         self.aggregation = RegionAggregation(aggregation)
+        if aggregation == "region_token" and normalization not in ("centering", "softmax", "sinkhorn"):
+            raise ValueError("region_token requires centering, softmax, or sinkhorn normalization")
         if aggregation == "hellinger" and normalization == "raw_logits":
             raise ValueError("hellinger aggregation requires probability distributions, not raw_logits")
 
@@ -200,6 +202,8 @@ class RegionLoss(nn.Module):
         teacher_patch_targets=None,
         return_per_image=False,
     ):
+        if self.aggregation.method == "region_token":
+            raise ValueError("region_token requires RegionTokenLoss and backbone feature aggregation")
         if len(student_patch_logits) != 2 or len(teacher_patch_logits) != 2:
             raise ValueError("Region loss requires exactly two global crops")
         shape = student_patch_logits[0].shape

@@ -228,6 +228,18 @@ class iBOTHead(DINOHead):
         })
         return head
 
+    def project_patches(self, x):
+        """Project patch or region embeddings through the existing patch head."""
+        if self.last_layer2 is not None:
+            trunk = self.mlp if self.shared_head else self.patch_mlp
+            x = self.last_layer2(nn.functional.normalize(trunk(x), dim=-1, p=2))
+        else:
+            trunk = (self.mlp[:-1] if isinstance(self.mlp, nn.Sequential) else nn.Identity()) if self.shared_head else self.patch_mlp
+            x = self.mlp2(trunk(x))
+        if self.last_norm2 is not None:
+            x = self.last_norm2(x)
+        return x
+
     def forward(self, x):
         if len(x.shape) == 2:
             return super(iBOTHead, self).forward(x)

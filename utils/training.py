@@ -358,11 +358,18 @@ def init_distributed_mode(args):
 class MultiCropWrapper(nn.Module):
     """The multi-resolution forward wrapper from DINO/iBOT."""
 
-    def __init__(self, backbone, head=None, deep_region=False):
+    def __init__(self, backbone, head=None, deep_region=False, region_token=False):
         super().__init__()
         backbone.fc, backbone.head = nn.Identity(), nn.Identity()
         self.backbone = backbone
         self.head = nn.Identity() if head is None else head
+        if region_token:
+            if deep_region:
+                raise ValueError('region_token cannot be combined with deep region supervision')
+            from model.region_token import RegionTokenAggregation
+            self.region_token = RegionTokenAggregation(
+                backbone.embed_dim, backbone.blocks[-1].attn.num_heads
+            )
         # Four evenly spaced depths, including the ordinary final output.
         self.region_layers = tuple(
             len(backbone.blocks) * i // 4 for i in range(1, 5)
@@ -376,12 +383,17 @@ class MultiCropWrapper(nn.Module):
             })
 
     def forward(self, inputs, mask=None, return_backbone_feat=False,
-                return_region_logits=False, **kwargs):
+                return_region_logits=False, region_weights=None, **kwargs):
+        if region_weights is not None and not hasattr(self, 'region_token'):
+            raise ValueError('Learned region token aggregation was not enabled')
         if return_region_logits and not self.region_layers:
             raise ValueError('Deep region heads were not enabled for this model')
         if not isinstance(inputs, list):
             inputs = [inputs]
             mask = [mask] if mask is not None else None
+            region_weights = [region_weights] if region_weights is not None else None
+        if region_weights is not None and len(region_weights) != len(inputs):
+            raise ValueError('Region token weights are required for each input view')
         crop_boundaries = torch.cumsum(
             torch.unique_consecutive(
                 torch.tensor([item.shape[-1] for item in inputs]),
@@ -412,6 +424,14 @@ class MultiCropWrapper(nn.Module):
             (output[:, :1], output[:, 1 + register_count:]), dim=1
         )
         projected_output = self.head(head_input)
+        if region_weights is not None:
+            region_features = self.region_token(
+                output[:, 1 + register_count:], torch.cat(region_weights)
+            )
+            region_logits = self.head.project_patches(region_features)
+            if return_backbone_feat:
+                return output, projected_output, region_logits
+            return projected_output, region_logits
         if return_region_logits:
             region_logits = tuple(
                 self.region_heads[str(depth)](torch.cat([

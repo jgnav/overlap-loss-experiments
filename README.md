@@ -143,6 +143,12 @@ available moment/distribution ablations and their fixed settings, see
 [region aggregation](docs/region_aggregation.md). Patch thresholding or area
 weighting is applied before aggregation.
 
+`region_aggregation: region_token` instead aggregates final backbone features
+with a learned token that attends only to the selected overlap patches in a
+one-block module inspired by CRISP. Its student/EMA-teacher outputs use
+symmetric cross-view distillation and a separate region center. The controlled
+config is [region-token ablation](config/ablations/region_aggregation_region_token.yaml).
+
 `region_views` selects the crops contributing to the regional objective.
 The former `include_local_crops` setting is removed. All four launch configs
 are copies of `config/train.yaml` with only `region_views` changed:

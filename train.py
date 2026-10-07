@@ -66,11 +66,12 @@ def load_config(path):
         raise ValueError("gradient_accumulation_steps must be an integer >= 1")
     if config["gradient_accumulation_steps"] > 1 and (
         config["region_normalization"] == "deep"
+        or config["region_aggregation"] == "region_token"
         or config["loss_modality"] != "standard"
         or config["koleo_regularizer"]
         or config["region_normalization"] == "sinkhorn"
     ):
-        raise ValueError("Gradient accumulation requires the standard loss without deep centers, Sinkhorn, or KoLeo")
+        raise ValueError("Gradient accumulation requires the standard loss without deep centers, region_token, Sinkhorn, or KoLeo")
     for name, minimum in (
         ("diagnostic_feature_batches", 1),
         ("diagnostic_max_patch_features_per_batch", 2),
@@ -120,6 +121,8 @@ def load_config(path):
         )
     # Validate the aggregation choice and its normalization combination before
     # loading checkpoints, datasets, or initializing distributed training.
+    if config["region_aggregation"] == "region_token" and config["region_normalization"] == "deep":
+        raise ValueError("region_token cannot be combined with deep region supervision")
     validate_region_views(
         config["region_views"], config["region_aggregation"], config["region_normalization"]
     )
@@ -430,6 +433,7 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
     embed_dim = student.embed_dim
     region_depths = tuple(len(student.blocks) * i // 4 for i in range(1, 5)) if args.region_normalization == "deep" else ()
     deep_region = args.region_normalization == "deep" and args.lambda3 != 0
+    region_token = args.region_aggregation == "region_token" and args.lambda3 != 0
 
     student = utils.MultiCropWrapper(
         student,
@@ -443,6 +447,7 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
             shared_head=args.shared_head,
         ),
         deep_region=deep_region,
+        region_token=region_token,
     )
     teacher = utils.MultiCropWrapper(
         teacher,
@@ -455,6 +460,7 @@ def train_ibot(args, wandb_run=None, wandb_initializer=None):
             shared_head=args.shared_head,
         ),
         deep_region=deep_region,
+        region_token=region_token,
     )
     student, teacher = student.cuda(), teacher.cuda()
     if utils.has_batchnorms(student):
@@ -939,6 +945,14 @@ def train_one_epoch(
                 dtype=autocast_dtype,
                 enabled=autocast_enabled,
             ):
+                token_weights = None
+                if ibot_loss.region_token and ibot_loss.lambda3 != 0:
+                    patch_size = student.module.backbone.patch_embed.patch_size
+                    patch_count = (images[0].shape[-2] // patch_size) * (images[0].shape[-1] // patch_size)
+                    geometry = ibot_loss.region_loss.prepare_geometry(
+                        crop_boxes[:, :args.global_crops_number], patch_count
+                    )
+                    token_weights = list(geometry["weights"].unbind(1))
                 with torch.no_grad():
                     diagnostic_batch = iteration < args.diagnostic_feature_batches
                     need_rank_features = ibot_loss.needs_patch_rank_features and ibot_loss.lambda3 != 0
@@ -947,10 +961,11 @@ def train_one_epoch(
                         images[: args.global_crops_number],
                         return_backbone_feat=need_teacher_features,
                         return_region_logits=ibot_loss.deep_region and ibot_loss.lambda3 != 0,
+                        region_weights=token_weights,
                     )
                     teacher_region_logits = None
                     teacher_region_targets = None
-                    if ibot_loss.deep_region and ibot_loss.lambda3 != 0:
+                    if (ibot_loss.deep_region or ibot_loss.region_token) and ibot_loss.lambda3 != 0:
                         *teacher_result, teacher_region_logits = teacher_result
                         if not need_teacher_features:
                             teacher_result = teacher_result[0]
@@ -972,7 +987,7 @@ def train_one_epoch(
                         teacher, images, ibot_loss, epoch
                     )
                     teacher_targets = get_teacher_targets(teacher_output, ibot_loss, epoch, center_accumulator)
-                    if teacher_region_logits is not None:
+                    if ibot_loss.deep_region and teacher_region_logits is not None:
                         teacher_region_targets = ibot_loss.deep_teacher_targets(
                             teacher_region_logits, teacher_targets[1],
                             ibot_loss.teacher_temp2_schedule[epoch],
@@ -983,9 +998,10 @@ def train_one_epoch(
                     mask=masks[: args.global_crops_number],
                     return_backbone_feat=need_student_features,
                     return_region_logits=ibot_loss.deep_region and ibot_loss.lambda3 != 0,
+                    region_weights=token_weights,
                 )
                 student_region_logits = None
-                if ibot_loss.deep_region and ibot_loss.lambda3 != 0:
+                if (ibot_loss.deep_region or ibot_loss.region_token) and ibot_loss.lambda3 != 0:
                     *student_result, student_region_logits = student_result
                     if not need_student_features:
                         student_result = student_result[0]

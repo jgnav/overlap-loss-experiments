@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .region_loss import RegionLoss
+from .region_token_loss import RegionTokenLoss
 from .local_region_loss import global_local_region_loss, multiview_region_loss, validate_region_views
 from .koleo_loss import KoLeoLoss
 from .patch_rank_distribution_loss import PatchRankDistributionLoss
@@ -76,6 +77,9 @@ class iBOTLoss(nn.Module):
         self.needs_local_patch_logits = region_views in ("global_local", "local") or loss_modality == "within_image"
         self.region_depths = tuple(region_depths)
         self.deep_region = region_normalization == "deep"
+        self.region_token = region_aggregation == "region_token"
+        if self.region_token and self.deep_region:
+            raise ValueError("region_token cannot be combined with deep region supervision")
         if self.deep_region:
             if len(self.region_depths) != 4 or tuple(sorted(set(self.region_depths))) != self.region_depths:
                 raise ValueError("Deep region loss requires four ordered, distinct region_depths")
@@ -89,13 +93,16 @@ class iBOTLoss(nn.Module):
             raise ValueError("koleo_regularizer must be a boolean")
         self.koleo_regularizer = koleo_regularizer
         self.koleo_loss = KoLeoLoss() if koleo_regularizer else None
-        self.region_loss = RegionLoss(
+        region_loss_class = RegionTokenLoss if self.region_token else RegionLoss
+        token_options = dict(out_dim=patch_out_dim, center_momentum=center_momentum2) if self.region_token else {}
+        self.region_loss = region_loss_class(
             region_min_area,
             region_patch_threshold,
             region_temp,
             "centering" if self.deep_region else region_normalization,
             student_temperature=student_temp,
             aggregation=region_aggregation,
+            **token_options,
         )
 
         self.teacher_temp_schedule = np.concatenate(
@@ -357,7 +364,16 @@ class iBOTLoss(nn.Module):
         else:
             if teacher_patch_logits is None and not self.deep_region:
                 raise ValueError("Active region loss requires raw teacher_patch_logits")
-            if self.deep_region:
+            if self.region_token:
+                if student_region_logits is None or teacher_region_logits is None:
+                    raise ValueError("region_token requires student and teacher regional logits")
+                region_stats = self.region_loss(
+                    student_region_logits.chunk(self.ngcrops),
+                    teacher_region_logits.detach().chunk(self.ngcrops),
+                    crop_boxes[:, :self.ngcrops],
+                    patch_count=raw_student_patch_c[0].shape[1],
+                )
+            elif self.deep_region:
                 levels = (student_region_logits, teacher_region_logits, teacher_region_targets)
                 if any(level is None or len(level) != len(self.region_depths) for level in levels):
                     raise ValueError("Deep region loss requires student logits, teacher logits and targets at every depth")

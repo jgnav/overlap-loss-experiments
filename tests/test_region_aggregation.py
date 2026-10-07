@@ -120,6 +120,10 @@ class RegionAggregationTest(unittest.TestCase):
             t = torch.randn(2, 4, 6).softmax(-1).requires_grad_()
             w = torch.tensor([[.1, 1., 0., .4]]).expand(2, -1)
             agg = RegionAggregation(method)
+            if method == 'region_token':
+                with self.assertRaisesRegex(ValueError, 'backbone features'):
+                    agg(s, t, w, w, s.sum((1, 2)) * 0)
+                continue
             result = agg(s, t, w, w, s.sum((1, 2)) * 0)
             perm = torch.tensor([3, 2, 0, 1])
             shuffled = agg(s[:, perm], t, w[:, perm], w, s.sum((1, 2)) * 0)
@@ -132,6 +136,9 @@ class RegionAggregationTest(unittest.TestCase):
     def test_all_methods_normalizations_and_empty_regions(self):
         torch.manual_seed(9)
         for method in METHODS:
+            if method == 'region_token':
+                # Learned feature aggregation has dedicated integration tests.
+                continue
             for mode in ('softmax', 'centering', 'sinkhorn', 'raw_logits'):
                 if method == 'hellinger' and mode == 'raw_logits':
                     with self.assertRaisesRegex(ValueError, 'probability distributions'):

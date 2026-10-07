@@ -64,7 +64,7 @@ def base_parser(description):
         "--classification-manifests", type=Path, default=None,
         help="Multilabel split/label JSON directory; defaults to <datasets-root>/evaluation_manifests",
     )
-    parser.add_argument("--video-protocol", choices=("dino_480p_last4", "dino_square_last4", "dinov3"), default="dinov3")
+    parser.add_argument("--video-protocol", choices=("dino_v1_480p", "dino_480p_last4", "dino_square_last4", "dinov3"), default="dinov3")
     parser.add_argument("--video-resolution", choices=("small", "medium", "large"), default="small")
     parser.add_argument("--video-feature-blocks", type=int, choices=(1, 4), default=4)
     parser.add_argument("--video-split-manifests-json", dest="video_split_manifests",
