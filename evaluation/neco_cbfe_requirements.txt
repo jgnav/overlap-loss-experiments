@@ -1,0 +1,8 @@
+# Additional dependencies for the isolated NeCo CBFE adapter environment.
+infomap==2.15.1
+optuna==4.5.0
+alembic==1.16.5
+sqlalchemy==2.0.43
+colorlog==6.9.0
+Mako==1.3.10
+greenlet==3.2.4

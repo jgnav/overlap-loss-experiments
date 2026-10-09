@@ -48,6 +48,7 @@ def evaluation_command(args, name, module, result_path):
         "--datasets-root", str(args.datasets_root), "--output-dir", str(args.output_dir),
         "--result-json", str(result_path), "--num-workers", str(args.num_workers),
         "--seed", str(args.seed), "--classification-manifests", str(args.classification_manifests),
+        "--multilabel-recipe", getattr(args, "multilabel_recipe", "bce"),
         "--video-protocol", getattr(args, "video_protocol", "dinov3"),
         "--video-resolution", getattr(args, "video_resolution", "small"),
         "--video-feature-blocks", str(getattr(args, "video_feature_blocks", 4)),
@@ -160,6 +161,23 @@ def _load_completed_result(path, args, evaluation_name):
         or result.get("evaluation_identity") != evaluation_identity(args)
     ):
         return None
+    classification_datasets = {
+        "pascal_voc_multilabel": "pascal_voc", "pascal_voc_1shot": "pascal_voc",
+        "pascal_voc_2shot": "pascal_voc", "pascal_voc_5shot": "pascal_voc",
+        "coco_multilabel": "coco", "visual_genome_multilabel": "visual_genome",
+    }
+    if evaluation_name in classification_datasets:
+        from evaluation.utils.classification import _protocol
+        if not model.get("architecture"):
+            return None
+        current = _protocol(classification_datasets[evaluation_name], model["architecture"], args.checkpoint_key,
+                            multilabel_recipe=getattr(args, "multilabel_recipe", "bce"),
+                            evaluation_name=evaluation_name)
+        saved = result.get("protocol", {})
+        # Check scientific settings as well as checkpoint/data identity. Old
+        # completed results must never bypass a changed evaluator on a requeue.
+        if any(saved.get(key) != value for key, value in current.items()):
+            return None
     if evaluation_name == "mose_vos":
         if (result.get("metrics_status") == "computed"
                 and result.get("protocol", {}).get("source") == "https://arxiv.org/abs/2508.10104v1"):

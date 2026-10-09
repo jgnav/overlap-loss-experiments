@@ -1,4 +1,4 @@
-# CRISP Table 3: stated paper settings with documented iBOT/local details.
+# iBOT-style multilabel linear probe, matched to the original-iBOT control.
 checkpoint: ../output/long_ibot_vit_small/85535_0/checkpoint_source1000_continuation0200.pth
 checkpoint_key: teacher
 arch: vit_small
@@ -10,6 +10,7 @@ classification_manifests: null
 output_dir: null
 result_json: null
 seed: 0
+multilabel_recipe: ibot
 num_workers: 4
 
 wandb_mode: offline
@@ -20,7 +21,11 @@ wandb_run_id: null
 wandb_resume: null
 
 # Omitted tasks are disabled. VOC probes use 500 epochs; COCO/VG use 200.
-# Frozen features, 4 GPUs x 256, 224 inputs, actual optimizer LR 0.001.
+# iBOT ViT-S last-four normalized CLS concatenation, train RRC(224) + flip,
+# val Resize(256) + CenterCrop(224), 4 GPUs x 256; SGD momentum 0.9,
+# weight decay 0, base LR 0.001 scaled to 0.004, cosine decay.
+# Local masked BCE/macro AP adaptation, final-epoch reporting.
+# Same settings for both models and all datasets; not an exact CRISP reproduction.
 evaluations:
   pascal_voc_1shot: true
   pascal_voc_2shot: true

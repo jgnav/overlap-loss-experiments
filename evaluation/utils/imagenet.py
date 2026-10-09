@@ -7,6 +7,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import datasets, transforms as T
+from evaluation.utils.online_probe_compatibility import online_probe_identity
 
 from evaluation.utils.common import (
     base_parser,
@@ -273,6 +274,7 @@ def run_imagenet_knn(args, evaluation_name="imagenet_knn"):
     percent = round(100 * fraction)
     started = utc_now()
     start_time = time.monotonic()
+    probe_identity = online_probe_identity(args, evaluation_name) if evaluation_name == "imagenet_knn" else None
     model, metadata = load_backbone(
         args.checkpoint, args.checkpoint_key, args.arch
     )
@@ -356,6 +358,8 @@ def run_imagenet_knn(args, evaluation_name="imagenet_knn"):
             "metrics": evaluations["20"],
             "metrics_by_neighbors": evaluations,
         }
+        if probe_identity is not None:
+            result["online_probe_identity"] = probe_identity
         write_json(args.result_json, result)
         print(
             f"ImageNet {percent}% k-NN (k=20): top-1={result['metrics']['top1']:.3f}, "

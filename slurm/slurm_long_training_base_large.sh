@@ -4,8 +4,7 @@
 # Array task 0: ViT-B, task 1: ViT-L.
 #SBATCH --job-name=ibot-long-bl
 #SBATCH --array=0-1
-#SBATCH --partition=a100,rtx_pro6000_risk
-#SBATCH --exclude=aisurrey37
+#SBATCH --partition=a100,rtx_pro6000_risk,rtx8000
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks=1
@@ -33,6 +32,14 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1 IBOT_SYNC_PROBES=1
 config_path="config/long_training/${configs[$SLURM_ARRAY_TASK_ID]}.yaml"
 echo "Training $config_path; run $IBOT_RUN_ID; Slurm restart ${SLURM_RESTART_COUNT:-0}"
 nvidia-smi
+# RTX 8000 (Turing) has FP16 Tensor Cores but no native BF16 support.
+# train.py accepts this precision override and retains the optimizer on resume.
+if nvidia-smi --query-gpu=name --format=csv,noheader | rg -q 'RTX 8000'; then
+    export IBOT_PRECISION_OVERRIDE=fp16
+    echo "RTX 8000: using FP16 with GradScaler"
+else
+    unset IBOT_PRECISION_OVERRIDE
+fi
 requeue_before_timeout() {
     trap - USR1
     echo "Requeueing $SLURM_JOB_ID before timeout; next launch restores the latest checkpoint"

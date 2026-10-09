@@ -36,16 +36,18 @@ def _distributed_probe_worker(rank, rendezvous):
         torch.manual_seed(4)
         head = torch.nn.Linear(3, 2)
         reference = copy.deepcopy(head)
-        ddp = torch.nn.parallel.DistributedDataParallel(head)
         inputs = torch.tensor([[0.2, 0.4, 0.6], [-0.1, 0.1, 0.3]])
         targets = torch.tensor([[1.0, -1.0], [0.0, 1.0]])
-        loss = classification.classification_loss(ddp(inputs[rank:rank + 1]), targets[rank:rank + 1], True)
-        loss.backward()
-        valid = targets >= 0
-        expected = F.binary_cross_entropy_with_logits(reference(inputs)[valid], targets[valid])
-        expected.backward()
-        torch.testing.assert_close(head.weight.grad, reference.weight.grad)
-        torch.testing.assert_close(head.bias.grad, reference.bias.grad)
+        ddp = torch.nn.parallel.DistributedDataParallel(head)
+        for loss_name in ("bce", "asymmetric"):
+            head.zero_grad()
+            reference.zero_grad()
+            loss = classification.classification_loss(ddp(inputs[rank:rank + 1]), targets[rank:rank + 1], True, loss_name)
+            loss.backward()
+            expected = classification.classification_loss(reference(inputs), targets, True, loss_name)
+            expected.backward()
+            torch.testing.assert_close(head.weight.grad, reference.weight.grad)
+            torch.testing.assert_close(head.bias.grad, reference.bias.grad)
 
         # Three validation samples cannot be evenly divided over two ranks.
         # The distributed result must equal AP on all three unique images.
@@ -324,6 +326,9 @@ class ClassificationTest(unittest.TestCase):
         backbone.get_intermediate_layers.return_value = [layers[-1]]
         features = classification.classification_features(backbone, torch.empty(0), "vit_base")
         torch.testing.assert_close(features, torch.cat([layers[-1][:, 0], layers[-1][:, 1:].mean(1)], dim=1))
+        features = classification.classification_features(backbone, torch.empty(0), "vit_small", True)
+        torch.testing.assert_close(features, torch.cat([layers[-1][:, 0], layers[-1][:, 1:].mean(1)], dim=1))
+        backbone.get_intermediate_layers.assert_called_with(mock.ANY, n=1)
 
     def test_unknown_labels_do_not_contribute_loss_or_gradient(self):
         logits = torch.tensor([[2.0, -3.0], [-1.0, 4.0]], requires_grad=True)
@@ -334,16 +339,32 @@ class ClassificationTest(unittest.TestCase):
         loss.backward()
         self.assertEqual(logits.grad[0, 1].item(), 0)
 
-    def test_crisp_linear_protocol_uses_actual_lr_and_full_data(self):
+    def test_asymmetric_loss_ignores_unknown_labels_and_clips_easy_negatives(self):
+        labels = torch.tensor([[1., -1.], [0., 1.]])
+        logits = torch.tensor([[2., -3.], [-20., 4.]], requires_grad=True)
+        value = classification.classification_loss(logits, labels, True, "asymmetric")
+        value.backward()
+        # gamma_pos=0 leaves positive BCE terms unchanged. A very easy negative
+        # is clipped to probability one, hence contributes no loss or gradient.
+        expected = (F.softplus(-logits[0, 0]) + F.softplus(-logits[1, 1])) / 3
+        torch.testing.assert_close(value, expected)
+        self.assertEqual(logits.grad[0, 1].item(), 0)
+        self.assertEqual(logits.grad[1, 0].item(), 0)
+        altered = logits.detach().clone()
+        altered[0, 1] = 100
+        torch.testing.assert_close(value.detach(), classification.classification_loss(altered, labels, True, "asymmetric"))
+
+    def test_crisp_linear_protocol_uses_explicit_multilabel_lr_and_full_data(self):
         for dataset, epochs in (("pascal_voc", 500), ("coco", 200), ("visual_genome", 200), ("imagenet", 200)):
             recipe = classification._protocol(dataset, "vit_small", "teacher", 4)
             self.assertEqual(recipe["epochs"], epochs)
-            self.assertEqual(recipe["learning_rate"], 0.001)
-            self.assertFalse(recipe["learning_rate_scaled_by_batch_size"])
+            self.assertEqual(recipe["base_learning_rate"], 0.001)
+            self.assertEqual(recipe["learning_rate"], 0.004 if dataset == "imagenet" else 0.001)
+            self.assertEqual(recipe["learning_rate_scaled_by_batch_size"], dataset == "imagenet")
             self.assertFalse(recipe["internal_training_holdout"])
             self.assertEqual(recipe["classifier"], "single linear layer")
 
-    def test_imagenet_linear_trains_the_head_with_unscaled_lr(self):
+    def test_imagenet_linear_trains_the_head_with_ibot_scaled_lr(self):
         # Exercise the configured ImageNet path through real SGD, CE training,
         # cosine scheduling and final validation without requiring CUDA.
         class CPUHead(torch.nn.Linear):
@@ -372,7 +393,7 @@ class ClassificationTest(unittest.TestCase):
         def cpu_epoch(*args):
             return real_epoch(*args[:6], "cpu", *args[7:])
         def cpu_evaluate(*args):
-            return real_evaluate(*args[:5], "cpu", args[6], 1, args[8])
+            return real_evaluate(*args[:5], "cpu", args[6], 1, *args[8:])
         with tempfile.TemporaryDirectory() as directory:
             args = SimpleNamespace(output_dir=Path(directory), result_json=Path(directory)/"results.json",
                                    checkpoint=Path(directory)/"encoder.pth", checkpoint_key="teacher",
@@ -390,7 +411,7 @@ class ClassificationTest(unittest.TestCase):
                  mock.patch.object(classification, "evaluate", side_effect=cpu_evaluate), \
                  mock.patch.object(classification.torch.optim, "SGD", wraps=torch.optim.SGD) as optimizer:
                 classification.run_classification(args, "imagenet", "imagenet_linear", 0, 4)
-            self.assertEqual(optimizer.call_args.kwargs["lr"], 0.001)
+            self.assertEqual(optimizer.call_args.kwargs["lr"], 0.004)
             result = json.loads(args.result_json.read_text())
             self.assertEqual(result["dataset_sizes"], {"train": 12, "test": 7})
             self.assertEqual(result["status"], "completed")
@@ -407,13 +428,34 @@ class ClassificationTest(unittest.TestCase):
         self.assertEqual(zero["map"], 0)
         self.assertEqual(zero["classes_without_validation_positives"], ["absent"])
 
+    def test_voc_precision_envelope_differs_from_noninterpolated_ap(self):
+        labels = np.array([[0], [1], [-1], [1], [0]])
+        scores = np.array([[5.0], [4.0], [100.0], [3.0], [2.0]])
+        voc = classification.multilabel_metrics(labels, scores, ["cat"], "pascal_voc")
+        coco = classification.multilabel_metrics(labels, scores, ["cat"], "coco")
+        self.assertAlmostEqual(voc["map"], 2 / 3)
+        self.assertAlmostEqual(coco["map"], 7 / 12)
+
+    def test_multilabel_resize_preserves_both_image_edges(self):
+        from PIL import Image
+        pixels = np.zeros((224, 448, 3), dtype=np.uint8)
+        pixels[:, :40] = 255
+        pixels[:, -40:] = 255
+        train, val = classification.classification_transforms(True)
+        image = Image.fromarray(pixels)
+        for transform in (train, val):
+            tensor = transform(image)
+            self.assertEqual(tuple(tensor.shape), (3, 224, 224))
+            self.assertTrue((tensor[:, :, 0] > 1).all())
+            self.assertTrue((tensor[:, :, -1] > 1).all())
+
     def test_probe_training_changes_head_but_not_backbone(self):
         for multilabel in (False, True):
             with self.subTest(multilabel=multilabel):
                 torch.manual_seed(1)
                 backbone = VisionTransformer(img_size=[32], patch_size=16, embed_dim=12, depth=4, num_heads=3).eval()
                 backbone.requires_grad_(False)
-                head = classification.linear_head(backbone, "vit_small", 2)
+                head = classification.linear_head(backbone, "vit_small", 2, multilabel)
                 images = torch.randn(8, 3, 32, 32)
                 labels = torch.arange(8) % 2
                 if multilabel:
@@ -431,6 +473,46 @@ class ClassificationTest(unittest.TestCase):
                     torch.testing.assert_close(value, before[key], rtol=0, atol=0)
                 self.assertFalse(backbone.training)
 
+    def test_ibot_multilabel_recipe_trains_and_evaluates_four_cls_features(self):
+        # Exercise feature selection through both training and validation, where
+        # confusing this recipe with whole-image CLS+patch pooling changes width.
+        torch.manual_seed(1)
+        backbone = VisionTransformer(img_size=[32], patch_size=16, embed_dim=12,
+                                     depth=4, num_heads=3).eval()
+        backbone.requires_grad_(False)
+        images = torch.randn(5, 3, 32, 32)
+        labels = torch.tensor([[1., 0.], [0., 1.], [1., -1.], [0., 0.], [1., 1.]])
+        dataset = TensorDataset(images, labels)
+        dataset.classes = ["cat", "dog"]
+        recipe = classification._protocol("pascal_voc", "vit_small", "teacher",
+                                          multilabel_recipe="ibot", evaluation_name="pascal_voc_1shot")
+        self.assertEqual(recipe["learning_rate"], 0.004)
+        self.assertEqual(recipe["weight_decay"], 0.)
+        self.assertEqual(recipe["epochs"], 500)
+        self.assertEqual(recipe["shots_per_class"], 1)
+        train_transform, val_transform = classification.classification_transforms(True, "ibot")
+        self.assertEqual(type(train_transform.transforms[0]).__name__, "RandomResizedCrop")
+        self.assertEqual(type(val_transform.transforms[1]).__name__, "CenterCrop")
+        head = classification.linear_head(backbone, "vit_small", 2, True, "ibot")
+        self.assertEqual(head.in_features, 4 * backbone.embed_dim)
+        before = {name: tensor.clone() for name, tensor in backbone.state_dict().items()}
+        head_before = head.weight.detach().clone()
+        optimizer = torch.optim.SGD(head.parameters(), lr=recipe["learning_rate"],
+                                    momentum=recipe["momentum"], weight_decay=recipe["weight_decay"])
+        classification.train_epoch(backbone, head, optimizer, DataLoader(dataset, batch_size=3),
+                                   "vit_small", True, "cpu", 0, 1, "bce", "ibot")
+        self.assertFalse(torch.equal(head_before, head.weight))
+        for name, tensor in backbone.state_dict().items():
+            torch.testing.assert_close(tensor, before[name], rtol=0, atol=0)
+        layers = backbone.get_intermediate_layers(images, n=4)
+        expected_features = torch.cat([layer[:, 0] for layer in layers], dim=-1)
+        expected_scores = head(expected_features).detach().numpy()
+        expected = classification.multilabel_metrics(labels.numpy(), expected_scores, dataset.classes)
+        actual = classification.evaluate(backbone, head, dataset, "vit_small", True,
+                                         "cpu", 0, 1, 0, "pascal_voc", "ibot")
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual["ap_definition"], "non-interpolated average precision")
+
     def test_distributed_gradients_and_uneven_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             torch.multiprocessing.start_processes(
@@ -440,6 +522,56 @@ class ClassificationTest(unittest.TestCase):
 
 
 class OrchestrationTest(unittest.TestCase):
+    def test_few_shot_metadata_is_accepted_and_recipe_changes_are_rejected(self):
+        # Regression: the producer added a few-shot validation_split string
+        # which the consumer previously compared with the full-data string.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "model.pth"
+            checkpoint.write_bytes(b"fixture")
+            args = SimpleNamespace(checkpoint=checkpoint, checkpoint_key="teacher", seed=0,
+                                   arch="vit_small", datasets_root=root, multilabel_recipe="asl224")
+            path = root / "result.json"
+            for name in ("pascal_voc_1shot", "pascal_voc_2shot", "pascal_voc_5shot"):
+                recipe = classification._protocol("pascal_voc", "vit_small", "teacher",
+                                                   multilabel_recipe="asl224", evaluation_name=name)
+                result = {"status": "completed", "evaluation": name,
+                          "model": {"checkpoint_fingerprint": checkpoint_fingerprint(checkpoint),
+                                    "checkpoint_key": "teacher", "architecture": "vit_small"},
+                          "evaluation_identity": evaluation_identity(args), "protocol": recipe}
+                path.write_text(json.dumps(result))
+                self.assertIsNotNone(orchestrator._load_completed_result(path, args, name))
+                for key, value in (("learning_rate", 0.001), ("weight_decay", 0.), ("loss", "masked binary cross entropy"),
+                                   ("shots_per_class", 99)):
+                    changed = copy.deepcopy(result)
+                    changed["protocol"][key] = value
+                    path.write_text(json.dumps(changed))
+                    self.assertIsNone(orchestrator._load_completed_result(path, args, name))
+
+    def test_completed_multilabel_results_require_current_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "model.pth"
+            checkpoint.write_bytes(b"fixture")
+            args = SimpleNamespace(checkpoint=checkpoint, checkpoint_key="teacher", seed=0,
+                                   arch="vit_small", datasets_root=root)
+            recipe = classification._protocol("pascal_voc", "vit_small", "teacher")
+            result = {
+                "status": "completed", "evaluation": "pascal_voc_multilabel",
+                "model": {"checkpoint_fingerprint": checkpoint_fingerprint(checkpoint),
+                          "checkpoint_key": "teacher", "architecture": "vit_small"},
+                "evaluation_identity": evaluation_identity(args), "protocol": recipe,
+            }
+            path = root / "result.json"
+            path.write_text(json.dumps(result))
+            self.assertIsNotNone(orchestrator._load_completed_result(path, args, "pascal_voc_multilabel"))
+            for key, value in (("protocol_version", 4), ("learning_rate", 0.004),
+                               ("metric", "macro average precision (non-interpolated)")):
+                old = copy.deepcopy(result)
+                old["protocol"][key] = value
+                path.write_text(json.dumps(old))
+                self.assertIsNone(orchestrator._load_completed_result(path, args, "pascal_voc_multilabel"))
+
     def test_table_keeps_segmentation_and_multilabel_tasks_separate(self):
         results = {
             "pascal_voc_linear": {"metrics": {"miou": 0.6}},

@@ -1,0 +1,24 @@
+{
+  "neco": {
+    "commit": "393216026b4d045e2e0b803f70a7d89d9a58937e",
+    "repository": "https://github.com/vpariza/NeCo",
+    "vendored_parts": [
+      "data",
+      "src",
+      "experiments",
+      "LICENSE",
+      "README.md",
+      "EVALUATION.md"
+    ]
+  },
+  "hummingbird": {
+    "commit": "0fd976fc38e4cc295a689295fbf3e7e6be8016a0",
+    "repository": "https://github.com/vpariza/open-hummingbird-eval",
+    "vendored_parts": [
+      "hbird",
+      "file_sets",
+      "LICENSE",
+      "README.md"
+    ]
+  }
+}

@@ -16,7 +16,8 @@ from types import SimpleNamespace
 from evaluation.utils.common import REPO_ROOT, utc_now, write_json
 from evaluation.utils.datasets import make_pascal_voc
 from evaluation.utils.imagenet import _resolve_imagenet_root
-from evaluation.utils.orchestrator import EVALUATIONS, _load_completed_result, evaluation_command
+from evaluation.utils.orchestrator import EVALUATIONS, evaluation_command
+from evaluation.utils.online_probe_compatibility import load_online_probe_result
 from evaluation.utils.runtime import worker_environment
 
 
@@ -103,7 +104,7 @@ def run_probe_checkpoint(checkpoint, datasets_root, output, arch="auto", seed=0,
     for name in ONLINE_EVALUATIONS:
         path = task_root / f"{name}.json"
         try:
-            result = _load_completed_result(path, args, name)
+            result = load_online_probe_result(path, args, name)
             if result is None:
                 print(f"Online epoch {epoch}: starting offline protocol {name}", flush=True)
                 completed = subprocess.run(
@@ -112,7 +113,7 @@ def run_probe_checkpoint(checkpoint, datasets_root, output, arch="auto", seed=0,
                 )
                 if completed.returncode != 0:
                     raise RuntimeError(f"{name} exited with status {completed.returncode}")
-                result = _load_completed_result(path, args, name)
+                result = load_online_probe_result(path, args, name)
                 if result is None:
                     raise RuntimeError(f"{name} did not produce a compatible completed result JSON")
             results[name] = result
@@ -151,6 +152,19 @@ def immutable_checkpoint_copy(source, destination):
     return destination
 
 
+def probe_record(epoch, result):
+    record = {"online_probe_epoch": epoch,
+              "online_probe_success": int(result["status"] == "completed")}
+    for name in ONLINE_EVALUATIONS:
+        task = result.get("evaluations", {}).get(name)
+        record[f"online_{name}_success"] = int(task is not None and task.get("status") == "completed")
+        if task:
+            for metric, value in task.get("metrics", {}).items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    record[f"online_{name}_{metric}"] = float(value)
+    return record
+
+
 class OnlineProbeRunner:
     """Queue each scheduled epoch and bound the number of active workers."""
 
@@ -170,7 +184,7 @@ class OnlineProbeRunner:
             for line in metrics_path.read_text(encoding="utf-8").splitlines():
                 try:
                     record = json.loads(line)
-                    reported[record["online_probe_epoch"]] = record["online_probe_success"]
+                    reported[record["online_probe_epoch"]] = record
                 except (ValueError, KeyError, TypeError):
                     continue
         for path in sorted(root.glob("epoch[0-9][0-9][0-9][0-9].json")):
@@ -184,7 +198,7 @@ class OnlineProbeRunner:
                 continue
             self.submitted_results.append((epoch, path))
             self.submitted_epochs.add(epoch)
-            if reported.get(epoch) == int(status == "completed"):
+            if reported.get(epoch) == probe_record(epoch, result):
                 self.completed_results.add(path)
 
     def _reap(self):
@@ -264,17 +278,9 @@ class OnlineProbeRunner:
                 continue
             if result.get("status") not in {"completed", "failed"}:
                 continue
-            record = {"online_probe_epoch": epoch,
-                      "online_probe_success": int(result["status"] == "completed")}
+            record = probe_record(epoch, result)
             if result["status"] == "failed":
                 print(f"Online probes: FAILED epoch {epoch}: {result.get('error', 'unknown error')}", flush=True)
-            for name in ONLINE_EVALUATIONS:
-                task = result.get("evaluations", {}).get(name)
-                record[f"online_{name}_success"] = int(task is not None and task.get("status") == "completed")
-                if task:
-                    for metric, value in task.get("metrics", {}).items():
-                        if isinstance(value, (int, float)) and not isinstance(value, bool):
-                            record[f"online_{name}_{metric}"] = float(value)
             records.append(record)
             self.completed_results.add(path)
             if result["status"] == "completed" and getattr(

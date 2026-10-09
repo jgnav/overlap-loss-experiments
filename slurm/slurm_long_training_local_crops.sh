@@ -3,15 +3,14 @@
 #   sbatch slurm/slurm_long_training_local_crops.sh
 
 #SBATCH --job-name=ibot-long-local-crops
-#SBATCH --partition=a100,rtx_pro6000_risk
-#SBATCH --exclude=aisurrey37
+#SBATCH --partition=a100,rtx_pro6000_risk,rtx8000
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=128G
 #SBATCH --time=3-00:00:00
-#SBATCH --nice=1000
+#SBATCH --nice=0
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@600
 #SBATCH --open-mode=append

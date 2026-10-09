@@ -60,6 +60,7 @@ def base_parser(description):
     parser.add_argument("--result-json", type=Path, default=None)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--multilabel-recipe", choices=("bce", "asl224", "asl224_lr001", "ibot"), default="bce")
     parser.add_argument("--correspondence-feature-variant", default="raw_final",
                         choices=("raw_final", "final_norm_standardized", "projection", "projection_softmax", "concat_4_6_8_12"))
     parser.add_argument("--correspondence-softmax-temperature", type=float, default=1.0)
@@ -147,6 +148,7 @@ def evaluation_identity(args):
         "version": 2,
         "source_sha256": digest.hexdigest(),
         "seed": args.seed,
+        "multilabel_recipe": getattr(args, "multilabel_recipe", "bce"),
         "correspondence_feature_variant": getattr(args, "correspondence_feature_variant", "raw_final"),
         "correspondence_softmax_temperature": getattr(args, "correspondence_softmax_temperature", 1.0),
         "architecture_argument": args.arch,

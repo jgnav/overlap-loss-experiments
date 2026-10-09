@@ -1,0 +1,14 @@
+data_root: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets/neco_eval
+ade20k: /mnt/fast/nobackup/scratch4weeks/jg02228/datasets/ade20k/ADEChallengeData2016
+models:
+  ibot_original: checkpoints/ibot_vit_small.pth
+  region200: output/long_ibot_vit_small/85535_0/checkpoint_source1000_continuation0200.pth
+evaluations: [clustering, fully_unsupervised]
+clustering:
+  clusters: [300]
+fully_unsupervised:
+  cache_root: /mnt/fast/nobackup/scratch4weeks/jg02228/neco_cbfe_cache
+  attention_mass: 0.70
+  k_community: 189
+  markov_time: 1.2
+  weight_threshold: 0.07

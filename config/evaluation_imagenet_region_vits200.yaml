@@ -17,7 +17,7 @@ wandb_resume: null
 
 # k-NN: fixed SimCLRv2 1%/10% banks and all training images for 100%;
 # final CLS, cosine similarity, temperature 0.07, primary k=20.
-# Linear: 4 GPUs x 256, 224 inputs, 200 epochs, actual optimizer LR 0.001.
+# Linear: 4 GPUs x 256, 224 inputs, 200 epochs, iBOT-scaled optimizer LR 0.004.
 # One frozen linear probe, all training images, full official validation set.
 # Unlisted evaluations are disabled.
 evaluations:

@@ -1,4 +1,4 @@
-# Control for the CRISP Table 3 VOC results using the original iBOT initialization.
+# Matched VOC/COCO/VG control using the original iBOT initialization.
 # Same evaluator/protocol as evaluation_multilabel_region_vits200.yaml.
 checkpoint: ../checkpoints/ibot_vit_small.pth
 checkpoint_key: teacher
@@ -9,6 +9,7 @@ classification_manifests: null
 output_dir: null
 result_json: null
 seed: 0
+multilabel_recipe: ibot
 num_workers: 4
 
 wandb_mode: offline
@@ -18,10 +19,15 @@ wandb_run_name: ibot-original-multilabel-control
 wandb_run_id: null
 wandb_resume: null
 
-# VOC probes: 500 epochs, frozen last-four CLS features, 4 GPUs x 256.
-# Actual optimizer LR 0.001 without scaling; unpublished CRISP details unverified.
+# VOC: 500 epochs; COCO/VG: 200; 4 GPUs x 256. iBOT ViT-S last-four
+# normalized CLS concatenation, train RandomResizedCrop(224) + flip,
+# val Resize(256) + CenterCrop(224), SGD momentum 0.9, weight decay 0,
+# base LR 0.001 scaled to 0.004, cosine decay. Local masked BCE/macro AP
+# adaptation and final-epoch reporting; not an exact CRISP reproduction.
 evaluations:
   pascal_voc_1shot: true
   pascal_voc_2shot: true
   pascal_voc_5shot: true
   pascal_voc_multilabel: true
+  coco_multilabel: true
+  visual_genome_multilabel: true

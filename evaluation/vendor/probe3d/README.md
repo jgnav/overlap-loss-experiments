@@ -1,5 +1,11 @@
 # Probe3D dataset readers
 
+`evaluate_spair_correspondence.py` and `configs/spair_correspondence.yaml` are
+also copied verbatim from the same upstream commit. `evaluation/spair_neco.py`
+uses the released `compute_errors` matcher for NeCo's stated 224-pixel SPair
+evaluation, and reports the paper-caption threshold 0.01 separately from the
+upstream default 0.1.
+
 `evals/datasets/{spair,navi,scannet_pairs,utils}.py` are vendored from
 [mbanani/probe3d](https://github.com/mbanani/probe3d), commit
 `a1f14640076e38b8bc07b66d0fe2d01d15691e9d`, under the adjacent MIT

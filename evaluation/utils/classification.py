@@ -29,7 +29,7 @@ from evaluation.utils.imagenet import IMAGENET_NORMALIZE, _resolve_imagenet_root
 REFERENCE_GPU_COUNT = 4
 BATCH_SIZE_PER_GPU = 256
 GLOBAL_BATCH_SIZE = REFERENCE_GPU_COUNT * BATCH_SIZE_PER_GPU
-LEARNING_RATE = 0.001
+BASE_LEARNING_RATE = 0.001
 
 
 def require_crisp_gpus(world_size):
@@ -40,7 +40,14 @@ def require_crisp_gpus(world_size):
         )
 
 
-def classification_transforms():
+def classification_transforms(multilabel=False, multilabel_recipe="bce"):
+    if multilabel and multilabel_recipe != "ibot":
+        # Image-level labels refer to the whole image, including edge objects.
+        resize = lambda: T.Resize((224, 224), interpolation=T.InterpolationMode.BICUBIC)
+        return (
+            T.Compose([resize(), T.RandomHorizontalFlip(), T.ToTensor(), IMAGENET_NORMALIZE]),
+            T.Compose([resize(), T.ToTensor(), IMAGENET_NORMALIZE]),
+        )
     # Original iBOT linear-probe transforms (training RRC uses bilinear).
     train = T.Compose([
         T.RandomResizedCrop(224), T.RandomHorizontalFlip(),
@@ -53,7 +60,11 @@ def classification_transforms():
     return train, val
 
 
-def feature_spec(architecture):
+def feature_spec(architecture, multilabel=False, multilabel_recipe="bce"):
+    if architecture not in ("vit_small", "vit_base", "vit_large"):
+        raise ValueError(f"Unsupported linear-probe architecture: {architecture}")
+    if multilabel and multilabel_recipe != "ibot":
+        return 1, True
     if architecture == "vit_small":
         return 4, False
     if architecture in ("vit_base", "vit_large"):
@@ -62,8 +73,8 @@ def feature_spec(architecture):
 
 
 @torch.no_grad()
-def classification_features(backbone, images, architecture):
-    n, average_patches = feature_spec(architecture)
+def classification_features(backbone, images, architecture, multilabel=False, multilabel_recipe="bce"):
+    n, average_patches = feature_spec(architecture, multilabel, multilabel_recipe)
     layers = backbone.get_intermediate_layers(images, n=n)
     vectors = [layer[:, 0].float() for layer in layers]
     if average_patches:
@@ -71,19 +82,31 @@ def classification_features(backbone, images, architecture):
     return torch.cat(vectors, dim=-1)
 
 
-def linear_head(backbone, architecture, num_classes):
-    n, average_patches = feature_spec(architecture)
+def linear_head(backbone, architecture, num_classes, multilabel=False, multilabel_recipe="bce"):
+    n, average_patches = feature_spec(architecture, multilabel, multilabel_recipe)
     head = nn.Linear(backbone.embed_dim * (n + int(average_patches)), num_classes)
     nn.init.normal_(head.weight, std=0.01)
     nn.init.zeros_(head.bias)
     return head
 
 
-def classification_loss(logits, targets, multilabel):
+def classification_loss(logits, targets, multilabel, loss_name="bce"):
     if not multilabel:
         return F.cross_entropy(logits, targets)
     known = targets >= 0
-    losses = F.binary_cross_entropy_with_logits(logits, targets.clamp_min(0), reduction="none")
+    truth = targets.clamp_min(0)
+    if loss_name == "asymmetric":
+        positive = logits.sigmoid()
+        negative = (1 - positive + 0.05).clamp(max=1)
+        # Match the tested ASL recipe: gamma_pos=0, gamma_neg=4, detached
+        # focal weights. Unknown labels are masked after computing elements.
+        focal = (1 - (positive * truth + negative * (1 - truth))).pow(4 * (1 - truth)).detach()
+        losses = -(truth * positive.clamp_min(1e-8).log()
+                   + (1 - truth) * negative.clamp_min(1e-8).log()) * focal
+    elif loss_name == "bce":
+        losses = F.binary_cross_entropy_with_logits(logits, truth, reduction="none")
+    else:
+        raise ValueError(f"Unknown multilabel loss: {loss_name}")
     # Normalize over known labels globally, even if ranks have different numbers
     # of difficult/unknown entries. DDP averages parameter gradients across ranks.
     count = known.sum().to(logits.dtype)
@@ -95,7 +118,27 @@ def classification_loss(logits, targets, multilabel):
     return (losses * known).sum() * world_size / count
 
 
-def multilabel_metrics(targets, scores, classes):
+def voc2012_average_precision(truth, scores):
+    """VOC2010+ precision-envelope AP; inputs contain only known labels.
+
+    Stable score sorting preserves input order for exact ties. AP integrates
+    all recall changes, rather than VOC2007's eleven-point approximation.
+    """
+    positive = np.asarray(truth)[np.argsort(-np.asarray(scores), kind="stable")] == 1
+    count = positive.sum()
+    if count == 0:
+        return 0.0
+    tp = np.cumsum(positive)
+    recall = tp / count
+    precision = tp / np.arange(1, len(positive) + 1)
+    recall = np.r_[0.0, recall, 1.0]
+    precision = np.r_[0.0, precision, 0.0]
+    precision = np.maximum.accumulate(precision[::-1])[::-1]
+    changes = np.flatnonzero(recall[1:] != recall[:-1])
+    return float(np.sum((recall[changes + 1] - recall[changes]) * precision[changes + 1]))
+
+
+def multilabel_metrics(targets, scores, classes, dataset_name=None):
     targets, scores = np.asarray(targets), np.asarray(scores)
     if targets.shape != scores.shape or targets.ndim != 2 or targets.shape[1] != len(classes):
         raise ValueError("Targets, predictions, and class vocabulary have incompatible shapes")
@@ -114,18 +157,24 @@ def multilabel_metrics(targets, scores, classes):
             ap = 0.0
             no_positives.append(name)
         else:
-            ap = float(average_precision_score(truth, scores[known, index]))
+            ap = (voc2012_average_precision(truth, scores[known, index])
+                  if dataset_name == "pascal_voc"
+                  else float(average_precision_score(truth, scores[known, index])))
         per_class[name] = ap
     mean_ap = float(np.mean(list(per_class.values())))
     return {
         "map": mean_ap, "map_percent": 100.0 * mean_ap,
         "average_precision_by_class": per_class,
         "classes_without_validation_positives": no_positives,
+        "ap_definition": ("VOC2010+ all-points interpolated precision-envelope AP"
+                          if dataset_name == "pascal_voc" else "non-interpolated average precision"),
     }
 
 
 def _make_datasets(args, dataset_name):
-    train_transform, val_transform = classification_transforms()
+    train_transform, val_transform = classification_transforms(
+        dataset_name in MULTILABEL_DATASETS, getattr(args, "multilabel_recipe", "bce"),
+    )
     if dataset_name in MULTILABEL_DATASETS:
         return make_multilabel_datasets(args, dataset_name, train_transform, val_transform)
     if dataset_name != "imagenet":
@@ -138,23 +187,26 @@ def _make_datasets(args, dataset_name):
     return train, val, {"root": str(root), "classes": train.classes, "training_fraction": 1.0}
 
 
-def _protocol(dataset_name, architecture, checkpoint_key, world_size=REFERENCE_GPU_COUNT):
+def _protocol(dataset_name, architecture, checkpoint_key, world_size=REFERENCE_GPU_COUNT,
+              multilabel_recipe="bce", evaluation_name=None):
     require_crisp_gpus(world_size)
     multilabel = dataset_name != "imagenet"
     epochs = MULTILABEL_DATASETS[dataset_name]["epochs"] if multilabel else 200
-    n, average_patches = feature_spec(architecture)
-    return {
+    n, average_patches = feature_spec(architecture, multilabel, multilabel_recipe)
+    global_batch_size = BATCH_SIZE_PER_GPU * world_size
+    protocol = {
         "source": "CRISP Tables 3/4 and Appendix A.2",
-        "protocol_version": 3,
-        "equivalence": "All explicitly stated CRISP classification settings; unpublished details use documented iBOT/local choices",
+        "protocol_version": 4,
+        "equivalence": "CRISP's stated resolution, GPU count, batch size and epochs; LR convention and unpublished details remain unverified",
         "protocol_precedence": ["CRISP", "iBOT", "documented local choices"],
         "input_resolution": 224, "gpu_count": world_size,
         "batch_size_per_gpu": BATCH_SIZE_PER_GPU,
-        "global_batch_size": GLOBAL_BATCH_SIZE,
+        "global_batch_size": global_batch_size,
         "feature_microbatch_size": BATCH_SIZE_PER_GPU,
-        "learning_rate": LEARNING_RATE,
-        "learning_rate_scaled_by_batch_size": False,
-        "learning_rate_interpretation": "Actual initial optimizer LR 0.001 as stated in CRISP Appendix A.2; no batch scaling",
+        "base_learning_rate": BASE_LEARNING_RATE,
+        "learning_rate": BASE_LEARNING_RATE * global_batch_size / 256,
+        "learning_rate_scaled_by_batch_size": True,
+        "learning_rate_interpretation": "Base LR 0.001 scaled by configured global batch size / 256, following the original iBOT evaluator; CRISP's LR convention remains unpublished",
         "epochs": epochs,
         "backbone_frozen": True, "checkpoint_key": checkpoint_key,
         "classifier": "single linear layer",
@@ -169,31 +221,144 @@ def _protocol(dataset_name, architecture, checkpoint_key, world_size=REFERENCE_G
         "validation_split": "full evaluation split from the dataset manifest" if multilabel else "full official ImageNet-1K validation set",
         "internal_training_holdout": False,
         "setting_sources": {
-            "epochs_resolution_gpu_batch_actual_lr": "CRISP Appendix A.2",
+            "epochs_resolution_gpu_batch_base_lr": "CRISP Appendix A.2; base-LR interpretation uses the original iBOT scaling rule",
             "pooling_optimizer_schedule_transforms_initialization": "Original iBOT linear evaluator; CAPI has no released VOC/COCO/VG multilabel protocol",
             "loss_ap_difficult_labels_split_final_epoch": "Documented local choices; absent from applicable released protocols",
         },
         "metric": "macro average precision (non-interpolated)" if multilabel else "top-1/top-5 accuracy",
         "implementation_choices_not_specified_by_papers": [
             "iBOT architecture-dependent feature pooling, SGD/momentum/weight decay, cosine schedule, augmentation, and head initialization",
+            "CRISP's reported LR 0.001 is interpreted as base LR and scaled by global batch size / 256, following the original iBOT evaluator",
             "multilabel masked BCE, unknown-label handling, and non-interpolated macro AP",
             "final-epoch reporting instead of selecting an epoch on the evaluation set",
             "dataset versions, split membership, and label vocabulary are supplied by input manifests",
         ],
     }
+    if multilabel and multilabel_recipe != "ibot":
+        protocol.update({
+            "protocol_version": 5,
+            "source": "CRISP multilabel representation and budget; official VOC2012 AP; documented fixed completion choices",
+            "equivalence": "Reproducible agreed benchmark protocol; CRISP's unpublished details and split lists are not claimed identical",
+            "protocol_precedence": ["CRISP", "official PASCAL VOC", "iBOT optimizer fallback", "documented local choices"],
+            "learning_rate": BASE_LEARNING_RATE,
+            "learning_rate_scaled_by_batch_size": False,
+            "learning_rate_interpretation": "Effective initial LR 0.001, without automatic batch scaling; agreed explicit interpretation of CRISP A.2",
+            "feature": {"concatenated_cls_blocks": 1, "append_mean_patch_tokens": True,
+                        "normalization": "final backbone LayerNorm", "projection_head": False,
+                        "l2_normalization": False, "softmax": False, "standard_scaler": False},
+            "loss_reduction": "mean over all known image-class entries across ranks",
+            "train_transform": "Resize(entire image to 224x224, bicubic), horizontal flip, ImageNet normalization",
+            "val_transform": "Resize(entire image to 224x224, bicubic), ImageNet normalization; no test-time augmentation",
+            "metric": ("macro VOC2010+ all-points interpolated precision-envelope AP"
+                       if dataset_name == "pascal_voc" else "macro average precision (non-interpolated)"),
+            "setting_sources": {
+                "epochs_resolution_gpu_batch": "CRISP Table 3 and Appendix A.2",
+                "pooling": "Documented local choice: final-LayerNorm CLS concatenated with mean final patch tokens; pooling is not specified in the supplied CRISP PDF",
+                "voc_ap_difficult_labels": "Official VOC2012 classification devkit",
+                "optimizer_schedule_initialization": "Original iBOT linear evaluator fallback",
+                "resize_effective_lr_bce_splits_seed_final_epoch": "Agreed explicit benchmark choices where CRISP is incomplete",
+            },
+            "implementation_choices_not_specified_by_papers": [
+                "whole-image bicubic square resize; horizontal flip only during training",
+                "effective initial learning rate 0.001 without batch scaling",
+                "final-block, final-LayerNorm CLS and patch tokens before projection; no L2/softmax/scaler",
+                "SGD/momentum/weight decay, cosine schedule, linear-head initialization, known-label mean BCE",
+                "final-epoch reporting; fixed dataset manifests and seed; few-shot overlap handling",
+            ],
+        })
+        if multilabel_recipe in ("asl224", "asl224_lr001"):
+            protocol.update({
+                "protocol_version": 6,
+                "source": "CRISP stated resolution/budget with the exploratory original-iBOT VOC-selected ASL recipe",
+                "equivalence": "Explicit local benchmark recipe; not a recovered CRISP protocol",
+                "base_learning_rate": 0.04,
+                "learning_rate": 0.04,
+                "learning_rate_interpretation": "Effective LR 0.04 selected in the fixed-feature VOC224 sweep; no batch scaling",
+                "weight_decay": 0.01,
+                "weight_decay_scope": "all linear-head parameters, including bias, matching the sweep",
+                "loss": "asymmetric",
+                "asymmetric_loss": {"gamma_negative": 4, "gamma_positive": 0,
+                                    "probability_clip": 0.05, "detach_focal_weights": True,
+                                    "log_epsilon": 1e-8},
+                "selection_note": "LR/loss/decay were selected using original-iBOT VOC validation scores; identical settings transferred to both models and all three datasets. Not an independent validation benchmark.",
+                "selection_result": "output/analysis/voc_data_protocol_20261008/asl224/results.json",
+            })
+            protocol["implementation_choices_not_specified_by_papers"] = [
+                "whole-image bicubic square resize; horizontal flip only during training",
+                "fixed VOC-selected effective LR 0.04, SGD momentum 0.9 and weight/bias decay 0.01",
+                "ASL gamma_neg=4, gamma_pos=0, clip=0.05, detached focal weights; globally known-label mean",
+                "final-block, final-LayerNorm CLS and patch tokens before projection; no L2/softmax/scaler",
+                "final-epoch reporting; fixed dataset manifests and seed; few-shot overlap handling",
+            ]
+            protocol["setting_sources"]["optimizer_schedule_initialization"] = "VOC224 sweep-selected SGD/decay; iBOT cosine schedule and linear initialization"
+            protocol["setting_sources"].pop("resize_effective_lr_bce_splits_seed_final_epoch")
+            protocol["setting_sources"]["resize_lr_asl_splits_seed_final_epoch"] = "Explicit local choices; VOC validation sweep selection recorded above"
+            if multilabel_recipe == "asl224_lr001":
+                protocol.update({
+                    "protocol_version": 7,
+                    "source": "CRISP stated resolution, budget and effective LR 0.001; retained local ASL/SGD recipe",
+                    "base_learning_rate": BASE_LEARNING_RATE,
+                    "learning_rate": BASE_LEARNING_RATE,
+                    "learning_rate_interpretation": "Effective initial LR 0.001 from CRISP A.2, without batch scaling; user-requested replacement of the exploratory LR 0.04",
+                    "selection_note": "LR 0.001 follows the paper as requested. Loss and weight decay retain the earlier VOC-selected settings; unpublished CRISP details remain unverified.",
+                })
+                protocol["implementation_choices_not_specified_by_papers"][1] = "SGD momentum 0.9 and weight/bias decay 0.01 retained from the earlier VOC-selected recipe"
+                protocol["setting_sources"]["learning_rate"] = "CRISP Appendix A.2, interpreted as effective LR 0.001 without batch scaling"
+        elif multilabel_recipe != "bce":
+            raise ValueError(f"Unknown multilabel recipe: {multilabel_recipe}")
+        protocol["multilabel_recipe"] = multilabel_recipe
+        shots = VOC_SHOT_EVALUATIONS.get(evaluation_name)
+        if shots is not None:
+            if dataset_name != "pascal_voc":
+                raise ValueError("VOC few-shot evaluation requires PASCAL VOC")
+            protocol.update(shots_per_class=shots,
+                            validation_split="full original classification validation set")
+    if multilabel and multilabel_recipe == "ibot":
+        protocol.update({
+            "protocol_version": 8,
+            "multilabel_recipe": "ibot",
+            "source": "Original iBOT ImageNet linear evaluator adapted to multilabel classification",
+            "equivalence": "iBOT features, transforms, SGD and LR scaling; local masked BCE/mAP adaptation, CRISP epoch budget and final-epoch reporting",
+            "protocol_precedence": ["iBOT linear evaluator", "CRISP epoch budget", "documented multilabel adaptation"],
+            "learning_rate_interpretation": "iBOT base LR 0.001 scaled by global batch size / 256",
+            "feature": {"concatenated_cls_blocks": n, "append_mean_patch_tokens": average_patches,
+                        "normalization": "backbone LayerNorm applied to each selected block",
+                        "projection_head": False, "l2_normalization": False,
+                        "softmax": False, "standard_scaler": False},
+            "loss_reduction": "mean over all known image-class entries across ranks",
+            "crop_label_handling": "Image-level labels retained after cropping; no bounding-box relabeling",
+            "setting_sources": {
+                "features_transforms_optimizer_lr_schedule_initialization": "https://github.com/bytedance/ibot/blob/main/evaluation/eval_linear.py",
+                "epochs_gpu_batch": "CRISP Appendix A.2: VOC 500 epochs, COCO/VG 200; 4 GPUs x 256",
+                "bce_ap_difficult_labels_splits_seed_final_epoch": "Documented local multilabel adaptation; original iBOT uses multiclass CE and best validation accuracy",
+            },
+            "implementation_choices_not_specified_by_papers": [
+                "masked BCE and non-interpolated macro AP for multilabel classification",
+                "final-epoch reporting; fixed dataset manifests and seed; few-shot overlap handling",
+                "image-level labels retained after random and center crops",
+            ],
+        })
+        shots = VOC_SHOT_EVALUATIONS.get(evaluation_name)
+        if shots is not None:
+            if dataset_name != "pascal_voc":
+                raise ValueError("VOC few-shot evaluation requires PASCAL VOC")
+            protocol.update(shots_per_class=shots,
+                            validation_split="full original classification validation set")
+    return protocol
 
 
-def train_epoch(backbone, head, optimizer, loader, architecture, multilabel, device, epoch, rank):
+def train_epoch(backbone, head, optimizer, loader, architecture, multilabel, device, epoch, rank,
+                loss_name="bce", multilabel_recipe="bce"):
     backbone.eval()
     head.train()
     total = torch.zeros(2, dtype=torch.float64, device=device)
     for step, (images, targets) in enumerate(loader, start=1):
         images, targets = images.to(device), targets.to(device)
         features = torch.cat([
-            classification_features(backbone, chunk, architecture)
+            classification_features(backbone, chunk, architecture, multilabel, multilabel_recipe)
             for chunk in images.split(BATCH_SIZE_PER_GPU)
         ])
-        loss = classification_loss(head(features), targets, multilabel)
+        loss = classification_loss(head(features), targets, multilabel, loss_name)
         if not torch.isfinite(loss):
             raise RuntimeError(f"Non-finite probe loss at epoch {epoch + 1}, batch {step}")
         optimizer.zero_grad(set_to_none=True)
@@ -209,7 +374,8 @@ def train_epoch(backbone, head, optimizer, loader, architecture, multilabel, dev
 
 
 @torch.no_grad()
-def evaluate(backbone, head, dataset, architecture, multilabel, device, rank, world_size, num_workers):
+def evaluate(backbone, head, dataset, architecture, multilabel, device, rank, world_size, num_workers, dataset_name=None,
+             multilabel_recipe="bce"):
     # Unequal rank lengths are intentional. Using the unwrapped head avoids DDP
     # forward collectives; each validation image contributes exactly once.
     head.eval()
@@ -220,7 +386,7 @@ def evaluate(backbone, head, dataset, architecture, multilabel, device, rank, wo
     predictions, labels = [], []
     counts = torch.zeros(3, dtype=torch.float64, device=device)
     for step, (images, targets) in enumerate(loader, start=1):
-        logits = head(classification_features(backbone, images.to(device), architecture))
+        logits = head(classification_features(backbone, images.to(device), architecture, multilabel, multilabel_recipe))
         if multilabel:
             predictions.append(logits.cpu())
             labels.append(targets.cpu())
@@ -250,6 +416,7 @@ def evaluate(backbone, head, dataset, architecture, multilabel, device, rank, wo
     return multilabel_metrics(
         np.concatenate([item[0] for item in gathered]),
         np.concatenate([item[1] for item in gathered]), dataset.classes,
+        None if multilabel_recipe == "ibot" else dataset_name,
     )
 
 
@@ -267,19 +434,17 @@ def run_classification(args, dataset_name, evaluation_name, rank, world_size):
     backbone, metadata = load_backbone(args.checkpoint, args.checkpoint_key, args.arch)
     backbone.to(device).eval()
     architecture = metadata["architecture"]
-    protocol = _protocol(dataset_name, architecture, args.checkpoint_key, world_size)
-    if shots is not None:
-        protocol.update({
-            "source": "CRISP Table 3 and Appendix A.2",
-            "shots_per_class": shots,
-            "validation_split": "full original classification validation set",
-        })
+    multilabel_recipe = getattr(args, "multilabel_recipe", "bce")
+    protocol = _protocol(dataset_name, architecture, args.checkpoint_key, world_size,
+                         getattr(args, "multilabel_recipe", "bce"), evaluation_name)
     epochs = protocol["epochs"]
     identity = evaluation_identity(args)
     multilabel = dataset_name != "imagenet"
-    head = linear_head(backbone, architecture, len(train.classes)).to(device)
+    head = linear_head(backbone, architecture, len(train.classes), multilabel=multilabel,
+                       multilabel_recipe=multilabel_recipe).to(device)
     head = nn.parallel.DistributedDataParallel(head, device_ids=[device.index])
-    optimizer = torch.optim.SGD(head.parameters(), lr=protocol["learning_rate"], momentum=0.9, weight_decay=0)
+    optimizer = torch.optim.SGD(head.parameters(), lr=protocol["learning_rate"],
+                                momentum=protocol["momentum"], weight_decay=protocol["weight_decay"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     sampler = DistributedSampler(train, shuffle=True, seed=args.seed)
     loader = DataLoader(
@@ -306,7 +471,8 @@ def run_classification(args, dataset_name, evaluation_name, rank, world_size):
         # Each rank gets different, but restart-stable, stochastic augmentations.
         torch.manual_seed(args.seed + epoch * world_size + rank)
         sampler.set_epoch(epoch)
-        loss = train_epoch(backbone, head, optimizer, loader, architecture, multilabel, device, epoch, rank)
+        loss = train_epoch(backbone, head, optimizer, loader, architecture, multilabel, device, epoch, rank,
+                           "asymmetric" if protocol["loss"] == "asymmetric" else "bce", multilabel_recipe)
         scheduler.step()
         if rank == 0:
             write_json(args.output_dir / "progress.json", {"epoch": epoch + 1, "epochs": epochs, "train_loss": loss})
@@ -318,7 +484,8 @@ def run_classification(args, dataset_name, evaluation_name, rank, world_size):
             }, temporary)
             temporary.replace(checkpoint_path)
         dist.barrier()
-    metrics = evaluate(backbone, head.module, val, architecture, multilabel, device, rank, world_size, args.num_workers)
+    metrics = evaluate(backbone, head.module, val, architecture, multilabel, device, rank, world_size,
+                       args.num_workers, dataset_name, multilabel_recipe)
     if rank == 0:
         result = {
             "evaluation": evaluation_name,

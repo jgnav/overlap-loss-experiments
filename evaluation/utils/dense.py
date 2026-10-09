@@ -23,6 +23,7 @@ from evaluation.utils.common import (
     write_json,
 )
 from evaluation.utils.datasets import DATASET_SPECS, segmentation_manifest
+from evaluation.utils.online_probe_compatibility import ONLINE_EVALUATIONS, online_probe_identity
 
 
 # CRISP's resolution adjustment preserves 256 spatial tokens for each backbone.
@@ -203,6 +204,7 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
     manifests = {"train": segmentation_manifest(full_train), "test": segmentation_manifest(test)}
     n_train, n_test = len(full_train), len(test)
     identity = evaluation_identity(args)
+    probe_identity = online_probe_identity(args, evaluation_name) if evaluation_name in ONLINE_EVALUATIONS else None
     if getattr(args, "feature_cache", None) is not None:
         print("Pinned CAPI evaluator extracts fresh features; legacy feature cache is not reused.", flush=True)
     print(
@@ -260,6 +262,8 @@ def run_dense_evaluation(args, dataset_name, classifier_name, evaluation_name):
         },
         **_format_capi_result(raw, classifier_name),
     }
+    if probe_identity is not None:
+        result["online_probe_identity"] = probe_identity
     write_json(args.result_json, result)
     print(
         f"{spec['display_name']} {classifier_name}: "

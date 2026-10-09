@@ -1,0 +1,35 @@
+{
+  "data_root": "/mnt/fast/nobackup/scratch4weeks/jg02228/datasets/neco_eval",
+  "ade20k": "/mnt/fast/nobackup/scratch4weeks/jg02228/datasets/ade20k/ADEChallengeData2016",
+  "models": {
+    "ibot_original": "/mnt/fast/nobackup/users/jg02228/overlap-loss-experiments/checkpoints/ibot_vit_small.pth",
+    "region200": "/mnt/fast/nobackup/users/jg02228/overlap-loss-experiments/output/long_ibot_vit_small/85535_0/checkpoint_source1000_continuation0200.pth"
+  },
+  "retrieval": {
+    "memory_size": 10240000,
+    "input_size": 512,
+    "neighbors": 30,
+    "fractions": [
+      1,
+      8,
+      64,
+      128
+    ],
+    "subset_seeds": [
+      42,
+      1293,
+      4019,
+      400,
+      783
+    ]
+  },
+  "linear": {
+    "epochs": 20,
+    "released_config_epochs": 25,
+    "batch_size": 128,
+    "learning_rate": 0.01,
+    "input_size": 448,
+    "train_mask_size": 100,
+    "final_mask_eval_size": 448
+  }
+}

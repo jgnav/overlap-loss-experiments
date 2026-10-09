@@ -74,3 +74,17 @@ python -m evaluation.online_probes \
 ```
 
 Compatible completed task results are reused; stale or failed tasks rerun.
+
+## Result compatibility
+
+Online probes use `online_probe_identity`, which fingerprints their own evaluator,
+backbone loading and feature code, checkpoint key, seed, dataset root and split
+inputs. The reader also checks the checkpoint fingerprint and recorded scientific
+settings. Changes to multi-label classification, correspondence, video evaluation
+or other benchmark code do not invalidate these three probes.
+
+Older results without this identity require an explicit audit before migration;
+the reader does not silently accept an unknown old implementation. Migration keeps
+the original broad fingerprint and results for provenance. Recovered metrics are
+logged by the resumed trainer at their original snapshot epoch, including newly
+recovered tasks when another task in the same suite still fails.

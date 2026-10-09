@@ -2,8 +2,8 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
-import stat
 
 import numpy as np
 import torch
@@ -112,6 +112,7 @@ def read_multilabel_manifest(path, datasets_root, dataset_name, num_classes):
     samples = {}
     seen_ids, seen_paths = set(), set()
     resolved_parents = {}
+    directory_entries = {}
     for split in ("train", "val"):
         rows = splits[split]
         if not isinstance(rows, list) or not rows:
@@ -132,14 +133,23 @@ def read_multilabel_manifest(path, datasets_root, dataset_name, num_classes):
                 resolved_parents[parent] = parent.resolve()
             image = resolved_parents[parent] / image.name
             try:
-                mode = image.lstat().st_mode
+                # Readdir supplies regular-file/symlink types without a remote
+                # metadata round trip for each of COCO/VG's 100,000+ images.
+                # Cache only within this validation call, so later calls still
+                # detect files removed or symlinks changed between evaluations.
+                if image.parent not in directory_entries:
+                    with os.scandir(image.parent) as entries:
+                        directory_entries[image.parent] = {entry.name: entry for entry in entries}
+                entry = directory_entries[image.parent].get(image.name)
+                if entry is None:
+                    raise FileNotFoundError(image)
+                symlink = entry.is_symlink()
+                is_file = entry.is_file(follow_symlinks=False)
             except (FileNotFoundError, NotADirectoryError):
                 raise FileNotFoundError(f"Manifest image does not exist: {image}") from None
-            if stat.S_ISLNK(mode):
+            if symlink:
                 image = image.resolve()
                 is_file = image.is_file()
-            else:
-                is_file = stat.S_ISREG(mode)
             image_id = row.get("id", str(image))
             if not isinstance(image_id, str) or not image_id:
                 raise ValueError(f"{path}: image IDs must be nonempty strings")

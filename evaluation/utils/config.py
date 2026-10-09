@@ -40,6 +40,7 @@ def load_config(path):
         **WANDB_DEFAULTS,
         "checkpoint_key": "teacher", "arch": "auto", "num_workers": 8,
         "seed": 0, "segmentation_batch_size": 128,
+        "multilabel_recipe": "bce",
         "output_dir": None, "result_json": None, "classification_manifests": None,
         "video_protocol": "dinov3",
         "video_resolution": "small", "video_feature_blocks": 4, "video_split_manifests": {},
@@ -53,6 +54,8 @@ def load_config(path):
     if missing:
         raise ValueError(f"Missing evaluation configuration keys: {', '.join(sorted(missing))}")
     values = {**defaults, **values}
+    if values["multilabel_recipe"] not in ("bce", "asl224", "asl224_lr001", "ibot"):
+        raise ValueError("multilabel_recipe must be bce, asl224, asl224_lr001 or ibot")
     from evaluation.utils.correspondence_features import FEATURE_VARIANTS
     if values["correspondence_feature_variant"] not in FEATURE_VARIANTS:
         raise ValueError(f"correspondence_feature_variant must be one of {FEATURE_VARIANTS}")
@@ -118,7 +121,7 @@ def load_config(path):
 def config_snapshot(args):
     """Save effective paths and every switch, including omitted/disabled tasks."""
     keys = ("checkpoint", "checkpoint_key", "arch", "datasets_root", "classification_manifests",
-            "output_dir", "result_json", "seed", "num_workers", "segmentation_batch_size",
+            "output_dir", "result_json", "seed", "num_workers", "segmentation_batch_size", "multilabel_recipe",
             "video_protocol", "video_resolution", "video_feature_blocks", "video_split_manifests",
             "correspondence_feature_variant", "correspondence_softmax_temperature", *WANDB_DEFAULTS)
     result = {key: str(value) if isinstance(value := getattr(args, key), Path) else value for key in keys}

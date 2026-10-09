@@ -11,6 +11,8 @@ from evaluation.online_probes import (
     run_probe_checkpoint, validate_probe_data,
 )
 from evaluation.utils.common import checkpoint_fingerprint, evaluation_identity, write_json
+from evaluation.utils.online_probe_compatibility import online_probe_identity, load_online_probe_result, probe_source_hash
+from evaluation.utils.datasets import make_pascal_voc, segmentation_manifest
 
 
 class OfflineProtocolTest(unittest.TestCase):
@@ -21,6 +23,10 @@ class OfflineProtocolTest(unittest.TestCase):
         self.checkpoint = self.root / 'checkpoint.pth'
         self.checkpoint.write_bytes(b'checkpoint fixture')
         self.output = self.root / 'epoch0010.json'
+        split_root = self.root / 'VOCdevkit/VOC2012/ImageSets/Segmentation'
+        split_root.mkdir(parents=True)
+        (split_root / 'train.txt').write_text('train_image\n')
+        (split_root / 'val.txt').write_text('val_image\n')
 
     def worker(self, command, **kwargs):
         name = command[2].rsplit('.', 1)[1]
@@ -31,12 +37,33 @@ class OfflineProtocolTest(unittest.TestCase):
             datasets_root=Path(options['--datasets-root']),
             classification_manifests=Path(options['--classification-manifests']),
         )
+        if name == 'imagenet_knn':
+            protocol = {'input_resolution': 224, 'training_fraction': .1,
+                        'training_subset_file_sha256': '6d09de11e7bdaf5b1f3b1f249b6183695f97310cdd20f0c03e7235b6b9392091',
+                        'feature': 'final normalized teacher CLS token', 'feature_l2_normalization': True,
+                        'temperature': .07, 'neighbors': [10, 20, 100, 200], 'primary_neighbors': 20,
+                        'gpu_count': 1, 'batch_size_per_gpu': 256}
+            manifests = {}
+        else:
+            protocol = {'capi_revision': '98b4fa17ee8eec8810c17022df9a27a44845368b',
+                        'dataset_train_split': 'train', 'dataset_test_split': 'val',
+                        'input_resolution': 256, 'patch_tokens': 256, 'knn_dtype': 'float32',
+                        'backbone_frozen': True, 'feature': 'final normalized teacher patch tokens',
+                        'standardization': 'StandardScaler fitted on train only',
+                        'validation_split': 'seeded 10% of training set', 'num_classes': 21,
+                        'ignore_labels': [255], 'gpu_count': 1}
+            manifests = {key: segmentation_manifest(make_pascal_voc(args.datasets_root, split))
+                         for key, split in [('train', 'train'), ('test', 'val')]}
         write_json(Path(options['--result-json']), {
             'status': 'completed', 'evaluation': name,
             'model': {'checkpoint_key': args.checkpoint_key,
-                      'checkpoint_fingerprint': checkpoint_fingerprint(args.checkpoint)},
+                      'checkpoint_fingerprint': checkpoint_fingerprint(args.checkpoint),
+                      'architecture': 'vit_small', 'patch_size': 16},
             'evaluation_identity': evaluation_identity(args),
-            'metrics': {'top1': 42} if name == 'imagenet_knn' else {'miou': .42},
+            'online_probe_identity': online_probe_identity(args, name),
+            'protocol': protocol, 'dataset_manifests': manifests,
+            'classifier': 'knn' if name.endswith('knn') else 'linear_logistic_regression',
+            'metrics': {'top1': 42} if name == 'imagenet_knn' else {'miou': .42, 'miou_percent': 42},
             'validation_sweep': [{'parameter': 123}],
         })
         return SimpleNamespace(returncode=0)
@@ -83,6 +110,76 @@ class OfflineProtocolTest(unittest.TestCase):
             result = self.run_suite()
         self.assertEqual(len(result['errors']), 3)
         self.assertEqual(json.loads(self.output.read_text())['status'], 'failed')
+
+    def test_unrelated_identity_changes_do_not_discard_completed_probes(self):
+        with mock.patch('evaluation.online_probes.subprocess.run', side_effect=self.worker):
+            self.run_suite()
+        for path in (self.root / 'epoch0010').glob('*.json'):
+            result = json.loads(path.read_text())
+            result['evaluation_identity'] = {'source_sha256': 'unrelated edits', 'multilabel_recipe': 'asl224'}
+            write_json(path, result)
+        with mock.patch('evaluation.online_probes.subprocess.run') as launch:
+            self.assertEqual(self.run_suite()['status'], 'completed')
+            launch.assert_not_called()
+
+    def test_relevant_source_protocol_and_split_changes_are_rejected(self):
+        with mock.patch('evaluation.online_probes.subprocess.run', side_effect=self.worker):
+            self.run_suite()
+        path = self.root / 'epoch0010/imagenet_knn.json'
+        args = SimpleNamespace(checkpoint=self.checkpoint, checkpoint_key='teacher', arch='auto',
+                               seed=17, datasets_root=self.root)
+        original = json.loads(path.read_text())
+        self.assertIsNotNone(load_online_probe_result(path, args, 'imagenet_knn'))
+        for change in ('source', 'temperature', 'seed'):
+            result = json.loads(json.dumps(original))
+            if change == 'source':
+                result['online_probe_identity']['source_sha256'] = 'changed algorithm'
+            elif change == 'temperature':
+                result['protocol']['temperature'] = .1
+            else:
+                result['online_probe_identity']['seed'] = 18
+            write_json(path, result)
+            self.assertIsNone(load_online_probe_result(path, args, 'imagenet_knn'))
+        split = self.root / 'VOCdevkit/VOC2012/ImageSets/Segmentation/train.txt'
+        split.write_text('different_image\n')
+        self.assertIsNone(load_online_probe_result(self.root / 'epoch0010/pascal_voc_knn.json', args, 'pascal_voc_knn'))
+
+    def test_legacy_recovery_requires_explicit_audit_and_checks_protocol(self):
+        with mock.patch('evaluation.online_probes.subprocess.run', side_effect=self.worker):
+            self.run_suite()
+        path = self.root / 'epoch0010/pascal_voc_linear.json'
+        result = json.loads(path.read_text())
+        del result['online_probe_identity']
+        legacy_hash = result['evaluation_identity']['source_sha256']
+        write_json(path, result)
+        args = SimpleNamespace(checkpoint=self.checkpoint, checkpoint_key='teacher', arch='auto',
+                               seed=17, datasets_root=self.root)
+        self.assertIsNone(load_online_probe_result(path, args, 'pascal_voc_linear'))
+        self.assertIsNotNone(load_online_probe_result(path, args, 'pascal_voc_linear', audited_legacy_hashes={legacy_hash}))
+        result['protocol']['input_resolution'] = 224
+        write_json(path, result)
+        self.assertIsNone(load_online_probe_result(path, args, 'pascal_voc_linear', audited_legacy_hashes={legacy_hash}))
+
+    def test_source_hash_excludes_unrelated_tasks_and_common_metadata(self):
+        import shutil
+        from evaluation.utils.online_probe_compatibility import REPO_ROOT
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = ['model/vision_transformer.py', 'model/__init__.py', 'utils/training.py',
+                     'evaluation/utils/online_probe_compatibility.py', 'evaluation/utils/common.py',
+                     'evaluation/utils/imagenet.py', 'evaluation/utils/imagenet_knn.py']
+            for relative in paths:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(REPO_ROOT / relative, target)
+            before = probe_source_hash('imagenet_knn', root)
+            (root / 'evaluation/another_benchmark.py').write_text('NEW_PROTOCOL = 1\n')
+            common = root / 'evaluation/utils/common.py'
+            common.write_text(common.read_text() + '\ndef new_metadata_field():\n    return "asl224"\n')
+            self.assertEqual(before, probe_source_hash('imagenet_knn', root))
+            imagenet = root / 'evaluation/utils/imagenet.py'
+            imagenet.write_text(imagenet.read_text().replace('temperature=0.07', 'temperature=0.1') + '\n# modified probe\n')
+            self.assertNotEqual(before, probe_source_hash('imagenet_knn', root))
 
 
 class RunnerTest(unittest.TestCase):
@@ -184,6 +281,27 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(command[command.index('--checkpoint') + 1], str(snapshot))
         self.assertEqual(json.loads(result.read_text())['status'], 'queued')
 
+    def test_partial_result_recovery_logs_new_metrics_even_if_one_probe_still_fails(self):
+        root = self.root / 'online_probes'
+        root.mkdir()
+        (root / 'metrics.jsonl').write_text(json.dumps({
+            'online_probe_epoch': 10, 'online_probe_success': 0,
+            'online_pascal_voc_knn_success': 0, 'online_pascal_voc_linear_success': 0,
+            'online_imagenet_knn_success': 0,
+        }) + '\n')
+        write_json(root / 'epoch0010.json', {
+            'epoch': 10, 'status': 'failed', 'evaluations': {
+                'pascal_voc_linear': {'status': 'completed', 'metrics': {'miou_percent': 62.0}},
+            },
+        })
+        restarted = OnlineProbeRunner(self.args)
+        record, = restarted.collect_completed()
+        self.assertEqual(record['online_probe_success'], 0)
+        self.assertEqual(record['online_pascal_voc_linear_miou_percent'], 62.0)
+        self.assertEqual(restarted.collect_completed(), [])
+        (root / 'metrics.jsonl').write_text(json.dumps(record) + '\n')
+        self.assertEqual(OnlineProbeRunner(self.args).collect_completed(), [])
+
 
 class ConfigurationTest(unittest.TestCase):
     def test_interval(self):
@@ -235,7 +353,7 @@ class ConfigurationTest(unittest.TestCase):
         from train import init_wandb
         wandb = mock.Mock()
         with mock.patch('train.init_wandb_run', return_value=wandb):
-            init_wandb(SimpleNamespace(seed=0))
+            init_wandb(SimpleNamespace(seed=0, register_warmup_epochs=0))
         self.assertEqual(
             wandb.define_metric.call_args_list[-2],
             mock.call('train/*', step_metric='epoch', step_sync=False),

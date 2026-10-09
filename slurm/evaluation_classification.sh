@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# CRISP classification: four GPUs, 256 images/GPU, actual LR 0.001.
+# Four GPUs, 256 images/GPU. Multilabel selects iBOT, BCE or ASL224 recipes;
+# ImageNet retains its iBOT-scaled LR 0.004 and separate feature/transform recipe.
 # Usage: sbatch slurm/evaluation_classification.sh /absolute/path/launch_config.yaml
 
 #SBATCH --job-name=eval-crisp-classification

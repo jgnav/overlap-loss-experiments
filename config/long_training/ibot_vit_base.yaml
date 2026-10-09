@@ -40,6 +40,8 @@ gradient_accumulation_steps: 3  # 48 * 4 * 3 = 576 images per optimizer step.
 seed: 0
 # Choose bf16 for supported GPUs, or fp16 to use a GradScaler.
 precision: bf16
+# Preserve optimizer state when a Slurm requeue moves between BF16 GPUs and RTX 8000/FP16.
+resume_allow_precision_change: true
 
 # Fresh optimizer and schedules
 optimizer: adamw

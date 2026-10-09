@@ -2,7 +2,7 @@
 
 Each evaluation has one implementation and one fixed recipe. There are no
 protocol mode switches. Settings follow CRISP first, then applicable CAPI details, then iBOT.
-ImageNet and multilabel linear classification use CRISP resolution, actual learning
+ImageNet and multilabel linear classification use CRISP resolution, explicit learning
 rate, GPU/batch counts and epoch budgets with documented iBOT/local details. Segmentation uses CAPI classifiers
 and CRISP resolution. Other tasks use documented CRISP/iBOT or task-specific
 components. Missing author details remain explicit assumptions.
@@ -92,18 +92,31 @@ are edited in place. Retain result JSON files with the evaluated checkpoints.
 
 ## Classification
 
-### Linear classification: CRISP stated settings
+### Linear classification: fixed multilabel benchmark protocol
 
 `imagenet_linear` and the VOC/COCO/VG linear probes share the frozen linear
-classifier in `evaluation/utils/classification.py`. Their fixed settings match
-CRISP Tables 3/4 and Appendix A.2:
+classifier in `evaluation/utils/classification.py`. They implement the settings
+listed in CRISP Tables 3/4 and Appendix A.2, with selectable documented recipes.
+The standalone comparison configs select the iBOT-style recipe described below.
+The following whole-image conventions describe the retained `bce` recipe:
 
 - **Exactly four GPUs**, **256 images per GPU** (global batch **1,024**).
   Any other GPU count is rejected before loading datasets or training probes.
 - **224 x 224** inputs; the encoder remains frozen and only a single linear
   classifier is trained.
-- **Actual initial optimizer learning rate 0.001**, followed by cosine decay.
-  No multiplication by batch size is applied.
+- Multilabel protocol version **5** uses **effective learning rate 0.001**,
+  without automatic batch scaling. This is the user's agreed explicit
+  interpretation of CRISP's incomplete LR description. ImageNet retains its
+  separate iBOT convention: base 0.001 scaled by global batch / 256 = 0.004.
+- Multilabel features concatenate the **final-block CLS token and mean spatial
+  patch tokens**, both after final backbone LayerNorm and before projection.
+  ViT-S features have 768 dimensions. There is no L2 normalization, softmax or
+  StandardScaler. This pooling is a documented local choice; the supplied CRISP
+  PDF does not specify the feature pooling.
+- Multilabel training resizes the **entire image to 224 x 224 with bicubic
+  interpolation**, followed by horizontal flip and ImageNet normalization.
+  Evaluation uses the same whole-image resize without augmentation. This is an
+  explicit completion choice, not a verified CRISP transform specification.
 - **500 epochs** for VOC Full and VOC 1/2/5-shot; **200 epochs** for COCO,
   VG and ImageNet linear.
 - Full-data tasks use their full training split and report on the full evaluation
@@ -123,20 +136,63 @@ CRISP Tables 3/4 and Appendix A.2:
 | `coco_multilabel` | COCO2017 train, 80 classes | 200 | mAP |
 | `visual_genome_multilabel` | SSGRL VG500 train, 500 classes | 200 | mAP |
 
-The following are **documented implementation choices**, not confirmed CRISP
-settings: iBOT feature pooling (last-four CLS concatenation for ViT-S; final CLS
-plus mean patch features for ViT-B/L), SGD with momentum 0.9 and zero weight
-decay, cosine decay without warmup, iBOT head initialization and augmentations,
-masked BCE for multilabel tasks, unknown/difficult-label exclusion, and
-non-interpolated macro AP. Results use the final epoch; reported validation
-images do not select hyperparameters or epochs. The PDF does not establish
-exact dataset versions/split membership, feature pooling, optimizer, schedule,
-AP convention or seed. Matching every stated setting therefore does not prove
-bit-for-bit reproduction of the authors' complete recipe.
+VOC uses official **VOC2010+ all-points interpolated precision-envelope AP**,
+averaged equally over its 20 classes. Native difficult-only labels are ignored
+per class in training and evaluation. COCO and VG use non-interpolated image-level
+macro AP over their fixed vocabularies, not detection AP.
 
-The previous 0.004-LR, one-GPU probes and CAPI ImageNet probes are historical
-results. New launches must use fresh output directories: probe checkpoint
-signatures reject incompatible resume. `capi_classification.py` remains a legacy
+The standalone multilabel comparison configurations now select
+`multilabel_recipe: ibot` (protocol version **8**). This restores the
+iBOT-style adaptation used for the earlier Region200 VOC results
+**49.59 / 64.39 / 74.28 / 89.31**: concatenate the last four normalized CLS
+tokens for ViT-S (1,536 dimensions); train with RandomResizedCrop(224) and
+horizontal flip; validate with Resize(256) and CenterCrop(224). Image-level
+labels remain unchanged after cropping. SGD uses momentum **0.9**, zero weight
+decay, cosine decay without warmup, and base LR **0.001** scaled by batch/256
+to **0.004** at 4 GPUs x 256. Masked BCE, non-interpolated macro AP for all
+three datasets, final-epoch reporting and the 500/200 epoch budget are local
+multilabel adaptations; the original iBOT evaluator uses multiclass CE and
+best validation accuracy. This is not claimed to reproduce CRISP exactly.
+Launch into fresh output directories; protocol signatures reject old heads.
+The whole-image recipes described above remain available explicitly.
+
+The previous comparison used
+`multilabel_recipe: asl224_lr001` (protocol version **7**), with effective
+LR **0.001** from CRISP Appendix A.2, without batch scaling. All other
+ASL/SGD settings below are retained. These settings are not claimed to recover
+CRISP's unpublished loss, optimizer, pooling, or sampling details. Relaunches
+use fresh output directories so the earlier LR 0.04 heads/results are not reused.
+
+The earlier exploratory recipe remains available as
+`multilabel_recipe: asl224` (protocol version **6**): SGD momentum **0.9**, effective
+LR **0.04** without batch scaling, weight decay **0.01** on weights and biases,
+and asymmetric loss with negative gamma **4**, positive gamma **0**, probability
+clip **0.05**, detached focal weights, and mean reduction over globally known
+labels. Whole-image resizing preserves image-level labels; there are no crops
+or test-time augmentation. Epochs, batch size, feature pooling, initialization,
+and cosine scheduling retain the settings above. This recipe obtained **89.56527**
+full VOC mAP in the original-iBOT 224-pixel exploratory sweep. It was selected
+on VOC validation and transferred unchanged to both checkpoints, COCO and VG;
+it is **not** claimed to recover CRISP's unpublished protocol. The default for
+other configurations remains `multilabel_recipe: bce`. Resume validation uses
+the same task-specific protocol builder as the worker, including VOC shot count
+and validation split, so completed few-shot tasks can be accepted correctly.
+
+SGD with momentum 0.9 and zero weight decay, cosine decay without warmup, and
+linear-head initialization follow the iBOT fallback. Multilabel masked BCE is
+averaged over known image-class entries across all ranks. Results use the final
+epoch; evaluation images do not select hyperparameters or checkpoints. Dataset
+versions, membership, seed, BCE reduction, effective LR, preprocessing, and
+the final-block extraction point are documented choices where CRISP is incomplete.
+This is a reproducible benchmark, not a claim of exact CRISP score reproduction.
+
+ImageNet keeps the original iBOT architecture-dependent pooling (last-four CLS
+concatenation for ViT-S; final CLS plus mean patch features for ViT-B/L), training
+RandomResizedCrop and evaluation Resize(256) + CenterCrop(224).
+
+Earlier multilabel results are historical. New launches must use fresh output
+directories: probe checkpoint signatures and completed-result protocol checks
+reject incompatible reuse. `capi_classification.py` remains a legacy
 comparison adapter; it is not selected by `imagenet_linear`.
 
 ImageNet 1%, 10% and 100% k-NN continue to use fixed SimCLRv2/iBOT training banks,
@@ -278,7 +334,8 @@ distributed process group on a single GPU. No GPU-count setting is required.
 An explicit existing `torchrun` launch is respected. Zero GPUs fails clearly.
 
 - CRISP linear classification requires four GPUs with 256 images per GPU,
-  actual initial LR 0.001, and a single frozen linear probe. Small few-shot
+  effective LR 0.001 for multilabel / iBOT-scaled LR 0.004 for ImageNet,
+  and a single frozen linear probe. Small few-shot
   datasets and final batches can be smaller. DDP aggregates training gradients;
   validation shards count each evaluation image once, without padding.
 - ImageNet k-NN distributes both feature extraction and validation queries.
@@ -582,3 +639,226 @@ allocation (four GPUs, 128 GiB, 72 hours). Its offline segmentation workers see
 only one GPU. The grouped launcher avoids reserving the other GPUs for these
 tasks. Selected dataset splits and local multilabel BCE/AP/final-epoch choices
 remain unchanged and are recorded in result metadata.
+
+## Native CRISP depth and surface normals
+
+`crisp_native_dense.py` snapshots the supplied CRISP/Probe3D repository and
+uses its depth and surface-normal training entry points, loaders, DPT heads,
+losses and metrics. Its region ViT-S adapter supplies raw blocks 3/6/9/12 as
+four separate DPT inputs. The backbone remains frozen; decoders train for
+10 epochs with the native optimizer and schedule. Saved CRISP batch sizes
+are preserved: depth 2, surface normals 8, on one GPU.
+
+Prepare a run using the supplied code and data:
+
+```bash
+python evaluation/crisp_native_dense.py prepare --root /absolute/path/to/run
+sbatch slurm/evaluation_crisp_native_dense.sh /absolute/path/to/run depth_nyu
+sbatch slurm/evaluation_crisp_native_dense.sh /absolute/path/to/run depth_navi
+sbatch slurm/evaluation_crisp_native_dense.sh /absolute/path/to/run snorm_nyu
+sbatch slurm/evaluation_crisp_native_dense.sh /absolute/path/to/run snorm_navi
+```
+
+Defaults point to `/mnt/fast/nobackup/scratch4weeks/jg02228/probe3d` and the
+region ViT-S continuation-epoch-200 teacher checkpoint. Override these with
+`--crisp-root` and `--checkpoint`. Dataset files are linked, rather than copied.
+NYU uses all 30,914 valid GeoNet training instances and 654 labeled test
+images at 480×480. NAVI uses multiview training and wild testing, retaining
+the supplied loader's every-fourth selection (2,024/555 images) at 512×512.
+
+Every task checks source/checkpoint hashes, data identities, representative
+samples, and decoder forward/backward at its actual batch size before training.
+The sole training-file fix handles final checkpoint serialization on a single
+GPU; training and metric computations are unchanged. The supplied code's
+unseeded training behavior is also preserved despite its seed configuration.
+Slurm requests RTX8000/A100 GPUs. NYU's labeled pickle is approximately 8 GiB;
+the default allocation includes 32 GiB RAM and 48 hours.
+
+Refresh metrics using the copied environment:
+
+```bash
+/mnt/fast/nobackup/scratch4weeks/jg02228/probe3d/env_probe3d/bin/python \
+    /absolute/path/to/run/native_dense.py collect --root /absolute/path/to/run
+```
+
+The run records source hashes, the exact checkpoint identity, resolved configs,
+and selected splits. Results appear in `results.json` and `results_summary.md`;
+native logs and decoder checkpoints remain under `tasks/*/source/`.
+
+## SPair-71k scale and visibility robustness
+
+`spair_nuisance.py` evaluates original iBOT ViT-S/16 and the region epoch-200
+teacher on all 12,234 pairs in `Layout/large/test.txt`. It reuses the supplied
+CRISP `compute_errors` function and preprocessing at 800 pixels: raw final-block
+features, L2 normalization before source-keypoint sampling, cosine argmax,
+no bounding-box crop, no feature head, no augmentation. Native square padding
+and integer keypoint rescaling remain unchanged.
+
+The primary PCK follows the [official HPF evaluator](https://github.com/juhongm999/hpf/blob/master/model/evaluation.py):
+errors at most 0.1 times the longer target bounding-box side count as correct;
+PCK is calculated per pair, then averaged over pairs. This differs from
+Probe3D's category average of pooled keypoint correctness, which is also saved
+as a secondary metric. These full-split scores need not equal earlier sampled
+Probe3D results. The subsets follow Table 4 of the
+[SPair paper](https://arxiv.org/abs/1908.10543), independently grouping each
+annotated factor while leaving the other factors unrestricted. This is not
+the paper's Table 5 analysis that holds other factors fixed.
+
+Viewpoint/scale codes 0/1/2 mean easy/medium/hard. Truncation and occlusion
+codes 0/1/2/3 mean none/source/target/both. Preparation checks these directions
+against image-level annotations, validates all common keypoints, and verifies
+all 14 subset counts against the publication. Source code, annotations, ordered
+pairs and checkpoint identities are frozen and recorded in the run manifest.
+
+```bash
+python evaluation/spair_nuisance.py prepare --root /absolute/path/to/run
+sbatch --array=0-1 slurm/evaluation_spair_nuisance.sh /absolute/path/to/run
+python /absolute/path/to/run/spair_nuisance.py collect --root /absolute/path/to/run
+```
+
+Each model uses one GPU, four CPUs, 16 GiB RAM and up to 12 hours. Before
+evaluating, the GPU worker checks checkpoint/source identities and tests real
+matching on directional visibility subsets. Per-pair errors are retained in
+`MODEL/pairs.jsonl` and allow restarting at the last completed pair. Final
+metrics appear in `MODEL/results.json`; collecting produces combined
+`results.json`, `results_summary.md`, and `table_rows.tex` in the run root.
+
+## CRISP correspondence with normalized backbone features
+
+`crisp_native_features.py` compares two feature choices for the region epoch-200
+teacher: final-block patch tokens after the learned final LayerNorm (the VOC
+feature extraction point), and the average of blocks 9–12 after applying that
+LayerNorm separately to each block (the video feature extraction rule).
+The feature width remains 384. The projection head and softmax are not used.
+VOC's classifier-specific StandardScaler is not added to correspondence;
+the native correspondence code retains its L2 normalization and matching.
+
+The runner freezes the previous CRISP-native source tree, configs, checkpoint
+identity, and exact SPair/NAVI/ScanNet pair lists. It changes only the backbone
+adapter and pins the pair order for comparison with the raw-block baseline.
+GPU preflight checks normalized features against explicit block-by-block
+extraction and exercises the 800-pixel SPair input before evaluation.
+
+```bash
+python evaluation/crisp_native_features.py prepare --root /absolute/path/to/run
+sbatch --array=0-5 slurm/evaluation_crisp_native_features.sh /absolute/path/to/run
+python /absolute/path/to/run/runner.py collect --root /absolute/path/to/run
+```
+
+Tasks 0–2 evaluate final LayerNorm features on SPair, NAVI, and ScanNet;
+tasks 3–5 evaluate the last-four average in the same order. Each uses one GPU,
+four CPUs, 16 GiB RAM, and up to 12 hours. Logs and preflight reports are under
+`VARIANT/DATASET/`; collecting writes `results.json` and `results_summary.md`.
+# NeCo Table 5: SPair-71k multiview feature consistency
+
+`spair_neco.py` implements the [NeCo Table 5](https://arxiv.org/html/2408.11054v3#S4.T5)
+protocol using the cited official Probe3D `compute_errors` function unchanged.
+Images use the Probe3D square padding/preprocessing at **224 × 224** instead of
+800; frozen teacher **raw final-block** patch tokens are L2-normalized before
+cosine matching. There is no projection head, softmax, foreground masking,
+training-set scaler, feature averaging, or test-time augmentation.
+
+The table caption specifies **Recall@0.01**. The primary report pools correct
+keypoints within each of the 18 categories and averages category recalls,
+following Probe3D. Recall@0.1 is saved separately because that is the threshold
+hardcoded in the released Probe3D evaluator. Errors use the target bounding-box
+longest side as their scale. The implementation also saves the official
+SPair/HPF per-pair PCK average with its inclusive threshold convention.
+
+NeCo does not release its SPair evaluator or sampled pairs. Therefore this is
+a reconstruction from its stated settings and cited Probe3D source, rather
+than a verified reproduction of its exact table. Both checkpoints use the same
+pinned seed-20 Probe3D sample (up to 200 pairs per category), followed by the
+remaining pairs of the official 12,234-pair test layout. Reports for the sampled
+and full test sets are kept separate. The sampled report becomes available
+before the full run finishes.
+
+```bash
+python evaluation/spair_neco.py prepare --root /absolute/path/to/new/run
+sbatch --array=0-1 slurm/evaluation_spair_neco.sh /absolute/path/to/new/run
+python /absolute/path/to/new/run/runner.py collect --root /absolute/path/to/new/run
+```
+
+Preparation freezes the source, annotations, ordered pair lists, checkpoint
+identities, runner, and launcher in the output directory. Each GPU job checks
+source/checkpoint hashes, validates raw-block feature equivalence, and records
+one result per pair in a journal that supports resuming interrupted evaluations.
+`results_sampled.json`, `results_full.json`, `results_summary.md`, and
+`table_rows.tex` contain the final values and protocol provenance.
+
+
+## Unsupervised object discovery (DINOv3 / TokenCut)
+
+`config/evaluation_object_discovery.yaml` evaluates official DINO v1 ViT-S/16,
+original iBOT ViT-S/16, and the region200 teacher using DINOv3 Sec. 6.1.4 /
+Appendix D.4. Run this independently of the classification/video suite:
+
+```bash
+.conda-env/bin/python -m evaluation.object_discovery prepare \
+  --config config/evaluation_object_discovery.yaml --root /absolute/new/run
+sbatch --array=0-8 slurm/evaluation_object_discovery.sh /absolute/new/run
+.conda-env/bin/python -m evaluation.object_discovery collect --root /absolute/new/run
+```
+
+Data requirements: VOC2007 detection **trainval** (5,011 images), VOC2012
+**trainval** (11,540), and the official fixed COCO20K list (19,817) with
+`coco/annotations/instances_train2014.json`. Existing COCO2017 JPEGs are resolved
+by the original COCO numeric image IDs; no 2017 split is substituted for COCO20K.
+Preparation validates and decodes every image, checks annotation dimensions,
+hashes images/checkpoints/annotations, and creates a frozen source snapshot.
+
+All backbones use final LayerNorm patch outputs, ImageNet normalization, native
+image resolution with official TokenCut zero padding, FP32 without AMP/TF32,
+and unchanged official TokenCut normalized cut. The extended sweep covers
+0.00 through 0.95 in steps of 0.05; the published 0.00--0.40 range is also
+summarized separately. VOC difficult and truncated boxes
+are included; COCO crowd boxes are excluded as in the official TokenCut release.
+Every image remains in the denominator, including any images with no noncrowd
+boxes. CorLoc is the percentage of images with a predicted box having IoU > 0.5
+with any eligible GT box. The >= 0.5 convention is also recorded separately.
+
+Each array task handles one model/dataset, saving all twenty predictions per image
+in an atomic SQLite transaction. Requeues resume at the first uncommitted image.
+`<model>/<dataset>/results.json` contains the whole threshold sweep; only a
+completed dataset receives a final best result. `results_summary.json` is refreshed
+by `collect`. The best threshold is selected per model/dataset, never per image.
+
+The public DINOv3 repository contains no object-discovery evaluator at the
+inspected commit. This extends its **published** threshold sweep with official TokenCut;
+unspecified implementation details are documented in the run manifest and
+[evaluation/vendor/tokencut/README.md](vendor/tokencut/README.md).
+
+
+## NeCo frozen-feature comparisons and semantic region retrieval
+
+See [neco_protocol.md](neco_protocol.md) for pinned authors' code, paper/config
+discrepancies, feature definitions and data audit rules. Both original iBOT and
+Region ViT-S/16 continuation epoch 200 are evaluated. The NeCo sweep contains
+64 dense retrieval tasks (VOC/ADE, published fractions and five partial-subset
+seeds), 16 clustering tasks (four datasets, class-count K and K=500, five
+internal seeds), and four COCO linear probes.
+
+Prepare a new frozen sweep before submitting the task arrays:
+
+```bash
+.conda-env/bin/python -m evaluation.neco_benchmarks --prepare \
+  --config config/evaluation_neco_ibot_vs_region200.yaml \
+  --root output/evaluation/neco_NEW_RUN
+```
+
+`slurm/prepare_neco_data.sh` prepares official annotations without duplicating
+images. VOC and COCO GPU arrays must depend on the corresponding successful
+preparation task, and the runner requires its completed audit JSON.
+`slurm/evaluation_neco.sh` executes one frozen comparison task per array index.
+Use 128 GiB host RAM for the published 10,240,000-entry retrieval bank;
+clustering and COCO linear probes request 32 GiB. Each uses one GPU.
+
+`evaluation/collect_neco.py --root RUN_ROOT` reports all seeds and only computes
+final aggregate results when each group is complete. A dependent collector is
+submitted for the current sweep.
+
+`slurm/evaluation_semantic_region_retrieval.sh` evaluates original iBOT and
+Region200 on disjoint VOC2012 train-gallery / validation-query regions. This
+is a separate custom mask-conditioned retrieval analysis, not a NeCo score.
+It reports macro/micro mAP and Recall@1/5/10, with exact region identities and
+split hashes retained for comparisons.
